@@ -18,15 +18,13 @@ def formatter(text, style="plain"):
 
 
 def format_signal_list(text):
-    """Normalize ANY pasted signal list to standard format.
+    """Flip a pasted signal list to the OTHER asset format.
 
-    Accepts lines like:
-      USDMXN_otc,09:02 M1 CALL
-      usdmxn-otc 09:02 call
-      USDMXN 9:2 CALL
-      09:02 M1 CALL  (asset missing -> kept as-is, time/direction fixed)
-    Returns lines like:
-      USDMXN-OTC,09:02 M1 CALL
+    A list in display format comes back in stored format, and
+    vice versa (per line, so mixed lists work too):
+      USDMXN-OTC,09:02 M1 CALL -> USDMXN_otc,09:02 M1 CALL
+      USDMXN_otc,09:02 M1 CALL -> USDMXN-OTC,09:02 M1 CALL
+    Assets without an OTC suffix (EURUSD) are left unchanged.
     Lines that cannot be parsed are returned upper-cased unchanged.
     """
     import re
@@ -52,15 +50,13 @@ def format_signal_list(text):
             asset = parts[-1] if parts else ""
         if asset:
             asset_up = asset.upper().strip()
-            # USDMXN_otc / USDMXN-OTC / USDMXNOTC -> USDMXN-OTC
-            if asset_up.endswith("_OTC"):
+            # Flip the suffix: -OTC <-> _otc.
+            if asset_up.endswith("-OTC"):
+                asset_up = asset_up[:-4] + "_otc"
+            elif asset_up.endswith("_OTC"):
                 asset_up = asset_up[:-4] + "-OTC"
-            elif asset_up.endswith("-OTC"):
-                pass
             elif asset_up.endswith("OTC"):
                 asset_up = asset_up[:-3] + "-OTC"
-            elif "OTC" in asset_up:
-                asset_up = asset_up.replace("_", "-")
             out.append(f"{asset_up},{hhmm} M1 {direction}")
         else:
             out.append(f"{hhmm} M1 {direction}")

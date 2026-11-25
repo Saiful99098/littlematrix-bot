@@ -6,8 +6,9 @@ Must pass:
 a) normalize_database_url — sslmode=require is added for Render's
    external Postgres URL, never duplicated, non-postgres URLs untouched.
 b) run_once with a fake session + temp SQLite DB — backfill inserts
-   5 days x 720 + today 720 per asset; a second run inserts 0 new
-   (UNIQUE index); Bot-Status-style summary sees the candles.
+   5 days x 1440 + today 721 (noon, boundary candle included) per
+   asset; a second run inserts 0 new (UNIQUE index); Bot-Status-style
+   summary sees the candles.
 c) run_once with a 429 fake session — retries once after 10 minutes,
    then returns False; nothing stored; no exception escapes.
 d) run_once with a 403 fake session — the 403 is logged as one clear
@@ -132,15 +133,15 @@ def test_run_once_fake():
         db, session_factory=lambda: FakeSession(now=FIXED_NOW),
         sleep=_fake_sleep_factory(sleeps), now=FIXED_NOW))
     assert (backfill_ok, inc_ok) == (True, True), (backfill_ok, inc_ok)
-    # 5 completed days x 720 + today 00:00-11:59 (720) = 4320 per asset.
-    assert db.count_total() == 2 * 4320, db.count_total()
+    # 5 completed days x 1440 + today 00:00-12:00 (721) = 7921 per asset.
+    assert db.count_total() == 2 * 7921, db.count_total()
     assert db.get_dates() == ["2026-11-20", "2026-11-21", "2026-11-22",
                               "2026-11-23", "2026-11-24", "2026-11-25"]
-    assert len(db.get_candles("USDMXN_otc", "2026-11-22")) == 720
+    assert len(db.get_candles("USDMXN_otc", "2026-11-22")) == 1440
     assert db.get_state("backfill_done") == "true"
     # Bot-Status-style summary sees the same candles.
     s = collector.get_status_summary(db, now=FIXED_NOW)
-    assert s["total_candles"] == 2 * 4320, s
+    assert s["total_candles"] == 2 * 7921, s
     assert s["today_count"] == 2 * 720, s
     # Second identical run: backfill skipped (done today), incremental
     # finds nothing new — 0 new candles, no extra sleeps.
@@ -148,9 +149,9 @@ def test_run_once_fake():
         db, session_factory=lambda: FakeSession(now=FIXED_NOW),
         sleep=_fake_sleep_factory(sleeps), now=FIXED_NOW))
     assert (backfill_ok2, inc_ok2) == (True, True), (backfill_ok2, inc_ok2)
-    assert db.count_total() == 2 * 4320, db.count_total()
+    assert db.count_total() == 2 * 7921, db.count_total()
     assert sleeps == [], sleeps
-    print("PASS b) run_once (fake session) — 4320/asset in DB, re-run 0 new")
+    print("PASS b) run_once (fake session) — 7921/asset in DB, re-run 0 new")
 
 
 def test_run_once_429_retries_once():

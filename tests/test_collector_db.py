@@ -2,7 +2,7 @@
 DB checker, webhook branch. Run: python tests/test_collector_db.py
 
 Must pass:
-a) window math — 5 backfill days, each 00:00-11:59 Dhaka = 720 minutes.
+a) window math — 5 backfill days, each a full Dhaka day = 1440 minutes.
 b) DB round-trip on SQLite — insert, UNIQUE blocks duplicates, load by
    asset+date returns the right candles.
 b2) DB recovers after the connection is closed (Render's Postgres
@@ -14,7 +14,7 @@ c) signals FROM the DB (sample USDMXN 2026-11-21 loaded in) give the
    same 13 signals for 09:00-10:59 as tests/test_signal.py.
 d) checker lookup from the DB returns the right result.
 e) webhook mode branches on WEBHOOK_URL (no real bind, no real login).
-f) collector backfill with a fake session inserts 720/day/asset in the
+f) collector backfill with a fake session inserts 1440/day/asset in the
    window; a second run inserts 0 new; a 429 stops the run.
 g) backfill resumes after a mid-run crash: assets stored before the
    crash stay in the DB, the next run skips them and finishes the rest.
@@ -31,7 +31,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from bot import collector, config
-from bot.candles_db import CandleDB, DHAKA, dhaka_date_range_utc
+from bot.candles_db import CandleDB, DHAKA, dhaka_date_range_utc, utc_iso
 from bot.checker import build_lookup, check_signals
 from bot.collector import (
     backfill_dates,
@@ -72,17 +72,21 @@ def test_window_math():
                      "2026-11-21", "2026-11-20"], dates
     for d in dates:
         start, end = day_window_utc(d)
-        assert (end - start) == timedelta(hours=12), (d, end - start)
+        assert (end - start) == timedelta(hours=24), (d, end - start)
         assert start.astimezone(DHAKA).strftime("%H:%M") == "00:00", d
-        assert end.astimezone(DHAKA).strftime("%H:%M") == "12:00", d
-    # 720 one-minute candles per day in the window.
+        assert end.astimezone(DHAKA).strftime("%H:%M") == "00:00", d
+    # 1440 one-minute candles per full day in the window.
     assert int((day_window_utc(dates[0])[1]
-                - day_window_utc(dates[0])[0]).total_seconds() // 60) == 720
-    # today window ends at now when now is inside 00:00-11:59.
+                - day_window_utc(dates[0])[0]).total_seconds() // 60) == 1440
+    # today window ends at now when now is inside the day (morning).
     morning = datetime(2026, 11, 25, 9, 30, tzinfo=DHAKA)
     s, e = today_window_utc(morning)
     assert e == morning.astimezone(timezone.utc), (e, morning)
     assert s.astimezone(DHAKA).strftime("%H:%M") == "00:00"
+    # ... and in the afternoon too (the old 12:00 cap is gone).
+    afternoon = datetime(2026, 11, 25, 15, 0, tzinfo=DHAKA)
+    s, e = today_window_utc(afternoon)
+    assert e == afternoon.astimezone(timezone.utc), (e, afternoon)
     # recent window: last 2h + 10 min overlap.
     s, e = recent_window_utc(now)
     assert (e - s) == timedelta(hours=2, minutes=10), (e - s)
@@ -90,7 +94,7 @@ def test_window_math():
     oldest_start, _ = day_window_utc(dates[-1])
     secs = fetch_seconds_back(oldest_start, now)
     assert secs > 5 * 24 * 3600 and secs < 6 * 24 * 3600, secs
-    print("PASS a) window math — 5 backfill days, 720 min/day, 2h+10m window")
+    print("PASS a) window math — 5 backfill days, 1440 min/day, 2h+10m window")
 
 
 def test_db_roundtrip():
@@ -182,7 +186,7 @@ def test_db_asset_name_case_insensitive():
 
 
 def _load_sample_into_db(db):
-    """Load the bundled USDMXN sample file into the DB (window only)."""
+    """Load the bundled USDMXN sample file into the DB (full file)."""
     data = json.loads(SAMPLE.read_text(encoding="utf-8"))
     rows = rows_from_raw(data["candles"])
     inserted = db.insert_candles("USDMXN_otc", rows)
@@ -192,10 +196,10 @@ def _load_sample_into_db(db):
 def test_signals_from_db():
     db = _tmp_db()
     inserted = _load_sample_into_db(db)
-    # Sample file spans 2026-11-20 19:59 -> 2026-11-21 19:55; the
-    # 2026-11-21 00:00-11:59 window holds exactly 720 candles.
-    assert inserted == 720, inserted
-    assert len(db.get_candles("USDMXN_otc", "2026-11-21")) == 720
+    # Sample file spans 2026-11-20 19:59 -> 2026-11-21 19:55 (1437
+    # candles); the full 2026-11-21 day holds 1196 of them (00:00-19:55).
+    assert inserted == 1437, inserted
+    assert len(db.get_candles("USDMXN_otc", "2026-11-21")) == 1196
     signals = generate_futures_signals_from_db(
         db, "USDMXN_otc", ["2026-11-21"], "09:00", "10:59")
     got = [(s["hhmm"], s["direction"]) for s in signals]
@@ -213,7 +217,7 @@ def test_checker_from_db():
          "USDMXN-OTC,00:38 M1 CALL"],
         lookup, "2026-11-21")
     # 09:02 is CALL in the sample; 00:38 is a DOJI candle (O == C)
-    # inside the 00:00-11:59 collection window.
+    # inside the full-day collection window.
     assert [r["result"] for r in results] == ["WIN", "LOSS", "DOJI"], results
     assert summary["win"] == 1 and summary["loss"] == 1 and summary["doji"] == 1
     assert summary["win_pct"] == 50.0, summary
@@ -310,19 +314,23 @@ def test_collector_backfill_fake():
     done, total = asyncio.run(
         run_backfill(db, FakeSession(now=now), days=5, now=now))
     assert done == 2, done
-    # 5 completed days x 720 + today 00:00-11:59 (720) = 4320 per asset.
-    assert total == 2 * 4320, total
-    assert db.count_total() == 2 * 4320
+    # 5 completed days x 1440 + today 00:00-12:00 (721 — the fake
+    # session includes the candle at exactly `now`) = 7921 per asset.
+    assert total == 2 * 7921, total
+    assert db.count_total() == 2 * 7921
     assert db.get_dates() == ["2026-11-20", "2026-11-21", "2026-11-22",
                               "2026-11-23", "2026-11-24", "2026-11-25"]
-    assert len(db.get_candles("USDMXN_otc", "2026-11-22")) == 720
+    assert len(db.get_candles("USDMXN_otc", "2026-11-22")) == 1440
     assert db.get_state("backfill_done") == "true"
     # Second identical backfill: everything already in the DB.
     done2, total2 = asyncio.run(
         run_backfill(db, FakeSession(now=now), days=5, now=now))
     assert total2 == 0, total2
-    # Incremental run at 12:00: last 2h+10m = 09:50-12:00, all inside
-    # the window except 12:00 itself — all already stored -> 0 new.
+    # The backfill stamps its window version, so a later restart with
+    # the same window skips it instead of re-collecting.
+    assert db.get_state("backfill_window") == "full-day"
+    # Incremental run at 12:00: last 2h+10m = 09:50-12:00, all already
+    # stored -> 0 new.
     done3, total3 = asyncio.run(
         run_incremental(db, FakeSession(now=now), now=now))
     assert total3 == 0, total3
@@ -332,7 +340,7 @@ def test_collector_backfill_fake():
     _, total4 = asyncio.run(
         run_incremental(db2, FakeSession(now=morning), now=morning))
     assert total4 == 2 * 130, total4
-    print("PASS f) collector backfill (fake session) — 720/day/asset, "
+    print("PASS f) collector backfill (fake session) — 1440/day/asset, "
           "re-run inserts 0, incremental window correct")
 
 
@@ -350,18 +358,47 @@ def test_backfill_resumes_after_crash():
         pass
     else:
         raise AssertionError("backfill did not stop on 429")
-    assert db.count_total() == 3 * 4320, db.count_total()
+    assert db.count_total() == 3 * 7921, db.count_total()
     assert db.get_state("backfill_done") != "true"
     # Run 2 (healthy) skips the 3 done assets and finishes DDD only.
     done, total = asyncio.run(run_backfill(
         db, CrashySession(assets, crash_after=None, now=now),
         days=5, now=now))
     assert done == 4, done
-    assert total == 4320, total
-    assert db.count_total() == 4 * 4320
+    assert total == 7921, total
+    assert db.count_total() == 4 * 7921
     assert db.get_state("backfill_done") == "true"
     print("PASS f3) backfill resumes after crash — done assets kept, "
           "restart skips them and finishes the rest")
+
+
+class _StopLoop(Exception):
+    """Raised by the fake sleep to end collector_loop after one pass."""
+
+
+async def _stop_sleep(_seconds):
+    raise _StopLoop
+
+
+def test_backfill_reruns_after_window_change():
+    db = _tmp_db()
+    now = datetime(2026, 11, 25, 12, 0, tzinfo=DHAKA)
+    # Simulate the OLD half-day state: backfill marked done today,
+    # but no window version recorded (old code never set it).
+    db.set_state("backfill_done", "true")
+    db.set_state("last_backfill", utc_iso(now))
+    # collector_loop must NOT skip the backfill: the window changed,
+    # so the missing afternoon halves must be collected.
+    try:
+        asyncio.run(collector.collector_loop(
+            db=db, session_factory=lambda: FakeSession(now=now),
+            sleep=_stop_sleep))
+    except _StopLoop:
+        pass
+    assert db.count_total() == 2 * 7921, db.count_total()
+    assert db.get_state("backfill_window") == "full-day"
+    print("PASS f4) backfill re-runs after window change — old half-day "
+          "state is topped up to full days")
 
 
 def test_collector_429_stops_run():
@@ -452,11 +489,12 @@ def test_handlers_db_end_to_end():
                      if ln.startswith("USDMXN-OTC,")]
         assert len(sig_lines) == 13, text
 
-        # 5 days requested, only 1 in the DB: honest note, 1-day result.
+        # 5 days requested, only 2 in the DB: honest note, 1-day result
+        # for 09:00-10:59 (the 20th has no candles in that window).
         Ctx.user_data["fs_days"] = 5
         text5 = asyncio.run(
             handlers._compute_futures_text(Ctx(), "09:00", "10:59"))
-        assert "has only 1 day(s)" in text5, text5
+        assert "has only 2 day(s)" in text5, text5
         sig_lines5 = [ln for ln in text5.splitlines()
                       if ln.startswith("USDMXN-OTC,")]
         assert len(sig_lines5) == 13, text5
@@ -478,9 +516,9 @@ def test_handlers_db_end_to_end():
 
         # Bot Status summary from the same DB.
         s = collector.get_status_summary(db)
-        assert s["total_candles"] == 720, s
-        assert s["dates"] == ["2026-11-21"], s
-        assert s["by_asset"] == {"USDMXN_otc": 720}, s
+        assert s["total_candles"] == 1437, s
+        assert s["dates"] == ["2026-11-20", "2026-11-21"], s
+        assert s["by_asset"] == {"USDMXN_otc": 1437}, s
         assert s["backend"] == "sqlite", s
     finally:
         candles_db_mod.get_candle_db = real_get_db
@@ -499,10 +537,11 @@ def main():
     test_webhook_branch()
     test_collector_backfill_fake()
     test_backfill_resumes_after_crash()
+    test_backfill_reruns_after_window_change()
     test_collector_429_stops_run()
     test_post_init_starts_collector_only_when_active()
     test_handlers_db_end_to_end()
-    print("ALL TESTS PASSED (12/12)")
+    print("ALL TESTS PASSED (13/13)")
 
 
 if __name__ == "__main__":

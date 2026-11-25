@@ -15,8 +15,8 @@ into the same Render Postgres database the bot reads from.
   instead of silently writing to the local SQLite file.
 - Reuses bot/candles_db.py (Postgres when DATABASE_URL is set) and
   bot/collector.py's run_backfill / run_incremental + SharedQuotexSession
-  (one login per run, 3 assets at a time, 1s pauses, Dhaka 00:00-11:59
-  window, past 5 days + today 00:00-now for backfill, then last 2h +
+  (one login per run, 3 assets at a time, 1s pauses, full Dhaka day
+  00:00-23:59 window, past 5 days + today 00:00-now for backfill, then last 2h +
   10-min overlap every 2 hours).
 - The Telegram bot does NOT need to run for this script to work, and
   the script never touches the bot's behaviour — the Render bot only

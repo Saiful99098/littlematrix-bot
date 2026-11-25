@@ -9,8 +9,8 @@ Tables:
     collector_state (key TEXT PRIMARY KEY, value TEXT)
 
 All timestamps are stored in UTC as 'YYYY-MM-DD HH:MM:SS'.
-The collection window is Asia/Dhaka 00:00-11:59, so a Dhaka date D
-covers UTC (D-1) 18:00 up to D 06:00 (half-open).
+The collection window is the FULL Asia/Dhaka day 00:00-23:59,
+so a Dhaka date D covers UTC (D-1) 18:00 up to D 18:00 (half-open).
 
 Only the candles module uses this file. The user/premium tables
 stay in bot/database.py (SQLite) — moving them to Postgres is a
@@ -89,12 +89,12 @@ def utc_iso(dt):
 
 
 def dhaka_date_range_utc(date_str):
-    """Half-open UTC range [start, end) for one Dhaka date's
-    collection window (00:00-11:59 Dhaka = 18:00 prev day - 06:00
-    UTC). Returns (start_dt, end_dt) as aware UTC datetimes."""
+    """Half-open UTC range [start, end) for one FULL Dhaka date
+    (00:00-23:59 Dhaka = 18:00 prev day - 18:00 UTC).
+    Returns (start_dt, end_dt) as aware UTC datetimes."""
     d = datetime.strptime(date_str, "%Y-%m-%d").date()
     start_dhaka = datetime(d.year, d.month, d.day, 0, 0, tzinfo=DHAKA)
-    end_dhaka = datetime(d.year, d.month, d.day, 12, 0, tzinfo=DHAKA)
+    end_dhaka = datetime(d.year, d.month, d.day, 0, 0, tzinfo=DHAKA) + timedelta(days=1)
     return start_dhaka.astimezone(UTC), end_dhaka.astimezone(UTC)
 
 
@@ -226,7 +226,7 @@ class CandleDB:
         return cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else len(data)
 
     def get_candles(self, asset, date_str):
-        """Candles for one asset on one Dhaka date (00:00-11:59 window).
+        """Candles for one asset on one FULL Dhaka date (00:00-23:59).
 
         Returns raw-like dicts in sample-file format, sorted by time:
         {"time": unix, "datetime": "YYYY-MM-DD HH:MM:SS" (Dhaka),
@@ -277,7 +277,7 @@ class CandleDB:
         return out
 
     def count_candles(self, asset, date_str):
-        """Candles stored for one asset on one Dhaka date (00:00-11:59).
+        """Candles stored for one asset on one FULL Dhaka date.
         Used by the collector to skip assets whose backfill span is
         already complete, so a restart resumes instead of re-fetching."""
         asset = normalize_asset_name(asset)
@@ -293,7 +293,7 @@ class CandleDB:
         return [row[0] for row in cur.fetchall()]
 
     def get_dates(self, asset=None):
-        """Dhaka dates (00:00-11:59 window) that have candles, sorted.
+        """Dhaka dates (full day) that have candles, sorted.
         A candle belongs to the Dhaka date of its Dhaka wall-clock time
         (UTC ts + 6h)."""
         if asset:

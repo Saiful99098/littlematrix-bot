@@ -96,6 +96,14 @@ def check_signals(lines, candles_by_key, date_str, with_mtg1=False):
     win_pct = round(win / decided * 100, 1) if decided else 0.0
     summary = {"total": total, "win": win, "loss": loss, "doji": doji,
                "no_data": no_data, "win_pct": win_pct}
+    if with_mtg1:
+        # MTG1 accuracy: M1 WINs plus M1 LOSSes recovered by MTG1.
+        mtg_wins = sum(1 for r in results
+                       if r["result"] == "WIN"
+                       or (r["result"] == "LOSS" and r.get("mtg1") == "WIN"))
+        summary["mtg_win"] = mtg_wins
+        summary["mtg_win_pct"] = (round(mtg_wins / decided * 100, 1)
+                                  if decided else 0.0)
     return results, summary
 
 
@@ -144,7 +152,9 @@ def format_check_results(results, summary):
     for r in results:
         emoji = _sym.get(r["result"], "")
         asset = r['asset'].upper().replace("_OTC", "-OTC")
-        line = f"{asset},{r['hhmm']} M1 {r['direction']} → {emoji}"
+        # No arrow between the direction and the result symbol —
+        # just the symbol (Saiful, 2026-11-25).
+        line = f"{asset},{r['hhmm']} M1 {r['direction']} {emoji}"
         if r.get("mtg1"):
             line += f" (MTG1: {_sym.get(r['mtg1'], '')})"
         lines.append(line)
@@ -153,4 +163,6 @@ def format_check_results(results, summary):
                  f"{pe('cross')} {summary['loss']} | {pe('minus')} {summary['doji']} | "
                  f"? {summary['no_data']}")
     lines.append(f"Accuracy: {summary['win_pct']}%")
+    if "mtg_win_pct" in summary:
+        lines.append(f"MTG1 Accuracy: {summary['mtg_win_pct']}%")
     return "\n".join(lines)

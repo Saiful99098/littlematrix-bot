@@ -8,8 +8,8 @@ Anti-429 design (agreed with Saiful):
   batches (the 3-at-a-time rule is ONLY for the live collector).
 - On HTTP 429: stop the run immediately, log it, wait 10 minutes
   and retry once. Never hammer Quotex.
-- Collection window is Asia/Dhaka 00:00-11:59 each day
-  (720 one-minute candles per asset per day). Only candles inside
+- Collection window is the FULL Asia/Dhaka day 00:00-23:59
+  (1440 one-minute candles per asset per day). Only candles inside
   the window are stored.
 - Resumable: UNIQUE(asset, ts) ignores candles already in the DB,
   and every 2-hourly run re-fetches the last 10 minutes as overlap.
@@ -20,7 +20,7 @@ Anti-429 design (agreed with Saiful):
 
 Runs:
 - Backfill (once, on startup, background task): the last 5
-  completed days (00:00-11:59 Dhaka each) for all open assets,
+  completed days (full Dhaka days each) for all open assets,
   plus today 00:00-now — so CHECKER can verify today's signals.
   One get_historical_candles() call per asset covers the whole
   5-day span; days are split locally.
@@ -38,6 +38,15 @@ from .candles_db import DHAKA, utc_iso
 
 logger = logging.getLogger("littlematrix.collector")
 
+# Backfill window version, stored in collector_state. When the window
+# changes (e.g. 00:00-11:59 -> full day), the next startup re-runs the
+# backfill once so the missing half of every day gets collected,
+# instead of skipping it because backfill_done is already "true".
+BACKFILL_WINDOW = "full-day"
+
+# One full Dhaka day = 1440 one-minute candles.
+CANDLES_PER_DAY = 1440
+
 
 # ---------------------------------------------------------------------------
 # Window math (pure functions — unit tested)
@@ -49,7 +58,7 @@ def dhaka_now():
 def backfill_dates(n_days=None, now=None):
     """Date strings of the last n completed days (yesterday first).
 
-    A day is complete once its 00:00-11:59 Dhaka window has passed,
+    A day is complete once its full Dhaka day (00:00-23:59) has passed,
     so every day before today is complete. Returns newest first.
     """
     n_days = n_days if n_days is not None else config.BACKFILL_DAYS
@@ -65,7 +74,7 @@ def day_window_utc(date_str):
 
 
 def today_window_utc(now=None):
-    """UTC range [today 00:00 Dhaka, min(now, today 12:00 Dhaka))."""
+    """UTC range [today 00:00 Dhaka, min(now, tomorrow 00:00 Dhaka))."""
     now = now or dhaka_now()
     today = now.strftime("%Y-%m-%d")
     start, end = day_window_utc(today)
@@ -84,8 +93,10 @@ def recent_window_utc(now=None, hours=2, overlap_minutes=None):
 
 
 def in_collection_window(dt_dhaka):
-    """True when a Dhaka datetime is inside 00:00-11:59."""
-    return 0 <= dt_dhaka.hour < 12
+    """True when a Dhaka datetime is inside the collection window.
+    The window is the FULL Dhaka day (00:00-23:59), so every minute
+    of the day counts."""
+    return True
 
 
 def fetch_seconds_back(window_start_utc, now=None):
@@ -99,7 +110,7 @@ def fetch_seconds_back(window_start_utc, now=None):
 
 def rows_from_raw(raw_candles):
     """pyquotex/sample raw candles -> DB rows, filtered to the
-    collection window (Dhaka 00:00-11:59).
+    collection window (the full Dhaka day 00:00-23:59).
 
     Input: list of dicts with unix 'time' + open/high/low/close
     (or 'datetime' + O/H/L/C). Output: list of dicts with keys
@@ -232,16 +243,16 @@ async def _fetch_assets_3_at_a_time(session, assets, seconds_back):
 
 def _asset_backfill_complete(db, asset, dates, now):
     """True when an asset already has its full backfill span in the DB:
-    every completed day in `dates` at all 720 candles, and today from
-    00:00 up to now (12:00 cap). Such assets are skipped on a re-run,
+    every completed day in `dates` at all 1440 candles, and today from
+    00:00 up to now. Such assets are skipped on a re-run,
     so a restart resumes instead of re-fetching everything. Today is
-    included because a morning restart must still top today up."""
+    included because a restart must still top today up."""
     for d in dates:
-        if db.count_candles(asset, d) < 720:
+        if db.count_candles(asset, d) < CANDLES_PER_DAY:
             return False
-    noon = now.replace(hour=12, minute=0, second=0, microsecond=0)
+    end_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    expected_today = int((min(now, noon) - start).total_seconds() // 60)
+    expected_today = int((min(now, end_of_day) - start).total_seconds() // 60)
     if expected_today > 0:
         if db.count_candles(asset, now.strftime("%Y-%m-%d")) < expected_today:
             return False
@@ -306,6 +317,7 @@ async def run_backfill(db, session, days=None, now=None):
 
     db.set_state("last_backfill", utc_iso(now))
     db.set_state("backfill_done", "true")
+    db.set_state("backfill_window", BACKFILL_WINDOW)
     db.set_state("last_collection", utc_iso(now))
     nxt = now + timedelta(seconds=config.COLLECTOR_INTERVAL_SECONDS)
     db.set_state("next_collection", utc_iso(nxt))
@@ -348,8 +360,8 @@ async def run_incremental(db, session, now=None):
     db.set_state("last_collection", utc_iso(now))
     nxt = now + timedelta(seconds=config.COLLECTOR_INTERVAL_SECONDS)
     db.set_state("next_collection", utc_iso(nxt))
-    logger.info("collector: 2-hourly run finished — %d assets, %d new candles "
-                "(window candles outside 00:00-11:59 are skipped), next run %s Dhaka",
+    logger.info("collector: 2-hourly run finished — %d assets, %d new candles, "
+                "next run %s Dhaka",
                 done, total, nxt.strftime("%H:%M"))
     return done, total
 
@@ -447,9 +459,13 @@ async def collector_loop(db=None, session_factory=None, sleep=None):
             db.set_state("quotex_session", "disconnected (between runs)")
 
     # --- backfill first (skip if already done today) ---
+    # The backfill also re-runs when the window version changed
+    # (e.g. half-day -> full-day), so the missing half of every day
+    # gets collected instead of being skipped as "done".
     done = db.get_state("backfill_done") == "true"
+    window_ok = db.get_state("backfill_window") == BACKFILL_WINDOW
     last_bf = db.get_state("last_backfill")
-    if done and last_bf and last_bf[:10] == dhaka_now().strftime("%Y-%m-%d"):
+    if done and window_ok and last_bf and last_bf[:10] == dhaka_now().strftime("%Y-%m-%d"):
         logger.info("collector: backfill already done today (%s), skipping", last_bf)
     else:
         result = await _one_run("backfill")

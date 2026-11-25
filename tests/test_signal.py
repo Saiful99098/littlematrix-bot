@@ -5,6 +5,10 @@ Must pass:
 2) Checker demo: 10 signals -> 7 WIN, 3 LOSS, 70%.
 3) DOJI candle returns DOJI (not DRAW, not WIN/LOSS).
 4) 2-day tie (1-1) skipped; 3-day majority (2-1) wins at 66%.
+5) NO DATA renders as plain '?' (no misleading WIN? sticker).
+6) Checker MTG1 choice: with_mtg1 recovers 3 of 5 M1 losses
+   (58.3% -> 83.3% MTG1 Accuracy); result lines have no arrow.
+7) Formatter flips the asset format: -OTC <-> _otc, per line.
 """
 from __future__ import annotations
 
@@ -124,9 +128,66 @@ def test_no_data_renders_plain_question_mark():
                "no_data": 1, "win_pct": 0.0}
     text = format_check_results(results, summary)
     assert "6282525354242348869" not in text, text
-    assert "AUDNZD-OTC,01:00 M1 CALL → ?" in text, text
+    assert "AUDNZD-OTC,01:00 M1 CALL ?" in text, text
+    assert "→" not in text, text
     assert "? 1" in text, text
     print("PASS 5) NO DATA renders as plain '?' (no misleading WIN? sticker)")
+
+
+def test_checker_mtg1_choice_no_arrow():
+    # Saiful's real BTCUSD list 2026-11-25: M1 7 WIN / 5 LOSS = 58.3%.
+    # With MTG1, 3 of the 5 losses recover (09:21, 09:42, 10:58 go the
+    # signal direction; 09:07 and 10:22 do not) -> 10/12 = 83.3%.
+    d = "2026-11-25"
+    candles = [
+        _mk_candle(d, "09:06", "CALL"), _mk_candle(d, "09:07", "CALL"),
+        _mk_candle(d, "09:20", "PUT"), _mk_candle(d, "09:21", "CALL"),
+        _mk_candle(d, "09:29", "PUT"),
+        _mk_candle(d, "09:41", "CALL"), _mk_candle(d, "09:42", "PUT"),
+        _mk_candle(d, "09:48", "PUT"), _mk_candle(d, "10:01", "PUT"),
+        _mk_candle(d, "10:13", "PUT"),
+        _mk_candle(d, "10:21", "CALL"), _mk_candle(d, "10:22", "CALL"),
+        _mk_candle(d, "10:29", "PUT"), _mk_candle(d, "10:37", "PUT"),
+        _mk_candle(d, "10:49", "CALL"),
+        _mk_candle(d, "10:57", "CALL"), _mk_candle(d, "10:58", "PUT"),
+    ]
+    lookup = build_lookup(candles, "BTCUSD_otc")
+    lines = ["BTCUSD-OTC,09:06 M1 PUT", "BTCUSD-OTC,09:20 M1 CALL",
+             "BTCUSD-OTC,09:29 M1 PUT", "BTCUSD-OTC,09:41 M1 PUT",
+             "BTCUSD-OTC,09:48 M1 PUT", "BTCUSD-OTC,10:01 M1 PUT",
+             "BTCUSD-OTC,10:13 M1 PUT", "BTCUSD-OTC,10:21 M1 PUT",
+             "BTCUSD-OTC,10:29 M1 PUT", "BTCUSD-OTC,10:37 M1 PUT",
+             "BTCUSD-OTC,10:49 M1 CALL", "BTCUSD-OTC,10:57 M1 PUT"]
+    # Non-MTG (M1 only): 7 WIN / 5 LOSS.
+    _, summary = check_signals(lines, lookup, d)
+    assert summary["win"] == 7 and summary["loss"] == 5, summary
+    assert summary["win_pct"] == 58.3, summary
+    assert "mtg_win_pct" not in summary, summary
+    # MTG1: 3 losses recover -> 10/12 = 83.3%.
+    _, summary_mtg = check_signals(lines, lookup, d, with_mtg1=True)
+    assert summary_mtg["mtg_win"] == 10, summary_mtg
+    assert summary_mtg["mtg_win_pct"] == 83.3, summary_mtg
+    text = format_check_results(
+        check_signals(lines, lookup, d, with_mtg1=True)[0], summary_mtg)
+    assert "→" not in text, text
+    assert "MTG1 Accuracy: 83.3%" in text, text
+    print("PASS 6) checker MTG1 choice — M1 58.3%, MTG1 83.3%, no arrow")
+
+
+def test_formatter_flips_format():
+    from bot.text_tools import format_signal_list
+    # Display form -> stored form, and back.
+    assert (format_signal_list("USDPHP-OTC,23:45 M1 PUT")
+            == "USDPHP_otc,23:45 M1 PUT")
+    assert (format_signal_list("BTCUSD_otc,10:57 M1 PUT")
+            == "BTCUSD-OTC,10:57 M1 PUT")
+    # Mixed list flips per line; plain assets are unchanged.
+    got = format_signal_list(
+        "USDPHP-OTC,23:45 M1 PUT\nBTCUSD_otc,10:57 M1 PUT\n"
+        "EURUSD,09:02 M1 CALL")
+    assert got == ("USDPHP_otc,23:45 M1 PUT\nBTCUSD-OTC,10:57 M1 PUT\n"
+                   "EURUSD,09:02 M1 CALL"), got
+    print("PASS 7) formatter flips format — -OTC <-> _otc, per line")
 
 
 def main():
@@ -135,7 +196,9 @@ def main():
     test_doji_returns_doji()
     test_tie_and_majority()
     test_no_data_renders_plain_question_mark()
-    print("ALL TESTS PASSED (5/5)")
+    test_checker_mtg1_choice_no_arrow()
+    test_formatter_flips_format()
+    print("ALL TESTS PASSED (7/7)")
 
 
 if __name__ == "__main__":

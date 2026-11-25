@@ -424,7 +424,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                   [_btn("Back", "menu_main", icon="back")]]
             await query.edit_message_text(
                 f"{pe('diamond')} How many days of history should shape the signals? {pe('chart')}\n"
-                "The database holds the last 5 days (00:00-11:59 each day). "
+                "The database holds the last 5 full days (00:00-23:59 each day). "
                 "Signals are built from those days at the same HH:MM.",
                 reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
             return
@@ -475,14 +475,23 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _run_ai_signal(query, context)
         return
     if data == "menu_checker":
-        context.user_data["flow"] = "checker_list"
-        # db mode: check against TODAY's candles (today 00:00-now is
-        # in the DB from the backfill + 2-hourly runs). Other modes:
-        # the bundled sample date.
+        # Ask first: MTG1 results or non-MTG (M1 only)? The choice is
+        # stored and used when the pasted list is checked.
         check_date = _today_date_str() if config.DATA_MODE == "db" else SAMPLE_DATE
         context.user_data["checker_date"] = check_date
+        kb = [[InlineKeyboardButton("MTG1", callback_data="checker_mtg_1"),
+               InlineKeyboardButton("Non-MTG", callback_data="checker_mtg_0")],
+              [_btn("Back", "menu_main", icon="back")]]
         await query.edit_message_text(
             f"{pe('search')}{pe('diamond')} Blue Fish Prime Check — Date: {check_date}\n{DIVIDER}\n\n"
+            "Do you want MTG1 results or non-MTG (M1 only)?",
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+        return
+    if data in ("checker_mtg_1", "checker_mtg_0"):
+        context.user_data["checker_mtg1"] = (data == "checker_mtg_1")
+        context.user_data["flow"] = "checker_list"
+        await query.edit_message_text(
+            f"{pe('search')}{pe('diamond')} Blue Fish Prime Check\n{DIVIDER}\n\n"
             "Paste your signal list, e.g.:\n"
             "USDMXN-OTC,09:02 M1 CALL\nUSDMXN-OTC,09:11 M1 CALL",
             reply_markup=back_keyboard(), parse_mode="HTML")
@@ -523,8 +532,9 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["flow"] = "formatter"
         await query.edit_message_text(
             f"{pe('sparkle')}{pe('diamond')} Signal Formatter — send a signal list.\n"
-            "Any format works — I will convert it to the standard format:\n"
-            "USDMXN-OTC,09:02 M1 CALL",
+            "I will flip its format:\n"
+            "USDMXN-OTC,09:02 M1 CALL -> USDMXN_otc,09:02 M1 CALL\n"
+            "USDMXN_otc,09:02 M1 CALL -> USDMXN-OTC,09:02 M1 CALL",
             reply_markup=back_keyboard(), parse_mode="HTML")
         return
     if data == "menu_swap":
@@ -1005,8 +1015,10 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         lines = [x for x in text.splitlines() if x.strip()]
         check_date = context.user_data.get("checker_date") or SAMPLE_DATE
+        with_mtg1 = context.user_data.get("checker_mtg1", False)
         lookup = await _build_checker_lookup(lines, check_date)
-        results, summary = check_signals(lines, lookup, check_date)
+        results, summary = check_signals(lines, lookup, check_date,
+                                         with_mtg1=with_mtg1)
         await working.edit_text(
             f"{pe('search')}{pe('diamond')} Check Results:\n{DIVIDER}\n\n"
             + format_check_results(results, summary),
