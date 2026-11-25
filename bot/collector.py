@@ -148,8 +148,17 @@ class SharedQuotexSession:
     async def connect(self):
         from pyquotex.stable_api import Quotex
 
+        # QUOTEX_PROXY (if set) routes the HTTP login through the proxy
+        # — this is what avoids the 403 on Render's datacenter IP.
+        # QUOTEX_HOST (if set) overrides the broker host. Neither value
+        # is ever logged (the proxy URL may contain a password).
         self.client = Quotex(email=config.QUOTEX_EMAIL,
-                             password=config.QUOTEX_PASSWORD)
+                             password=config.QUOTEX_PASSWORD,
+                             proxies=config.quotex_proxies_dict(),
+                             host=config.QUOTEX_HOST)
+        logger.info("collector: Quotex session connecting (proxy=%s, host=%s)",
+                    "set" if config.QUOTEX_PROXY else "none",
+                    config.QUOTEX_HOST or "market-qx.info (default)")
         check, message = await self.client.connect()
         if not check:
             msg = str(message or "")

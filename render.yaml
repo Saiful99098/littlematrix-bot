@@ -18,6 +18,7 @@ services:
   - type: web
     name: blue-fish-prime-bot
     runtime: python
+    region: singapore
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
@@ -41,10 +42,14 @@ services:
       # runtime.txt + .python-version + this PYTHON_VERSION env var.
       - key: PYTHON_VERSION
         value: "3.12.7"
-      # Public base URL of this service; Render fills in the hostname.
-      # The bot registers <WEBHOOK_URL>/webhook with Telegram.
+      # Public base URL of this service. NOTE: do NOT use
+      # https://$RENDER_EXTERNAL_HOSTNAME here — Render does NOT
+      # expand it in Blueprint env vars (verified 2026-11-25: the
+      # Dashboard showed the literal string, and Telegram failed
+      # with "Bad webhook: failed to resolve host"). Use the
+      # literal service URL instead.
       - key: WEBHOOK_URL
-        value: https://$RENDER_EXTERNAL_HOSTNAME
+        value: https://blue-fish-prime-bot.onrender.com
       - key: DATABASE_URL
         fromDatabase:
           name: littlematrix-db
@@ -52,5 +57,6 @@ services:
 
 databases:
   - name: littlematrix-db
+    region: singapore
     plan: free
     databaseName: littlematrix

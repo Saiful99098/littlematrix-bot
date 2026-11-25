@@ -208,6 +208,43 @@ NoEventLoopError('Not currently running on any asynchronous event loop.')
 
 ---
 
+## Quotex 403 এলে (Render থেকে লগইন হয় না)?
+
+বট Live হওয়ার পরও লগে `collector: run failed: Quotex login failed:
+Error on access page: 403` দেখলে বুঝবেন Quotex Render-এর সার্ভারের
+IP থেকে লগইন নিচ্ছে না। তখন **PC থেকে কালেক্টর চালান** — পুরো গাইড
+দেখুন `README_PC_COLLECTOR_BN.md` (PC থেকে সরাসরি Render-এর
+Postgres ডেটাবেসে candle লেখে)।
+
+**Render থেকেই ঠিক করার আরও দুইটা উপায়:**
+
+1. **Region বদলান (Singapore):** 403 আসলে শুধু ডেটা সেন্টারের
+   IP-র দোষ নয় — Quotex যুক্তরাষ্ট্র, কানাডা, হংকং, রাশিয়া আর
+   ইউরোপের সব দেশ (EEA) থেকে ক্লায়েন্ট নেয় না, ওখানে "not
+   available in your region" দেখায়। Render-এর ডিফল্ট region
+   Oregon, USA — তাই Render-এর সার্ভার থেকে Quotex 403 দেয়।
+   Dashboard → `blue-fish-prime-bot` সার্ভিস → **Settings** →
+   **Region** → **Singapore** বাছুন। সিঙ্গাপুর Quotex-এর নিষিদ্ধ
+   তালিকায় নেই, তাই ওখান থেকে লগইন হওয়ার কথা। ⚠️ Frankfurt
+   (জার্মানি, EEA) বা Oregon (USA) বাছবেন না — ওই দুই জায়গা
+   থেকেও 403 আসবে। Region বদলালে সার্ভিস আবার তৈরি হবে, আর
+   Environment Variables আবার দেখে নিন — BOT_TOKEN,
+   QUOTEX_EMAIL, QUOTEX_PASSWORD ঠিক আছে কিনা।
+
+2. **Proxy ব্যবহার করুন:** residential/mobile proxy থাকলে
+   Render Environment-এ `QUOTEX_PROXY` বসান
+   (যেমন `http://user:pass@host:port`), তারপর redeploy করুন।
+   কালেক্টর তখন proxy দিয়ে Quotex-এ লগইন করবে। ফ্রি public
+   proxy ব্যবহার করবেন না — ওগুলো অবিশ্বস্ত আর প্রায়ই ব্লক
+   থাকে। আর proxy-র পাসওয়ার্ড কখনো চ্যাটে পাঠাবেন না।
+
+> `QUOTEX_HOST` নামে আরও একটা সেটিং আছে (অন্য broker host
+> চেষ্টা করার জন্য), কিন্তু কোনো বিকল্প host 403 এড়ায় বলে
+> যাচাই করা হয়নি — proxy আর region না হলে তবেই ওটা চেষ্টা
+> করবেন।
+
+---
+
 ## জেনে রাখা ভালো
 
 - **ফ্রি প্ল্যান ঘুমায়:** ১৫ মিনিট কোনো ট্রাফিক না থাকলে Render ফ্রি

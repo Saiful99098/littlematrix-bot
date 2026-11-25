@@ -32,6 +32,39 @@ except Exception:
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 QUOTEX_EMAIL = os.getenv("QUOTEX_EMAIL", "")
 QUOTEX_PASSWORD = os.getenv("QUOTEX_PASSWORD", "")
+# Proxy for the Quotex collector session only (Render 403 fix).
+# Format: http://user:pass@host:port (or http://host:port).
+# Empty = no proxy (direct connection, as before). The value is
+# NEVER logged (it may contain a password). Only the collector's
+# Quotex session uses it — signals and CHECKER never log in.
+QUOTEX_PROXY = os.getenv("QUOTEX_PROXY", "").strip()
+# Optional broker host override for the collector's Quotex session
+# (passed as host= to Quotex()). Empty = default market-qx.info.
+# No alternative host is verified to avoid the Render 403 — this is
+# only an escape hatch to try (e.g. qxbroker.com) if proxy + region
+# both fail. Do NOT set this unless asked to try it.
+QUOTEX_HOST = os.getenv("QUOTEX_HOST", "").strip() or None
+
+
+def quotex_proxies_dict():
+    """QUOTEX_PROXY env -> {"http": ..., "https": ...} for Quotex().
+
+    Returns None when no proxy is set (direct connection) or when the
+    value has an unsupported scheme (only http/https/socks5/socks5h).
+    """
+    if not QUOTEX_PROXY:
+        return None
+    proxy = QUOTEX_PROXY.strip()
+    if "://" not in proxy:
+        proxy = "http://" + proxy
+    scheme = proxy.split("://", 1)[0].lower()
+    if scheme not in ("http", "https", "socks5", "socks5h"):
+        import logging
+        logging.getLogger("littlematrix.config").warning(
+            "QUOTEX_PROXY has unsupported scheme %r — ignoring it "
+            "(use http://, https:// or socks5://)", scheme)
+        return None
+    return {"http": proxy, "https": proxy}
 DATA_MODE = os.getenv("DATA_MODE", "sample")  # sample | live | db
 # Render webhook: set WEBHOOK_URL to the public HTTPS base URL of the
 # Render web service, e.g. https://blue-fish-prime-bot.onrender.com

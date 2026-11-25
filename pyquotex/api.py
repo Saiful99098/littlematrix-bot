@@ -844,8 +844,17 @@ class QuotexAPI:
 
     @property
     def login(self) -> Login:
-        """Returns the Login action handler."""
-        return Login(self)
+        """Returns the Login action handler.
+
+        The proxy MUST be passed here: Login is a Browser, and the
+        Browser builds its curl_cffi client from its own `proxies`
+        kwarg only — it never reads api.proxies. Before this fix,
+        Quotex(proxies=...) stored the proxy on the API object but
+        the access-page GET (GET https://market-qx.info/pt) that
+        returns 403 from Render's datacenter IP always went direct,
+        so the proxy was silently ignored for the whole HTTP login.
+        """
+        return Login(self, proxies=self.proxies)
 
     @property
     def ssid(self) -> Ssid:
