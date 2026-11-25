@@ -1,0 +1,13 @@
+# python-telegram-bot with the [webhooks] extra (tornado) — webhook
+# mode on Render needs it; polling mode on the local PC works too.
+python-telegram-bot[webhooks]==22.*
+python-dotenv
+numpy
+pandas
+beautifulsoup4
+curl_cffi
+fake-useragent
+certifi
+# Postgres driver for the candle database on Render (DATABASE_URL).
+# Local testing uses SQLite, so this is only used when DATABASE_URL is set.
+psycopg2-binary

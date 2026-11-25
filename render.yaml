@@ -1,0 +1,49 @@
+# BLUE FISH PRIME — Render Blueprint (web service + free Postgres).
+# Push this repo to GitHub, then in Render: New -> Blueprint -> pick the
+# repo. Render creates the web service AND the database from this file.
+# Secrets (BOT_TOKEN, QUOTEX_EMAIL, QUOTEX_PASSWORD) are NOT in this
+# file — set them in Render Dashboard -> Environment after the first
+# sync (sync: false), or they will be empty and the bot will not start.
+#
+# No healthCheckPath is set on purpose: Render marks the service live
+# once the process binds to $PORT. The bot's webhook server (PTB)
+# has no /health endpoint, so do NOT add a health check path here.
+#
+# Free plan note: the free web service sleeps after ~15 minutes with
+# no traffic. Telegram updates wake it up, but the 2-hourly collector
+# does NOT run while it sleeps. For a 24/7 collector (1000-2000 users)
+# change plan: free -> starter (about $7/month) in the Dashboard.
+
+services:
+  - type: web
+    name: blue-fish-prime-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: QUOTEX_EMAIL
+        sync: false
+      - key: QUOTEX_PASSWORD
+        sync: false
+      - key: DATA_MODE
+        value: db
+      - key: COLLECTOR_ENABLED
+        value: "true"
+      - key: BACKFILL_DAYS
+        value: "5"
+      # Public base URL of this service; Render fills in the hostname.
+      # The bot registers <WEBHOOK_URL>/webhook with Telegram.
+      - key: WEBHOOK_URL
+        value: https://$RENDER_EXTERNAL_HOSTNAME
+      - key: DATABASE_URL
+        fromDatabase:
+          name: littlematrix-db
+          property: connectionString
+
+databases:
+  - name: littlematrix-db
+    plan: free
+    databaseName: littlematrix

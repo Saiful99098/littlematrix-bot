@@ -1,0 +1,14 @@
+.env
+session.json
+__pycache__/
+*.pyc
+.venv/
+venv/
+data/*.db
+data/*.db-wal
+data/*.db-shm
+# Collected candle JSON files are local only — the database holds
+# the candles on Render. Keep the bundled sample file in git.
+data/candles_*.json
+!data/sample_candles_USDMXN_otc_2026-11-21.json
+.DS_Store
