@@ -150,13 +150,24 @@ def format_check_results(results, summary):
             "DOJI": pe("minus"), "NO DATA": "?"}
     lines = []
     for r in results:
-        emoji = _sym.get(r["result"], "")
         asset = r['asset'].upper().replace("_OTC", "-OTC")
+        if r.get("mtg1"):
+            # MTG1 mode: the MTG1 outcome IS the line's symbol — no
+            # "(MTG1: ...)" suffix written beside it (Saiful, 2026-11-25).
+            # MTG1 WIN  -> check sticker + dot (won on MTG1, not M1).
+            # MTG1 LOSS -> loss sticker. MTG1 DOJI -> minus + dot.
+            # MTG1 NO DATA -> the M1 loss stands (nothing to show).
+            if r["mtg1"] == "WIN":
+                emoji = _sym["WIN"] + "."
+            elif r["mtg1"] == "DOJI":
+                emoji = _sym["DOJI"] + "."
+            else:
+                emoji = _sym["LOSS"]
+        else:
+            emoji = _sym.get(r["result"], "")
         # No arrow between the direction and the result symbol —
         # just the symbol (Saiful, 2026-11-25).
         line = f"{asset},{r['hhmm']} M1 {r['direction']} {emoji}"
-        if r.get("mtg1"):
-            line += f" (MTG1: {_sym.get(r['mtg1'], '')})"
         lines.append(line)
     lines.append("")
     lines.append(f"{pe('chart')} Total: {summary['total']} | {pe('check')} {summary['win']} | "

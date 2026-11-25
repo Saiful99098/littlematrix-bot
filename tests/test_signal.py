@@ -171,7 +171,18 @@ def test_checker_mtg1_choice_no_arrow():
         check_signals(lines, lookup, d, with_mtg1=True)[0], summary_mtg)
     assert "→" not in text, text
     assert "MTG1 Accuracy: 83.3%" in text, text
-    print("PASS 6) checker MTG1 choice — M1 58.3%, MTG1 83.3%, no arrow")
+    # No "(MTG1: ...)" suffix: an MTG1 win is the check sticker + dot,
+    # an MTG1 loss is just the loss sticker.
+    assert "(MTG1:" not in text, text
+    from bot.premium_emoji import pe
+    mtg_win_line = [ln for ln in text.splitlines()
+                    if ln.startswith("BTCUSD-OTC,09:20")][0]
+    assert mtg_win_line.endswith(pe("check") + "."), mtg_win_line
+    mtg_loss_line = [ln for ln in text.splitlines()
+                     if ln.startswith("BTCUSD-OTC,09:06")][0]
+    assert mtg_loss_line.endswith(pe("cross")), mtg_loss_line
+    print("PASS 6) checker MTG1 choice — M1 58.3%, MTG1 83.3%, no arrow, "
+          "MTG1 win = check + dot, no (MTG1:) suffix")
 
 
 def test_formatter_flips_format():
