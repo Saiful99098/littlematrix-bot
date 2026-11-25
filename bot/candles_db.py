@@ -38,6 +38,22 @@ try:
 except ImportError:
     pass
 
+
+def normalize_asset_name(asset):
+    """Asset name in the form the DB stores it.
+
+    Quotex instruments are stored as e.g. 'BTCUSD_otc' (base upper,
+    '_otc' lower) or 'EURUSD'. A pasted signal line gives 'BTCUSD-OTC'
+    (all upper) — without this, `WHERE asset = ?` (case-sensitive on
+    both Postgres and SQLite) finds nothing and the CHECKER reports
+    NO DATA even though the candles are in the DB. Every method below
+    normalizes its asset argument through this helper.
+    """
+    a = (asset or "").strip().upper().replace("-", "_")
+    if a.endswith("_OTC"):
+        a = a[:-4] + "_otc"
+    return a
+
 try:
     from zoneinfo import ZoneInfo
     DHAKA = ZoneInfo("Asia/Dhaka")
@@ -190,6 +206,7 @@ class CandleDB:
         ts (aware datetime, UTC, or ISO string), open, high, low, close.
         Duplicates (same asset+ts) are ignored by the UNIQUE index.
         Returns the number of NEW rows inserted."""
+        asset = normalize_asset_name(asset)
         if not rows:
             return 0
         data = []
@@ -216,6 +233,7 @@ class CandleDB:
          "H", "L", "O", "C"} — signal_engine.normalize_candle reads
         exactly this shape.
         """
+        asset = normalize_asset_name(asset)
         start, end = dhaka_date_range_utc(date_str)
         cur = self._execute(
             "SELECT ts, open, high, low, close FROM candles "
@@ -242,6 +260,7 @@ class CandleDB:
     def get_candles_range(self, asset, start_utc, end_utc):
         """Candles for one asset in a UTC [start, end) range.
         Same raw-like dict format as get_candles()."""
+        asset = normalize_asset_name(asset)
         cur = self._execute(
             "SELECT ts, open, high, low, close FROM candles "
             "WHERE asset = ? AND ts >= ? AND ts < ? ORDER BY ts",
@@ -261,6 +280,7 @@ class CandleDB:
         """Candles stored for one asset on one Dhaka date (00:00-11:59).
         Used by the collector to skip assets whose backfill span is
         already complete, so a restart resumes instead of re-fetching."""
+        asset = normalize_asset_name(asset)
         start, end = dhaka_date_range_utc(date_str)
         cur = self._execute(
             "SELECT COUNT(*) FROM candles "
@@ -277,6 +297,7 @@ class CandleDB:
         A candle belongs to the Dhaka date of its Dhaka wall-clock time
         (UTC ts + 6h)."""
         if asset:
+            asset = normalize_asset_name(asset)
             cur = self._execute(
                 "SELECT ts FROM candles WHERE asset = ? ORDER BY ts", (asset,))
         else:

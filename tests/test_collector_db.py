@@ -7,6 +7,9 @@ b) DB round-trip on SQLite — insert, UNIQUE blocks duplicates, load by
    asset+date returns the right candles.
 b2) DB recovers after the connection is closed (Render's Postgres
    closes idle connections) — the next read/write reconnects once.
+b3) DB asset names are case-insensitive: candles stored as
+   'BTCUSD_otc' are found when the checker asks for 'BTCUSD-OTC'
+   (pasted signal form) — the 2026-11-25 all-NO-DATA bug.
 c) signals FROM the DB (sample USDMXN 2026-11-21 loaded in) give the
    same 13 signals for 09:00-10:59 as tests/test_signal.py.
 d) checker lookup from the DB returns the right result.
@@ -143,6 +146,39 @@ def test_db_recovers_after_connection_closed():
     assert db.count_total() == 2
     print("PASS b2) DB recovers after the connection is closed — "
           "reconnects once, reads and writes work")
+
+
+def test_db_asset_name_case_insensitive():
+    # 2026-11-25: CHECKER on BTCUSD-OTC showed all NO DATA even though
+    # Bot Status showed 4319 BTCUSD candles. Cause: the DB stores
+    # 'BTCUSD_otc' (lower _otc) but the checker asked for 'BTCUSD-OTC'
+    # (all upper) and WHERE asset = ? is case-sensitive.
+    db = _tmp_db()
+    rows = [
+        {"ts": datetime(2026, 11, 25, 9, 6, tzinfo=DHAKA), "open": 50000,
+         "high": 50010, "low": 49990, "close": 49990},   # PUT
+        {"ts": datetime(2026, 11, 25, 9, 20, tzinfo=DHAKA), "open": 49990,
+         "high": 50000, "low": 49980, "close": 50000},   # CALL
+        {"ts": datetime(2026, 11, 25, 9, 29, tzinfo=DHAKA), "open": 50000,
+         "high": 50005, "low": 49995, "close": 50000},   # DOJI
+    ]
+    # Inserted under the stored form, as the collector does.
+    assert db.insert_candles("BTCUSD_otc", rows) == 3
+    # Every pasted-signal spelling must find the same rows.
+    for spelling in ("BTCUSD-OTC", "BTCUSD_OTC", "btcusd_otc", "BTCUSD_otc"):
+        got = db.get_candles(spelling, "2026-11-25")
+        assert len(got) == 3, (spelling, got)
+        assert db.count_candles(spelling, "2026-11-25") == 3, spelling
+    # Checker end-to-end with the pasted list: real results, no NO DATA.
+    candles = db.get_candles("BTCUSD-OTC", "2026-11-25")
+    lookup = build_lookup(candles, "BTCUSD_OTC")
+    lines = ["BTCUSD-OTC,09:06 M1 PUT", "BTCUSD-OTC,09:20 M1 CALL",
+             "BTCUSD-OTC,09:29 M1 PUT"]
+    results, summary = check_signals(lines, lookup, "2026-11-25")
+    assert [r["result"] for r in results] == ["WIN", "WIN", "DOJI"], results
+    assert summary["no_data"] == 0 and summary["win"] == 2, summary
+    print("PASS b3) DB asset names case-insensitive — pasted BTCUSD-OTC "
+          "finds stored BTCUSD_otc, checker gives WIN/WIN/DOJI")
 
 
 def _load_sample_into_db(db):
@@ -457,6 +493,7 @@ def main():
     test_window_math()
     test_db_roundtrip()
     test_db_recovers_after_connection_closed()
+    test_db_asset_name_case_insensitive()
     test_signals_from_db()
     test_checker_from_db()
     test_webhook_branch()
@@ -465,7 +502,7 @@ def main():
     test_collector_429_stops_run()
     test_post_init_starts_collector_only_when_active()
     test_handlers_db_end_to_end()
-    print("ALL TESTS PASSED (11/11)")
+    print("ALL TESTS PASSED (12/12)")
 
 
 if __name__ == "__main__":
