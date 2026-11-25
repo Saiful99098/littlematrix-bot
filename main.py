@@ -28,11 +28,25 @@ logger = logging.getLogger("littlematrix")
 
 
 def _ensure_event_loop():
-    """Python 3.14/3.15 fix: asyncio.get_event_loop() no longer creates
-    a loop when none exists, so python-telegram-bot's run_polling()
-    crashes with 'There is no current event loop in thread MainThread'.
-    Create and set one here, before run_polling() is called.
-    Safe on Python 3.12 too.
+    """Create + set an event loop in the main thread, BEFORE any
+    telegram/httpx object is built.
+
+    Root cause of the first failed Render deploy (2026-11-25):
+    Render built with Python 3.14 instead of the pinned 3.12.7.
+    Python 3.14 removed the implicit loop — asyncio.get_event_loop()
+    now raises RuntimeError when no loop is set (CPython gh-126353).
+    The first Telegram API call (getMe during initialize, setWebhook
+    during the webhook bootstrap) goes through httpx -> httpcore ->
+    anyio, and anyio raises NoEventLoopError when it cannot find a
+    running loop in the current thread. PTB 22.8 does create a loop
+    inside run_webhook()/run_polling(), but the HTTPXRequest client
+    (httpx.AsyncClient) is built earlier, inside build_application()
+    — and Tornado's IOLoop.current() also reads the loop at server
+    construction. So the loop must already exist before
+    build_application() runs. This is called there (and again in
+    main() before run_webhook/run_polling, belt and suspenders).
+    Safe to call twice; a no-op when a loop already exists.
+    Works on 3.12, 3.14 and 3.15.
     """
     try:
         asyncio.get_event_loop()
@@ -69,7 +83,17 @@ async def post_init(app):
 
 
 def build_application():
-    """Build the telegram Application (no polling started here)."""
+    """Build the telegram Application (no polling started here).
+
+    The event loop is ensured FIRST (see _ensure_event_loop):
+    Application.builder().build() constructs the Bot and its
+    HTTPXRequest client (httpx.AsyncClient) eagerly, and on
+    Python 3.14 that construction — and Tornado's IOLoop.current()
+    later in run_webhook — needs a loop to already exist in the
+    main thread. Without this, the first Telegram POST failed on
+    Render with anyio NoEventLoopError.
+    """
+    _ensure_event_loop()
     # Some environments set NO_PROXY with bracketed IPv6 entries that
     # httpx cannot parse (it raises InvalidURL on '[::1]'). Telegram
     # does not need the proxy list to build the client, so sanitise

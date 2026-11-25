@@ -34,6 +34,13 @@ services:
         value: "true"
       - key: BACKFILL_DAYS
         value: "5"
+      # Python version pin (belt and suspenders — see below).
+      # The first deploy IGNORED runtime.txt (python-3.12.7) and built
+      # with Python 3.14, which crashed the webhook startup with
+      # NoEventLoopError. So the version is pinned three ways:
+      # runtime.txt + .python-version + this PYTHON_VERSION env var.
+      - key: PYTHON_VERSION
+        value: "3.12.7"
       # Public base URL of this service; Render fills in the hostname.
       # The bot registers <WEBHOOK_URL>/webhook with Telegram.
       - key: WEBHOOK_URL

@@ -16,6 +16,10 @@
 - **সিগন্যাল আর CHECKER কখনো Quotex-এ লগইন করে না** — সব ডেটাবেস থেকে আসে।
   এটাই ৪২৯ ব্লক এড়ানোর ডিজাইন।
 - **ডেটাবেস:** Render-এ ফ্রি Postgres। লোকাল টেস্টে SQLite ফাইল (`data/candles.db`)।
+- **Python ভার্সন:** Render Python **3.12.7** দিয়ে বিল্ড করে
+  (`runtime.txt` + `.python-version` + `PYTHON_VERSION` — তিনভাবে পিন
+  করা)। Python 3.14 দিয়ে বিল্ড করলে webhook চালু হয় না, দেখুন
+  নিচে "ডেপ্লয় ফেইল হলে?"।
 - **Bot Status বাটন:** মেনুতে নতুন বাটন — Mode, ডেটাবেসে কত candle, কোন কোন
   তারিখের ডেটা আছে, প্রতি অ্যাসেটে কত, শেষ কালেকশন কখন, পরের কালেকশন কখন,
   Quotex সেশন, আজকের কভারেজ — সব দেখায়।
@@ -175,6 +179,32 @@ collector: backfill done — mode=db db=postgres candles=M assets=N dates=...
    টেস্ট করুন — SELECT ALL দিয়ে নয়।
 4. ডেটাবেসে আগের ডেটা থাকায় সিগন্যাল আর CHECKER তখনো চলবে —
    শুধু নতুন কালেকশন থেমে থাকবে।
+
+---
+
+## ডেপ্লয় ফেইল হলে?
+
+প্রথম ডেপ্লয়ে (২০২৬-১১-২৫) এই এরর এসেছিল:
+
+```
+telegram.error.NetworkError: Unknown error in HTTP implementation:
+NoEventLoopError('Not currently running on any asynchronous event loop.')
+```
+
+কারণ: Render `runtime.txt`-এ লেখা Python 3.12.7-কে না মেনে Python 3.14
+দিয়ে বিল্ড করেছিল। Python 3.14-এ `asyncio.get_event_loop()` আর নিজে
+লুপ বানায় না, তাই webhook চালু করার সময় (setWebhook) লুপ না পেয়ে
+বটটা ক্র্যাশ করেছিল।
+
+ঠিক করা হয়েছে:
+- `.python-version` ফাইলে `3.12.7` লেখা আছে, আর `render.yaml`-এ
+  `PYTHON_VERSION=3.12.7` বসানো আছে — Render এখন 3.12 দিয়েই বিল্ড করবে।
+- `main.py` এখন বট বানানোর আগেই event loop তৈরি করে, তাই 3.14/3.15-তেও
+  webhook চালু হবে।
+
+আবার ফেইল হলে: কোডের নতুন ভার্সন push করুন (Render নিজে আবার ডেপ্লয়
+করবে), তারপর Logs-এ দেখুন — `Application started` লেখা আসলেই বট চালু।
+লাল এরর থাকলে লগের শেষ কয়েক লাইন কপি করে পাঠান।
 
 ---
 

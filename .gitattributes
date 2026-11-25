@@ -1,0 +1,14 @@
+# Line endings: force LF so a Windows git checkout (autocrlf) can never
+# silently turn version files (runtime.txt, .python-version) or code
+# into CRLF. Render reads runtime.txt / .python-version byte-exact,
+# and a CRLF runtime.txt was one suspect in the first failed deploy
+# (Render built with Python 3.14 instead of the pinned 3.12.7).
+* text=auto eol=lf
+*.py text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.txt text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.sh text eol=lf
+*.bat text eol=crlf
