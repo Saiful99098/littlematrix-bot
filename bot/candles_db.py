@@ -26,6 +26,18 @@ from . import config
 
 logger = logging.getLogger("littlematrix.candles_db")
 
+# Errors that mean "the server closed our connection" — the query can
+# be retried once on a fresh connection. psycopg2 is imported lazily
+# (it is only installed where Postgres is used); sqlite raises
+# ProgrammingError on a closed connection.
+_CONNECTION_ERRORS = (sqlite3.ProgrammingError,)
+try:
+    import psycopg2 as _psycopg2
+    _CONNECTION_ERRORS = (_psycopg2.InterfaceError, _psycopg2.OperationalError,
+                          sqlite3.ProgrammingError)
+except ImportError:
+    pass
+
 try:
     from zoneinfo import ZoneInfo
     DHAKA = ZoneInfo("Asia/Dhaka")
@@ -138,6 +150,17 @@ class CandleDB:
         return sql
 
     def _execute(self, sql, params=()):
+        try:
+            return self._execute_once(sql, params)
+        except _CONNECTION_ERRORS:
+            # Render's Postgres closes idle connections (and restarts
+            # the free DB) — the next query then raises InterfaceError:
+            # "connection already closed". Reconnect once and retry.
+            logger.warning("candles_db: connection lost, reconnecting once")
+            self._conn = None
+            return self._execute_once(sql, params)
+
+    def _execute_once(self, sql, params=()):
         conn = self.connect()
         cur = conn.cursor()
         cur.execute(self._q(sql), params)
@@ -146,6 +169,14 @@ class CandleDB:
         return cur
 
     def _executemany(self, sql, rows):
+        try:
+            return self._executemany_once(sql, rows)
+        except _CONNECTION_ERRORS:
+            logger.warning("candles_db: connection lost, reconnecting once")
+            self._conn = None
+            return self._executemany_once(sql, rows)
+
+    def _executemany_once(self, sql, rows):
         conn = self.connect()
         cur = conn.cursor()
         cur.executemany(self._q(sql), rows)

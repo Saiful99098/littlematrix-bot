@@ -85,7 +85,9 @@ PREMIUM_EMOJI = {
     "info": ("5334544901428229844", "ℹ️"),
     # ➖ minus — marketment (CHECKER DOJI symbol)
     "minus": ("5789644639749281149", "➖"),
-    # ❓ question — ZEROX_660_by_TgEmodziBot (CHECKER NO DATA symbol)
+    # ❓ question — ZEROX_660_by_TgEmodziBot — RETIRED, DO NOT USE:
+    # renders as a gold "WIN?" sticker, misleading as CHECKER NO DATA.
+    # Checker uses plain "?" instead (see bot/checker.py).
     "question": ("6282525354242348869", "❓"),
 }
 

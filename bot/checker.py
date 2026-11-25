@@ -135,8 +135,11 @@ def build_lookup(candles, asset):
 def format_check_results(results, summary):
     """Format checker output for Telegram — symbols only, no outcome words."""
     # Premium symbols (Saiful: checker symbols must be premium too).
+    # NO DATA is plain "?" on purpose: the ZEROX premium ❓
+    # (ID 6282525354242348869) renders as a gold "WIN?" sticker,
+    # so users read NO DATA as WIN. Plain "?" cannot be misread.
     _sym = {"WIN": pe("check"), "LOSS": pe("cross"),
-            "DOJI": pe("minus"), "NO DATA": pe("question")}
+            "DOJI": pe("minus"), "NO DATA": "?"}
     lines = []
     for r in results:
         emoji = _sym.get(r["result"], "")
@@ -148,6 +151,6 @@ def format_check_results(results, summary):
     lines.append("")
     lines.append(f"{pe('chart')} Total: {summary['total']} | {pe('check')} {summary['win']} | "
                  f"{pe('cross')} {summary['loss']} | {pe('minus')} {summary['doji']} | "
-                 f"{pe('question')} {summary['no_data']}")
+                 f"? {summary['no_data']}")
     lines.append(f"Accuracy: {summary['win_pct']}%")
     return "\n".join(lines)

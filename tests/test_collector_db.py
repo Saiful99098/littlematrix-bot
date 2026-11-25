@@ -5,6 +5,8 @@ Must pass:
 a) window math — 5 backfill days, each 00:00-11:59 Dhaka = 720 minutes.
 b) DB round-trip on SQLite — insert, UNIQUE blocks duplicates, load by
    asset+date returns the right candles.
+b2) DB recovers after the connection is closed (Render's Postgres
+   closes idle connections) — the next read/write reconnects once.
 c) signals FROM the DB (sample USDMXN 2026-11-21 loaded in) give the
    same 13 signals for 09:00-10:59 as tests/test_signal.py.
 d) checker lookup from the DB returns the right result.
@@ -116,6 +118,31 @@ def test_db_roundtrip():
     assert db.get_state("last_collection") == "2026-11-25 09:00:00"
     assert db.get_state("missing_key") is None
     print("PASS b) DB round-trip — insert, UNIQUE blocks dupes, load by date")
+
+
+def test_db_recovers_after_connection_closed():
+    db = _tmp_db()
+    rows = [
+        {"ts": datetime(2026, 11, 21, 3, 2, tzinfo=DHAKA), "open": 19.9,
+         "high": 19.95, "low": 19.88, "close": 19.93},
+        {"ts": datetime(2026, 11, 21, 3, 3, tzinfo=DHAKA), "open": 19.93,
+         "high": 19.96, "low": 19.90, "close": 19.91},
+    ]
+    assert db.insert_candles("USDMXN_otc", rows) == 2
+    # Simulate Render's Postgres closing the idle connection: the
+    # connection object is closed but still referenced by the DB.
+    db.connect().close()
+    # The next read must reconnect once and return the right result
+    # (this is the Bot Status crash: InterfaceError on count_total).
+    assert db.count_total() == 2
+    got = db.get_candles("USDMXN_otc", "2026-11-21")
+    assert len(got) == 2, got
+    # Writes must recover the same way (executemany path).
+    db.connect().close()
+    assert db.insert_candles("USDMXN_otc", rows) == 0  # dupes ignored
+    assert db.count_total() == 2
+    print("PASS b2) DB recovers after the connection is closed — "
+          "reconnects once, reads and writes work")
 
 
 def _load_sample_into_db(db):
@@ -429,6 +456,7 @@ def test_handlers_db_end_to_end():
 def main():
     test_window_math()
     test_db_roundtrip()
+    test_db_recovers_after_connection_closed()
     test_signals_from_db()
     test_checker_from_db()
     test_webhook_branch()
@@ -437,7 +465,7 @@ def main():
     test_collector_429_stops_run()
     test_post_init_starts_collector_only_when_active()
     test_handlers_db_end_to_end()
-    print("ALL TESTS PASSED (10/10)")
+    print("ALL TESTS PASSED (11/11)")
 
 
 if __name__ == "__main__":

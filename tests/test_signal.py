@@ -13,7 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from bot.checker import build_lookup, check_signals
+from bot.checker import build_lookup, check_signals, format_check_results
 from bot.signal_engine import (
     generate_futures_signals,
     load_json_candles,
@@ -114,12 +114,28 @@ def test_tie_and_majority():
     print("PASS 4) 2-day 1-1 tie skipped; 3-day 2-1 = 66% (below 70% filter, dropped); majority_vote correct")
 
 
+def test_no_data_renders_plain_question_mark():
+    # 2026-11-25: the ZEROX premium ❓ (ID 6282525354242348869) renders
+    # as a gold "WIN?" sticker, so every NO DATA line looked like WIN.
+    # NO DATA must render as a plain "?" — never that custom emoji.
+    results = [{"asset": "AUDNZD_otc", "hhmm": "01:00", "direction": "CALL",
+                "result": "NO DATA", "actual": None}]
+    summary = {"total": 1, "win": 0, "loss": 0, "doji": 0,
+               "no_data": 1, "win_pct": 0.0}
+    text = format_check_results(results, summary)
+    assert "6282525354242348869" not in text, text
+    assert "AUDNZD-OTC,01:00 M1 CALL → ?" in text, text
+    assert "? 1" in text, text
+    print("PASS 5) NO DATA renders as plain '?' (no misleading WIN? sticker)")
+
+
 def main():
     test_raw_118_filtered_13()
     test_checker_demo_7_of_10()
     test_doji_returns_doji()
     test_tie_and_majority()
-    print("ALL TESTS PASSED (4/4)")
+    test_no_data_renders_plain_question_mark()
+    print("ALL TESTS PASSED (5/5)")
 
 
 if __name__ == "__main__":
