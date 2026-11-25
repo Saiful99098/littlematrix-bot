@@ -12,3 +12,4 @@ data/*.db-shm
 data/candles_*.json
 !data/sample_candles_USDMXN_otc_2026-11-21.json
 .DS_Store
+.venv-test/

@@ -226,6 +226,17 @@ class CandleDB:
             })
         return out
 
+    def count_candles(self, asset, date_str):
+        """Candles stored for one asset on one Dhaka date (00:00-11:59).
+        Used by the collector to skip assets whose backfill span is
+        already complete, so a restart resumes instead of re-fetching."""
+        start, end = dhaka_date_range_utc(date_str)
+        cur = self._execute(
+            "SELECT COUNT(*) FROM candles "
+            "WHERE asset = ? AND ts >= ? AND ts < ?",
+            (asset, utc_iso(start), utc_iso(end)))
+        return cur.fetchone()[0]
+
     def get_assets(self):
         cur = self._execute("SELECT DISTINCT asset FROM candles ORDER BY asset")
         return [row[0] for row in cur.fetchall()]

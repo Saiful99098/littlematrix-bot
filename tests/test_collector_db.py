@@ -11,6 +11,8 @@ d) checker lookup from the DB returns the right result.
 e) webhook mode branches on WEBHOOK_URL (no real bind, no real login).
 f) collector backfill with a fake session inserts 720/day/asset in the
    window; a second run inserts 0 new; a 429 stops the run.
+g) backfill resumes after a mid-run crash: assets stored before the
+   crash stay in the DB, the next run skips them and finishes the rest.
 """
 from __future__ import annotations
 
@@ -217,6 +219,28 @@ class FakeSession:
         self.connected = False
 
 
+class CrashySession(FakeSession):
+    """Fake session that dies with a 429 after `crash_after` fetches
+    (simulates a Render sleep/restart mid-backfill). `assets` is the
+    open-asset list; crash_after=None means a healthy session."""
+
+    def __init__(self, assets, crash_after=None, **kwargs):
+        super().__init__(**kwargs)
+        self._assets = list(assets)
+        self._crash_after = crash_after
+        self._fetched = 0
+
+    async def get_open_assets(self):
+        return list(self._assets)
+
+    async def fetch_asset_span(self, asset, seconds_back):
+        self._fetched += 1
+        if (self._crash_after is not None
+                and self._fetched > self._crash_after):
+            raise QuotexRateLimited("Quotex temporarily blocked us (429).")
+        return await super().fetch_asset_span(asset, seconds_back)
+
+
 def test_collector_backfill_fake():
     db = _tmp_db()
     now = datetime(2026, 11, 25, 12, 0, tzinfo=DHAKA)
@@ -247,6 +271,34 @@ def test_collector_backfill_fake():
     assert total4 == 2 * 130, total4
     print("PASS f) collector backfill (fake session) — 720/day/asset, "
           "re-run inserts 0, incremental window correct")
+
+
+def test_backfill_resumes_after_crash():
+    db = _tmp_db()
+    now = datetime(2026, 11, 25, 12, 0, tzinfo=DHAKA)
+    assets = ["AAA_otc", "BBB_otc", "CCC_otc", "DDD_otc"]
+    # Run 1 dies on the 4th fetch (first asset of batch 2): batch 1
+    # (AAA/BBB/CCC) must already be stored, not lost with the crash.
+    try:
+        asyncio.run(run_backfill(
+            db, CrashySession(assets, crash_after=3, now=now),
+            days=5, now=now))
+    except QuotexRateLimited:
+        pass
+    else:
+        raise AssertionError("backfill did not stop on 429")
+    assert db.count_total() == 3 * 4320, db.count_total()
+    assert db.get_state("backfill_done") != "true"
+    # Run 2 (healthy) skips the 3 done assets and finishes DDD only.
+    done, total = asyncio.run(run_backfill(
+        db, CrashySession(assets, crash_after=None, now=now),
+        days=5, now=now))
+    assert done == 4, done
+    assert total == 4320, total
+    assert db.count_total() == 4 * 4320
+    assert db.get_state("backfill_done") == "true"
+    print("PASS f3) backfill resumes after crash — done assets kept, "
+          "restart skips them and finishes the rest")
 
 
 def test_collector_429_stops_run():
@@ -381,10 +433,11 @@ def main():
     test_checker_from_db()
     test_webhook_branch()
     test_collector_backfill_fake()
+    test_backfill_resumes_after_crash()
     test_collector_429_stops_run()
     test_post_init_starts_collector_only_when_active()
     test_handlers_db_end_to_end()
-    print("ALL TESTS PASSED (9/9)")
+    print("ALL TESTS PASSED (10/10)")
 
 
 if __name__ == "__main__":

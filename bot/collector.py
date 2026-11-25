@@ -13,6 +13,10 @@ Anti-429 design (agreed with Saiful):
   the window are stored.
 - Resumable: UNIQUE(asset, ts) ignores candles already in the DB,
   and every 2-hourly run re-fetches the last 10 minutes as overlap.
+  The backfill saves progress per batch: each batch of 3 assets is
+  fetched AND stored immediately, and assets whose backfill span is
+  already complete are skipped — so a Render sleep/restart resumes
+  where the last run stopped instead of starting over from asset 1.
 
 Runs:
 - Backfill (once, on startup, background task): the last 5
@@ -226,10 +230,43 @@ async def _fetch_assets_3_at_a_time(session, assets, seconds_back):
     return results
 
 
+def _asset_backfill_complete(db, asset, dates, now):
+    """True when an asset already has its full backfill span in the DB:
+    every completed day in `dates` at all 720 candles, and today from
+    00:00 up to now (12:00 cap). Such assets are skipped on a re-run,
+    so a restart resumes instead of re-fetching everything. Today is
+    included because a morning restart must still top today up."""
+    for d in dates:
+        if db.count_candles(asset, d) < 720:
+            return False
+    noon = now.replace(hour=12, minute=0, second=0, microsecond=0)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    expected_today = int((min(now, noon) - start).total_seconds() // 60)
+    if expected_today > 0:
+        if db.count_candles(asset, now.strftime("%Y-%m-%d")) < expected_today:
+            return False
+    return True
+
+
+def _store_rows(db, asset, raw, ts_min, ts_max=None):
+    """Convert raw candles to rows, keep those in [ts_min, ts_max),
+    insert into the DB. Returns (rows_in_window, new_in_db)."""
+    rows = rows_from_raw(raw)
+    rows = [r for r in rows
+            if r["ts"] >= ts_min and (ts_max is None or r["ts"] < ts_max)]
+    if not rows:
+        return 0, 0
+    return len(rows), db.insert_candles(asset, rows)
+
+
 async def run_backfill(db, session, days=None, now=None):
     """Collect the last `days` completed days + today 00:00-now.
 
     One fetch per asset covers the whole span; days are split locally.
+    Progress is saved per batch: each batch of 3 assets is fetched
+    and stored immediately, and assets whose span is already complete
+    are skipped — so a restart (Render sleep, crash, redeploy) resumes
+    where the last run stopped instead of starting over from asset 1.
     Returns (assets_done, candles_inserted). Raises QuotexRateLimited.
     """
     days = days if days is not None else config.BACKFILL_DAYS
@@ -246,20 +283,26 @@ async def run_backfill(db, session, days=None, now=None):
                 "span %d seconds back",
                 len(assets), days, dates[-1], dates[0], seconds_back)
 
-    raw_by_asset = await _fetch_assets_3_at_a_time(session, assets, seconds_back)
     total = 0
     done = 0
-    for asset, raw in raw_by_asset.items():
-        if not raw:
+    for i in range(0, len(assets), 3):
+        batch = assets[i:i + 3]
+        todo = [a for a in batch
+                if not _asset_backfill_complete(db, a, dates, now)]
+        if not todo:
+            logger.info("collector: backfill batch %s — already in DB, skipped",
+                        ", ".join(batch))
+            done += len(batch)
             continue
-        rows = rows_from_raw(raw)
-        # Only keep candles from the backfill span (oldest day 00:00 -> now).
-        rows = [r for r in rows if r["ts"] >= oldest_start]
-        inserted = db.insert_candles(asset, rows)
-        total += inserted
-        done += 1
-        logger.info("collector: backfill %s — %d candles in window, %d new in DB",
-                    asset, len(rows), inserted)
+        raw_by_asset = await _fetch_assets_3_at_a_time(session, todo, seconds_back)
+        for asset, raw in raw_by_asset.items():
+            if not raw:
+                continue
+            n_rows, inserted = _store_rows(db, asset, raw, oldest_start)
+            total += inserted
+            done += 1
+            logger.info("collector: backfill %s — %d candles in window, %d new in DB",
+                        asset, n_rows, inserted)
 
     db.set_state("last_backfill", utc_iso(now))
     db.set_state("backfill_done", "true")
@@ -274,6 +317,8 @@ async def run_backfill(db, session, days=None, now=None):
 async def run_incremental(db, session, now=None):
     """Collect the last 2 hours (+10 min overlap) for all open assets.
 
+    Each batch of 3 assets is fetched and stored immediately, so a
+    restart keeps what was already collected.
     Returns (assets_done, candles_inserted). Raises QuotexRateLimited.
     """
     now = now or dhaka_now()
@@ -289,16 +334,17 @@ async def run_incremental(db, session, now=None):
                 start.astimezone(DHAKA).strftime("%H:%M"),
                 end.astimezone(DHAKA).strftime("%H:%M"))
 
-    raw_by_asset = await _fetch_assets_3_at_a_time(session, assets, seconds_back)
     total = 0
     done = 0
-    for asset, raw in raw_by_asset.items():
-        if not raw:
-            continue
-        rows = [r for r in rows_from_raw(raw) if start <= r["ts"] < end]
-        inserted = db.insert_candles(asset, rows)
-        total += inserted
-        done += 1
+    for i in range(0, len(assets), 3):
+        batch = assets[i:i + 3]
+        raw_by_asset = await _fetch_assets_3_at_a_time(session, batch, seconds_back)
+        for asset, raw in raw_by_asset.items():
+            if not raw:
+                continue
+            n_rows, inserted = _store_rows(db, asset, raw, start, end)
+            total += inserted
+            done += 1
     db.set_state("last_collection", utc_iso(now))
     nxt = now + timedelta(seconds=config.COLLECTOR_INTERVAL_SECONDS)
     db.set_state("next_collection", utc_iso(nxt))

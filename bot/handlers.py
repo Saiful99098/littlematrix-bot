@@ -308,7 +308,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception:
+        # "Query is too old" / timeout (slow instance under backfill
+        # load): the tap still works — the menu is edited below.
+        pass
     data = query.data
     user = update.effective_user
     database.get_or_create_user(user.id, user.username or "")
