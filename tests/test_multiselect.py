@@ -349,6 +349,49 @@ def test_botstatus_refresh():
     print("PASS g) Bot Status has Refresh and re-reads the database")
 
 
+def test_payouts_as_buttons():
+    db, tmp = _tmp_db()
+    _load_today(db, "BTCUSD_otc")
+    _load_today(db, "ETHUSD_otc")
+    db.set_payouts([("BTCUSD_otc", 95.0, True, "2026-11-26 11:48:34"),
+                    ("ETHUSD_otc", 93.0, True, "2026-11-26 11:48:34"),
+                    ("XAUUSD_otc", 91.0, True, "2026-11-26 11:48:34")])
+    restore = _setup(db)
+    try:
+        ctx = FakeContext()
+        q = FakeQuery("menu_payouts")
+        _drive(ctx, q, "menu_payouts")
+        text = q.texts[-1]
+        # No dead list: the payouts are buttons with the % on them.
+        assert "BTCUSD-OTC: 95%" not in text, text
+        assert "Updated: 2026-11-26 11:48:34" in text, text
+        btc = _button(q, "payout_BTCUSD_otc")
+        eth = _button(q, "payout_ETHUSD_otc")
+        assert btc is not None and eth is not None, q.texts[-1]
+        assert "95%" in btc.text and "BTCUSD-OTC" in btc.text, btc.text
+        assert "93%" in eth.text, eth.text
+        # Every payout button carries a premium money icon, best first.
+        payout_btns = [b for b in _last_buttons(q)
+                       if b.callback_data.startswith("payout_")]
+        assert len(payout_btns) == 3, payout_btns
+        assert all(b.icon_custom_emoji_id == "6267068789146260253"
+                   for b in payout_btns), payout_btns
+        assert payout_btns[0].callback_data == "payout_BTCUSD_otc", payout_btns
+        # Tapping one opens that market's Market Live detail.
+        _drive(ctx, q, "payout_BTCUSD_otc")
+        assert "Market Live" in q.texts[-1], q.texts[-1]
+        assert "BTCUSD-OTC" in q.texts[-1], q.texts[-1]
+        # The board itself refreshes (go back and refresh it).
+        _drive(ctx, q, "menu_payouts")
+        n_before = len(q.texts)
+        _drive(ctx, q, "refresh")
+        assert len(q.texts) > n_before, q.texts
+        assert "Live Payouts" in q.texts[-1], q.texts[-1]
+    finally:
+        restore()
+    print("PASS h) payouts are buttons with % + premium icon; tap opens Market Live")
+
+
 if __name__ == "__main__":
     test_analysis_multiselect_toggle_and_next()
     test_analysis_next_empty_warns()
@@ -357,4 +400,5 @@ if __name__ == "__main__":
     test_futures_select_all_toggle()
     test_refresh_reruns_same_result()
     test_botstatus_refresh()
+    test_payouts_as_buttons()
     print("ALL MULTI-SELECT TESTS PASSED")

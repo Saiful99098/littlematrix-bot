@@ -200,4 +200,6 @@ BUTTON_ICONS = {
     "refresh": "5375338737028841420",
     # ✅ selected asset — same ID as pe("check")
     "check": "6267008582294705964",
+    # 💰 payout buttons — same ID as pe("money")
+    "money": "6267068789146260253",
 }

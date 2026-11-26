@@ -668,6 +668,8 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _run_futures(query, context, start, end, animate=False)
         elif spec[0] == "botstatus":
             await _run_bot_status(query, context)
+        elif spec[0] == "payouts":
+            await _run_payouts(query, context)
         return
 
     if data == "check_member":
@@ -942,7 +944,11 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _run_otc_board(query, context)
         return
     if data == "menu_payouts":
-        await _run_payouts(query)
+        await _run_payouts(query, context)
+        return
+    if data.startswith("payout_"):
+        # A payout button opens that market's Market Live detail.
+        await _run_market(query, data[len("payout_"):], context)
         return
     if data == "menu_counter":
         await _show_analysis_picker(query, context, "counter")
@@ -1407,8 +1413,14 @@ async def _run_market(query, assets=None, context=None):
         _store_result_spec(context, query, ("an", "market", assets))
 
 
-async def _run_payouts(query):
-    """Payouts from the DB snapshot the collector stores each run."""
+async def _run_payouts(query, context=None):
+    """Payouts from the DB snapshot the collector stores each run.
+
+    Shown as buttons, not a dead list: each button carries the asset
+    + its 1M payout % with a premium money icon (the owner, 2026-11-26).
+    Tapping one opens that market's Market Live detail — a high payout
+    is worth a look before trading it. Best payout first, top 15.
+    """
     try:
         rows = _db().get_payouts()
     except Exception:
@@ -1417,17 +1429,27 @@ async def _run_payouts(query):
         text = (f"{pe('money')} Live Payouts {pe('dollar')}\n"
                 "No payout snapshot yet — the collector stores one on every run. "
                 "Try again after the next collection.")
-    else:
-        shown = rows[:15]
-        lines = []
-        for a, p, _o, _u in shown:
-            lines.append(f"{display_asset(a)}: {p:.0f}%" if p is not None
-                         else f"{display_asset(a)}: —")
-        updated = rows[0][3] if rows and rows[0][3] else "—"
-        text = (f"{pe('money')} Live Payouts (1M) {pe('dollar')}\n{DIVIDER}\n"
-                + "\n".join(lines)
-                + f"\n\nUpdated: {updated} (Dhaka, next update with the next collection)")
-    await query.edit_message_text(text, reply_markup=back_keyboard(), parse_mode="HTML")
+        await query.edit_message_text(text, reply_markup=back_keyboard(), parse_mode="HTML")
+        return
+    shown = rows[:15]
+    updated = rows[0][3] if rows and rows[0][3] else "—"
+    text = (f"{pe('money')} Live Payouts (1M) {pe('dollar')}\n{DIVIDER}\n"
+            "Tap a market to see its live detail.\n\n"
+            f"Updated: {updated} (Dhaka, next update with the next collection)")
+    kb = []
+    for i in range(0, len(shown), 2):
+        row = []
+        for a, p, _o, _u in shown[i:i + 2]:
+            label = (f"{display_asset(a)} {p:.0f}%" if p is not None
+                     else f"{display_asset(a)} —")
+            row.append(_btn(label, f"payout_{a}", icon="money"))
+        kb.append(row)
+    kb.append([_btn("Refresh", "refresh", icon="refresh")])
+    kb.append([_btn("Back to Menu", "menu_main", icon="back")])
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb),
+                                  parse_mode="HTML")
+    if context is not None:
+        _store_result_spec(context, query, ("payouts",))
 
 
 async def _run_news(query):
@@ -1857,7 +1879,7 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         results, summary = check_signals(lines, lookup, check_date,
                                          with_mtg1=with_mtg1)
         await working.edit_text(
-            f"{pe('search')}{pe('diamond')} Check Results:\n{DIVIDER}\n\n"
+            f"{pe('search')}{pe('diamond')} Check Results — {check_date}:\n{DIVIDER}\n\n"
             + format_check_results(results, summary),
             reply_markup=back_keyboard(), parse_mode="HTML")
         context.user_data["flow"] = None

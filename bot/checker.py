@@ -13,8 +13,10 @@ Rules agreed with the owner:
 - Summary: Total / WIN / LOSS / DOJI / NO DATA / WIN%.
   WIN% = WIN / (WIN + LOSS) — DOJI and NO DATA excluded.
 - Optional MTG1: if LOSS, check the next minute's candle with the
-  same direction. Reported as an extra line only, never overwriting
-  the M1 result.
+  same direction. An MTG1 WIN counts as a WIN in the summary (the
+  owner, 2026-11-26): in MTG mode the MTG1 result IS the result, so
+  there is one Accuracy line, never a separate "MTG1 Accuracy".
+  An MTG1 LOSS / DOJI / NO DATA leaves the M1 loss standing.
 """
 from __future__ import annotations
 
@@ -110,18 +112,18 @@ def check_signals(lines, candles_by_key, date_str, with_mtg1=False):
     doji = sum(1 for r in results if r["result"] == "DOJI")
     no_data = sum(1 for r in results if r["result"] == "NO DATA")
     total = len(results)
+    if with_mtg1:
+        # MTG mode: a LOSS recovered by MTG1 counts as a WIN in the
+        # summary (the owner, 2026-11-26) — the MTG1 result IS the
+        # result. An MTG1 DOJI / NO DATA leaves the M1 loss standing.
+        recovered = sum(1 for r in results
+                        if r["result"] == "LOSS" and r.get("mtg1") == "WIN")
+        win += recovered
+        loss -= recovered
     decided = win + loss
     win_pct = round(win / decided * 100, 1) if decided else 0.0
     summary = {"total": total, "win": win, "loss": loss, "doji": doji,
                "no_data": no_data, "win_pct": win_pct}
-    if with_mtg1:
-        # MTG1 accuracy: M1 WINs plus M1 LOSSes recovered by MTG1.
-        mtg_wins = sum(1 for r in results
-                       if r["result"] == "WIN"
-                       or (r["result"] == "LOSS" and r.get("mtg1") == "WIN"))
-        summary["mtg_win"] = mtg_wins
-        summary["mtg_win_pct"] = (round(mtg_wins / decided * 100, 1)
-                                  if decided else 0.0)
     return results, summary
 
 
@@ -192,6 +194,7 @@ def format_check_results(results, summary):
                  f"{pe('cross')} {summary['loss']} | {pe('minus')} {summary['doji']} | "
                  f"? {summary['no_data']}")
     lines.append(f"Accuracy: {summary['win_pct']}%")
-    if "mtg_win_pct" in summary:
-        lines.append(f"MTG1 Accuracy: {summary['mtg_win_pct']}%")
+    # One Accuracy line only: in MTG mode the win/loss counts above
+    # already count MTG1 wins as wins, so there is no separate
+    # "MTG1 Accuracy" line (the owner, 2026-11-26).
     return "\n".join(lines)

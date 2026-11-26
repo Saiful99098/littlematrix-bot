@@ -190,14 +190,17 @@ def test_checker_mtg1_choice_no_arrow():
     assert summary["win"] == 7 and summary["loss"] == 5, summary
     assert summary["win_pct"] == 58.3, summary
     assert "mtg_win_pct" not in summary, summary
-    # MTG1: 3 losses recover -> 10/12 = 83.3%.
+    # MTG1: 3 losses recover -> the summary counts them as wins:
+    # 10 WIN / 2 LOSS = 83.3%, one Accuracy line, no MTG1 line.
     _, summary_mtg = check_signals(lines, lookup, d, with_mtg1=True)
-    assert summary_mtg["mtg_win"] == 10, summary_mtg
-    assert summary_mtg["mtg_win_pct"] == 83.3, summary_mtg
+    assert summary_mtg["win"] == 10 and summary_mtg["loss"] == 2, summary_mtg
+    assert summary_mtg["win_pct"] == 83.3, summary_mtg
+    assert "mtg_win" not in summary_mtg, summary_mtg
     text = format_check_results(
         check_signals(lines, lookup, d, with_mtg1=True)[0], summary_mtg)
     assert "→" not in text, text
-    assert "MTG1 Accuracy: 83.3%" in text, text
+    assert "Accuracy: 83.3%" in text, text
+    assert "MTG1 Accuracy" not in text, text
     # No "(MTG1: ...)" suffix: an MTG1 win is the check sticker + dot,
     # an MTG1 loss is just the loss sticker.
     assert "(MTG1:" not in text, text
@@ -208,8 +211,59 @@ def test_checker_mtg1_choice_no_arrow():
     mtg_loss_line = [ln for ln in text.splitlines()
                      if ln.startswith("BTCUSD-OTC,09:06")][0]
     assert mtg_loss_line.endswith(pe("cross")), mtg_loss_line
-    print("PASS 6) checker MTG1 choice — M1 58.3%, MTG1 83.3%, no arrow, "
-          "MTG1 win = check + dot, no (MTG1:) suffix")
+    print("PASS 6) checker MTG1 choice — M1 58.3%, MTG1 wins count as wins "
+          "(83.3%), no arrow, MTG1 win = check + dot, no (MTG1:) suffix, "
+          "no MTG1 line")
+
+
+def test_checker_mtg_wins_count_as_wins():
+    # The owner's real 12-signal list 2026-11-26 (reported 13:23):
+    # M1 5 WIN / 7 LOSS = 41.7%. 4 of the 7 losses recover on MTG1
+    # (09:26, 09:58, 10:06, 10:41) -> the summary must count them as
+    # wins: 9 WIN / 3 LOSS = 75.0%, one Accuracy line.
+    d = "2026-11-26"
+    per_asset = {}
+    for asset, hhmm, direction in [
+            ("AXSUSD_otc", "09:02", "PUT"), ("AXSUSD_otc", "09:58", "PUT"),
+            ("AXSUSD_otc", "09:59", "CALL"), ("AXSUSD_otc", "10:06", "PUT"),
+            ("AXSUSD_otc", "10:07", "CALL"),
+            ("CADJPY_otc", "09:16", "PUT"), ("CADJPY_otc", "09:26", "CALL"),
+            ("CADJPY_otc", "09:27", "PUT"),
+            ("EURAUD_otc", "09:40", "PUT"), ("EURAUD_otc", "09:41", "PUT"),
+            ("EURAUD_otc", "10:29", "PUT"), ("EURAUD_otc", "10:30", "PUT"),
+            ("DOTUSD_otc", "09:47", "CALL"), ("DOTUSD_otc", "10:15", "CALL"),
+            ("EURGBP_otc", "10:41", "CALL"), ("EURGBP_otc", "10:42", "PUT"),
+            ("DASUSD_otc", "10:48", "PUT"),
+            ("CADCHF_otc", "10:55", "CALL"), ("CADCHF_otc", "10:56", "CALL")]:
+        per_asset.setdefault(asset, []).append(_mk_candle(d, hhmm, direction))
+    lookup = {}
+    for asset, cs in per_asset.items():
+        lookup.update(build_lookup(cs, asset))
+    lines = ["AXSUSD-OTC,09:02 M1 PUT", "CADJPY-OTC,09:16 M1 PUT",
+             "CADJPY-OTC,09:26 M1 PUT", "EURAUD-OTC,09:40 M1 CALL",
+             "DOTUSD-OTC,09:47 M1 CALL", "AXSUSD-OTC,09:58 M1 CALL",
+             "AXSUSD-OTC,10:06 M1 CALL", "DOTUSD-OTC,10:15 M1 CALL",
+             "EURAUD-OTC,10:29 M1 CALL", "EURGBP-OTC,10:41 M1 PUT",
+             "DASUSD-OTC,10:48 M1 PUT", "CADCHF-OTC,10:55 M1 PUT"]
+    # Non-MTG (M1 only): 5 WIN / 7 LOSS = 41.7%.
+    _, summary = check_signals(lines, lookup, d)
+    assert summary["win"] == 5 and summary["loss"] == 7, summary
+    assert summary["win_pct"] == 41.7, summary
+    # MTG1: 4 losses recover -> 9 WIN / 3 LOSS = 75.0%.
+    _, summary_mtg = check_signals(lines, lookup, d, with_mtg1=True)
+    assert summary_mtg["win"] == 9 and summary_mtg["loss"] == 3, summary_mtg
+    assert summary_mtg["win_pct"] == 75.0, summary_mtg
+    text = format_check_results(
+        check_signals(lines, lookup, d, with_mtg1=True)[0], summary_mtg)
+    assert "Accuracy: 75.0%" in text, text
+    assert "MTG1 Accuracy" not in text, text
+    # The dotted check lines (MTG1 wins) are the 4 recovered ones.
+    from bot.premium_emoji import pe
+    dotted = [ln for ln in text.splitlines()
+              if ln.rstrip().endswith(pe("check") + ".")]
+    assert len(dotted) == 4, dotted
+    print("PASS 6b) checker MTG1 — owner's 12-signal list: M1 41.7%, "
+          "MTG1 wins count as wins -> 9/12 = 75.0%, one Accuracy line")
 
 
 def test_formatter_flips_format():
@@ -250,9 +304,10 @@ def main():
     test_tie_and_majority()
     test_no_data_renders_plain_question_mark()
     test_checker_mtg1_choice_no_arrow()
+    test_checker_mtg_wins_count_as_wins()
     test_formatter_flips_format()
     test_checker_date_parse()
-    print("ALL TESTS PASSED (8/8)")
+    print("ALL TESTS PASSED (9/9)")
 
 
 if __name__ == "__main__":
