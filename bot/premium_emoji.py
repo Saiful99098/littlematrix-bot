@@ -196,4 +196,8 @@ BUTTON_ICONS = {
     "time": "6285240160120477644",
     # 🔄 MTG1 — same ID as the Swap button icon
     "mtg": "5017470156276761427",
+    # 🔄 Refresh — same ID as pe("refresh")
+    "refresh": "5375338737028841420",
+    # ✅ selected asset — same ID as pe("check")
+    "check": "6267008582294705964",
 }

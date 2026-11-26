@@ -138,6 +138,67 @@ def back_keyboard():
         [[_btn("Back to Menu", "menu_main", icon="back")]])
 
 
+def _generated_line():
+    """When this result was built (Dhaka time). A Telegram message is
+    frozen once sent — a 12:52 AI Signal is still 12:52 at 12:57 —
+    so every result carries its build time and is never mistaken
+    for live data."""
+    return f"Generated: {datetime.now(candles_db.DHAKA).strftime('%H:%M:%S')} (Dhaka)"
+
+
+def _candle_age_text(last):
+    """How old the last candle is ('2 min ago'), from its Dhaka
+    datetime string. '' when it cannot be parsed."""
+    try:
+        dt = datetime.strptime(last["datetime"], "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=candles_db.DHAKA)
+        mins = max(0, int((datetime.now(candles_db.DHAKA) - dt).total_seconds() // 60))
+    except Exception:
+        return ""
+    return "just now" if mins == 0 else f"{mins} min ago"
+
+
+def _refresh_keyboard():
+    """Refresh + Back, for result messages. Refresh re-runs exactly
+    the result shown in that message (see _store_result_spec)."""
+    return InlineKeyboardMarkup([
+        [_btn("Refresh", "refresh", icon="refresh")],
+        [_btn("Back to Menu", "menu_main", icon="back")]])
+
+
+def _store_result_spec(context, query_or_mid, spec):
+    """Remember what a result message shows, keyed by its message id,
+    so its Refresh button re-runs exactly that result — not whatever
+    the user picked afterwards. `query_or_mid` is a CallbackQuery (its
+    message id is used) or a raw message id (the custom-time text
+    flow's working message). Keeps the last 10 results."""
+    if isinstance(query_or_mid, int):
+        mid = query_or_mid
+    else:
+        try:
+            mid = query_or_mid.message.message_id if query_or_mid.message else None
+        except Exception:
+            mid = None
+    if mid is None:
+        return
+    store = context.user_data.setdefault("result_specs", {})
+    store[mid] = spec
+    while len(store) > 10:
+        store.pop(next(iter(store)))
+
+
+def _fs_asset_label(asset):
+    """Label for the futures progress lines: 'SELECT ALL', one asset,
+    or 'N assets' for a multi-asset selection."""
+    if asset == "ALL":
+        return "SELECT ALL"
+    if isinstance(asset, list):
+        if len(asset) == 1:
+            return display_asset(asset[0])
+        return f"{len(asset)} assets"
+    return display_asset(asset)
+
+
 DIVIDER = "━━━━━━━━━━━━━━━"
 
 
@@ -164,29 +225,34 @@ def _filter_assets_by_mode(assets, mode):
     return [a for a in assets if _is_otc(a)]
 
 
-def _asset_picker_keyboard(assets, page, mode):
-    """Paginated asset picker: SELECT ALL on top, 2 assets per row,
-    12 per page, Prev/Next navigation."""
+def _asset_picker_keyboard(assets, page, mode, selected=None):
+    """Paginated MULTI-SELECT asset picker: tap an asset to toggle it
+    (a premium check appears on selected buttons), SELECT ALL toggles
+    everything, Next continues with the selection. The picker stays
+    on the same page — it is re-rendered in place on every tap."""
+    selected = selected or set()
     kb = [[_btn("SELECT ALL", "fs_asset_ALL", icon="select_all", style="success")]]
     total_pages = max(1, (len(assets) + ASSETS_PER_PAGE - 1) // ASSETS_PER_PAGE)
     page = max(0, min(page, total_pages - 1))
     chunk = assets[page * ASSETS_PER_PAGE:(page + 1) * ASSETS_PER_PAGE]
     for i in range(0, len(chunk), 2):
-        row = [_btn(display_asset(a), f"fs_asset_{a}", icon="asset")
+        row = [_btn(display_asset(a), f"fs_asset_{a}",
+                    icon="check" if a in selected else "asset")
                for a in chunk[i:i + 2]]
         kb.append(row)
     nav = []
     if page > 0:
-        nav.append(_btn("Prev", f"fs_assets_page_{page - 1}", icon="back"))
+        nav.append(_btn("Prev Page", f"fs_assets_page_{page - 1}", icon="back"))
     if page < total_pages - 1:
-        nav.append(_btn("Next", f"fs_assets_page_{page + 1}", icon="next"))
+        nav.append(_btn("Next Page", f"fs_assets_page_{page + 1}", icon="next"))
     if nav:
         kb.append(nav)
+    kb.append([_btn("Next", "fs_next", icon="next")])
     kb.append([_btn("Back", "menu_main", icon="back")])
     return InlineKeyboardMarkup(kb), page, total_pages
 
 
-def _asset_picker_text(assets, page, total_pages, mode, live):
+def _asset_picker_text(assets, page, total_pages, mode, live, selected=None):
     if config.DATA_MODE == "db":
         src = (f"{pe('diamond')} Database assets ({len(assets)} for {mode}) — "
                "from the candle database, no Quotex login.")
@@ -196,7 +262,8 @@ def _asset_picker_text(assets, page, total_pages, mode, live):
         src = (f"{pe('diamond')} Local test — only these 6 assets here.\n"
                "Live mode shows every open asset from Quotex.")
     return (f"{pe('diamond')} BLUE FISH PRIME • CHOOSE ASSET\n{DIVIDER}\n"
-            f"{src}\nPage {page + 1}/{total_pages}")
+            f"{src}\nPage {page + 1}/{total_pages}\n"
+            f"Selected: {len(selected or [])} — tap an asset to toggle it, then tap Next.")
 
 
 # Analysis tools (AI Signal, Candle Scan, Trend Scan, Market Live) ask
@@ -219,35 +286,59 @@ def _analysis_assets():
     return otc + real
 
 
-def _analysis_picker_keyboard(assets, page, tool):
-    """Paginated asset picker for one analysis tool: 2 assets per row,
-    12 per page, Prev/Next navigation."""
-    kb = []
+def _analysis_picker_keyboard(assets, page, tool, selected=None):
+    """Paginated MULTI-SELECT asset picker for one analysis tool:
+    tap a market to toggle it (a premium check appears on selected
+    buttons), SELECT ALL toggles everything, Next runs the tool for
+    the selection. The picker stays on the same page — it is
+    re-rendered in place on every tap."""
+    selected = selected or set()
+    kb = [[_btn("SELECT ALL", f"an_all_{tool}", icon="select_all", style="success")]]
     total_pages = max(1, (len(assets) + ASSETS_PER_PAGE - 1) // ASSETS_PER_PAGE)
     page = max(0, min(page, total_pages - 1))
     chunk = assets[page * ASSETS_PER_PAGE:(page + 1) * ASSETS_PER_PAGE]
     for i in range(0, len(chunk), 2):
-        kb.append([_btn(display_asset(a), f"an_asset_{tool}_{a}", icon="asset")
+        kb.append([_btn(display_asset(a), f"an_asset_{tool}_{a}",
+                        icon="check" if a in selected else "asset")
                    for a in chunk[i:i + 2]])
     nav = []
     if page > 0:
-        nav.append(_btn("Prev", f"an_page_{tool}_{page - 1}", icon="back"))
+        nav.append(_btn("Prev Page", f"an_page_{tool}_{page - 1}", icon="back"))
     if page < total_pages - 1:
-        nav.append(_btn("Next", f"an_page_{tool}_{page + 1}", icon="next"))
+        nav.append(_btn("Next Page", f"an_page_{tool}_{page + 1}", icon="next"))
     if nav:
         kb.append(nav)
+    kb.append([_btn("Next", f"an_next_{tool}", icon="next")])
     kb.append([_btn("Back", "menu_main", icon="back")])
     return InlineKeyboardMarkup(kb), page, total_pages
 
 
-def _analysis_picker_text(tool, page, total_pages):
-    return (f"{pe('diamond')} {_ANALYSIS_TOOLS[tool]} — pick a market {pe('chart')}\n"
-            f"{DIVIDER}\nPage {page + 1}/{total_pages}")
+def _analysis_picker_text(tool, page, total_pages, selected=None):
+    return (f"{pe('diamond')} {_ANALYSIS_TOOLS[tool]} — pick markets {pe('chart')}\n"
+            f"{DIVIDER}\nPage {page + 1}/{total_pages}\n"
+            f"Selected: {len(selected or [])} — tap a market to toggle it, then tap Next.")
 
 
-async def _show_analysis_picker(query, tool):
+async def _rerender_an_picker(query, context, tool, warn=False):
+    """Re-render the analysis picker in place (same page, updated
+    check marks). Used on every toggle tap."""
+    assets = _analysis_assets()
+    selected = context.user_data.get("an_selected") or set()
+    page = context.user_data.get("an_page", 0)
+    kb, page, total_pages = _analysis_picker_keyboard(assets, page, tool, selected)
+    text = _analysis_picker_text(tool, page, total_pages, selected)
+    if warn:
+        text += f"\n\n{pe('warning')} Select at least 1 market first."
+    await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+async def _show_analysis_picker(query, context, tool):
     """Show the asset picker for one analysis tool, or the empty-DB
-    message when no candles have been collected yet."""
+    message when no candles have been collected yet. Starts a fresh
+    (empty) selection."""
+    context.user_data["an_tool"] = tool
+    context.user_data["an_selected"] = set()
+    context.user_data["an_page"] = 0
     assets = _analysis_assets()
     if not assets:
         await query.edit_message_text(
@@ -481,6 +572,49 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text, reply_markup=main_keyboard(), parse_mode="HTML")
 
 
+async def _rerender_fs_picker(query, context, warn=False):
+    """Re-render the futures asset picker in place (same page, updated
+    check marks). Used on every toggle tap."""
+    assets = context.user_data.get("fs_assets") or config.SAMPLE_ASSETS
+    mode = context.user_data.get("fs_mode", "OTC FS")
+    live = config.DATA_MODE == "live" and config.has_quotex_login()
+    page = context.user_data.get("fs_assets_page", 0)
+    selected = context.user_data.get("fs_selected") or set()
+    kb, page, total_pages = _asset_picker_keyboard(assets, page, mode, selected)
+    text = _asset_picker_text(assets, page, total_pages, mode, live, selected)
+    if warn:
+        text += f"\n\n{pe('warning')} Select at least 1 asset first."
+    await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+async def _show_futures_days_question(query, context):
+    """Days question — shown after the asset selection (Next)."""
+    context.user_data["flow"] = "futures_days"
+    if config.DATA_MODE == "db":
+        kb = [[_btn("1 Day", "fs_days_1", icon="days"),
+               _btn("2 Days", "fs_days_2", icon="days"),
+               _btn("3 Days", "fs_days_3", icon="days"),
+               _btn("5 Days", "fs_days_5", icon="days")],
+              [_btn("Back", "menu_main", icon="back")]]
+        await query.edit_message_text(
+            f"{pe('diamond')} How many days of history should shape the signals? {pe('chart')}\n"
+            "The database holds the last 5 full days (00:00-23:59 each day). "
+            "Signals are built from those days at the same HH:MM.",
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+        return
+    kb = [[_btn("1 Day", "fs_days_1", icon="days"),
+           _btn("2 Days", "fs_days_2", icon="days"),
+           _btn("3 Days", "fs_days_3", icon="days"),
+           _btn("10 Days", "fs_days_10", icon="days")],
+          [_btn("Back", "menu_main", icon="back")]]
+    await query.edit_message_text(
+        f"{pe('diamond')} How many days of history should shape the signals? {pe('chart')}\n"
+        "Local test uses 1 day of sample data. Picking 2/3/10 days "
+        "shows the 1-day result for now — multi-day voting needs "
+        "the 20-day database (Render step).",
+        reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+
+
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     try:
@@ -503,6 +637,38 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 _join_gate_text(), reply_markup=_join_keyboard(),
                 parse_mode="HTML")
             return
+
+    if data == "refresh":
+        # Re-run exactly the result shown in THIS message (stored by
+        # _store_result_spec under its message id) — so a 12:52 result
+        # never silently becomes "current" data at 12:57.
+        mid = query.message.message_id if query.message else None
+        spec = (context.user_data.get("result_specs") or {}).get(mid)
+        if not spec:
+            await query.edit_message_text(
+                f"{pe('warning')} This result is too old to refresh — "
+                "open it again from the menu.",
+                reply_markup=back_keyboard(), parse_mode="HTML")
+            return
+        if spec[0] == "an":
+            _, tool, assets = spec
+            if tool == "ai":
+                await _run_ai_signal(query, context, assets, animate=False)
+            elif tool == "counter":
+                await _run_counter(query, assets, context)
+            elif tool == "trend":
+                await _run_trend(query, assets, context)
+            elif tool == "market":
+                await _run_market(query, assets, context)
+        elif spec[0] == "fs":
+            _, assets, days, mode, start, end = spec
+            context.user_data["fs_asset"] = assets
+            context.user_data["fs_days"] = days
+            context.user_data["fs_mode"] = mode
+            await _run_futures(query, context, start, end, animate=False)
+        elif spec[0] == "botstatus":
+            await _run_bot_status(query, context)
+        return
 
     if data == "check_member":
         _member_cache.pop(user.id, None)
@@ -586,6 +752,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("fs_mode_"):
         context.user_data["fs_mode"] = data[len("fs_mode_"):]
         context.user_data["flow"] = "futures_asset"
+        context.user_data["fs_selected"] = set()
         mode = context.user_data["fs_mode"]
         # db mode: assets come from the candle database — no Quotex
         # login here. If the backfill has not finished yet, the DB
@@ -652,38 +819,50 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mode = context.user_data.get("fs_mode", "OTC FS")
         live = config.DATA_MODE == "live" and config.has_quotex_login()
         context.user_data["fs_assets_page"] = page
-        kb, page, total_pages = _asset_picker_keyboard(assets, page, mode)
+        selected = context.user_data.get("fs_selected") or set()
+        kb, page, total_pages = _asset_picker_keyboard(assets, page, mode, selected)
         await query.edit_message_text(
-            _asset_picker_text(assets, page, total_pages, mode, live),
+            _asset_picker_text(assets, page, total_pages, mode, live, selected),
             reply_markup=kb, parse_mode="HTML")
         return
 
+    if data == "fs_asset_ALL":
+        # SELECT ALL toggles everything (on, or off when all selected).
+        assets = context.user_data.get("fs_assets") or config.SAMPLE_ASSETS
+        selected = set(context.user_data.get("fs_selected") or set())
+        if set(assets) <= selected:
+            selected = set()
+        else:
+            selected = set(assets)
+        context.user_data["fs_selected"] = selected
+        await _rerender_fs_picker(query, context)
+        return
+
     if data.startswith("fs_asset_"):
-        context.user_data["fs_asset"] = data[len("fs_asset_"):]
-        context.user_data["flow"] = "futures_days"
-        if config.DATA_MODE == "db":
-            kb = [[_btn("1 Day", "fs_days_1", icon="days"),
-                   _btn("2 Days", "fs_days_2", icon="days"),
-                   _btn("3 Days", "fs_days_3", icon="days"),
-                   _btn("5 Days", "fs_days_5", icon="days")],
-                  [_btn("Back", "menu_main", icon="back")]]
-            await query.edit_message_text(
-                f"{pe('diamond')} How many days of history should shape the signals? {pe('chart')}\n"
-                "The database holds the last 5 full days (00:00-23:59 each day). "
-                "Signals are built from those days at the same HH:MM.",
-                reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+        # Toggle one asset — the picker stays on the same page and
+        # shows a premium check on selected buttons.
+        asset = data[len("fs_asset_"):]
+        selected = set(context.user_data.get("fs_selected") or set())
+        if asset in selected:
+            selected.discard(asset)
+        else:
+            selected.add(asset)
+        context.user_data["fs_selected"] = selected
+        await _rerender_fs_picker(query, context)
+        return
+
+    if data == "fs_next":
+        assets = context.user_data.get("fs_assets") or config.SAMPLE_ASSETS
+        selected = set(context.user_data.get("fs_selected") or set())
+        if not selected:
+            await _rerender_fs_picker(query, context, warn=True)
             return
-        kb = [[_btn("1 Day", "fs_days_1", icon="days"),
-               _btn("2 Days", "fs_days_2", icon="days"),
-               _btn("3 Days", "fs_days_3", icon="days"),
-               _btn("10 Days", "fs_days_10", icon="days")],
-              [_btn("Back", "menu_main", icon="back")]]
-        await query.edit_message_text(
-            f"{pe('diamond')} How many days of history should shape the signals? {pe('chart')}\n"
-            "Local test uses 1 day of sample data. Picking 2/3/10 days "
-            "shows the 1-day result for now — multi-day voting needs "
-            "the 20-day database (Render step).",
-            reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+        if set(assets) <= selected:
+            context.user_data["fs_asset"] = "ALL"
+        else:
+            # Keep the picker's order (OTC first, sorted).
+            context.user_data["fs_asset"] = [a for a in assets if a in selected]
+        await _show_futures_days_question(query, context)
         return
 
     if data.startswith("fs_days_"):
@@ -714,10 +893,10 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "menu_botstatus":
-        await _run_bot_status(query)
+        await _run_bot_status(query, context)
         return
     if data == "menu_ai":
-        await _show_analysis_picker(query, "ai")
+        await _show_analysis_picker(query, context, "ai")
         return
     if data == "menu_checker":
         # Ask first: MTG1 results or non-MTG (M1 only)? The choice is
@@ -757,7 +936,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=back_keyboard(), parse_mode="HTML")
         return
     if data == "menu_market":
-        await _show_analysis_picker(query, "market")
+        await _show_analysis_picker(query, context, "market")
         return
     if data == "menu_otc":
         await _run_otc_board(query, context)
@@ -766,32 +945,64 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _run_payouts(query)
         return
     if data == "menu_counter":
-        await _show_analysis_picker(query, "counter")
+        await _show_analysis_picker(query, context, "counter")
         return
     if data == "menu_trend":
-        await _show_analysis_picker(query, "trend")
+        await _show_analysis_picker(query, context, "trend")
         return
     if data.startswith("an_page_"):
         # an_page_<tool>_<page> — re-render the analysis picker page.
         _, _, tool, page = data.split("_")
+        context.user_data["an_page"] = int(page)
         assets = _analysis_assets()
-        kb, page, total_pages = _analysis_picker_keyboard(assets, int(page), tool)
+        selected = context.user_data.get("an_selected") or set()
+        kb, page, total_pages = _analysis_picker_keyboard(
+            assets, int(page), tool, selected)
         await query.edit_message_text(
-            _analysis_picker_text(tool, page, total_pages),
+            _analysis_picker_text(tool, page, total_pages, selected),
             reply_markup=kb, parse_mode="HTML")
         return
+    if data.startswith("an_all_"):
+        # SELECT ALL toggles every market (on, or off when all selected).
+        tool = data[len("an_all_"):]
+        assets = _analysis_assets()
+        selected = set(context.user_data.get("an_selected") or set())
+        if set(assets) <= selected:
+            selected = set()
+        else:
+            selected = set(assets)
+        context.user_data["an_selected"] = selected
+        await _rerender_an_picker(query, context, tool)
+        return
     if data.startswith("an_asset_"):
-        # an_asset_<tool>_<asset> — run the tool for the picked market.
+        # an_asset_<tool>_<asset> — toggle the market. The picker stays
+        # on the same page and shows a premium check on selected buttons.
         rest = data[len("an_asset_"):]
         tool, asset = rest.split("_", 1)
+        selected = set(context.user_data.get("an_selected") or set())
+        if asset in selected:
+            selected.discard(asset)
+        else:
+            selected.add(asset)
+        context.user_data["an_selected"] = selected
+        await _rerender_an_picker(query, context, tool)
+        return
+    if data.startswith("an_next_"):
+        # Run the tool for the selected markets (1..N).
+        tool = data[len("an_next_"):]
+        selected = set(context.user_data.get("an_selected") or set())
+        if not selected:
+            await _rerender_an_picker(query, context, tool, warn=True)
+            return
+        assets = [a for a in _analysis_assets() if a in selected]
         if tool == "ai":
-            await _run_ai_signal(query, context, asset)
+            await _run_ai_signal(query, context, assets)
         elif tool == "counter":
-            await _run_counter(query, asset)
+            await _run_counter(query, assets, context)
         elif tool == "trend":
-            await _run_trend(query, asset)
+            await _run_trend(query, assets, context)
         elif tool == "market":
-            await _run_market(query, asset)
+            await _run_market(query, assets, context)
         return
     if data == "menu_backtest":
         await _run_backtest(query)
@@ -908,16 +1119,33 @@ async def _compute_futures_text_db(context, start, end):
     then the cross-asset filter (win rate + strength, >= 7 min gap
     between any two kept signals, max 6/hour, max 12 total)."""
     asset = context.user_data.get("fs_asset", "USDMXN_otc")
+    if isinstance(asset, list) and len(asset) == 1:
+        # One picked asset behaves exactly like the old single pick
+        # (no cross-asset filter — there is nothing to rank across).
+        asset = asset[0]
     days = context.user_data.get("fs_days", 1)
     mode = context.user_data.get("fs_mode", "OTC FS")
     db = _db()
     today = _today_date_str()
     note = ""
 
-    if asset == "ALL":
-        db_assets = _filter_assets_by_mode(db.get_assets(), mode)
+    # Multi-asset selection: a list of assets, or "ALL" for every asset
+    # in this mode. Both go through the cross-asset filter (win rate +
+    # strength, >= 7 min gap between any two kept signals, max 6/hour,
+    # max 12 total).
+    if isinstance(asset, list) or asset == "ALL":
+        if asset == "ALL":
+            db_assets = _filter_assets_by_mode(db.get_assets(), mode)
+            label = f"SELECT ALL ({len(db_assets)} assets)"
+        else:
+            # Only the picked assets, in the user's pick order.
+            all_mode = _filter_assets_by_mode(db.get_assets(), mode)
+            order = {a: i for i, a in enumerate(asset)}
+            db_assets = [a for a in all_mode if a in order]
+            db_assets.sort(key=lambda a: order.get(a, 999))
+            label = f"{len(db_assets)} selected"
         if not db_assets:
-            return (f"{pe('cross')} No candles in the database yet.\n"
+            return (f"{pe('cross')} No candles for the selected assets in the database yet.\n"
                     "The backfill collects the last 5 days first. "
                     "Press Bot Status to see the progress, then try again.")
         all_dates = db.get_dates()
@@ -937,7 +1165,7 @@ async def _compute_futures_text_db(context, start, end):
         kept = cross_asset_filter(all_signals)
         lines = format_signals_list(kept)
         header = (f"{pe('diamond')}{pe('lightning')} BLUE FISH PRIME • FUTURE SIGNALS — {mode} {pe('fire')}\n{DIVIDER}\n"
-                  f"Assets: SELECT ALL ({len(db_assets)} assets) | Dates: {dates[0]} to {dates[-1]} | Days: {len(dates)} (database)\n"
+                  f"Assets: {label} | Dates: {dates[0]} to {dates[-1]} | Days: {len(dates)} (database)\n"
                   f"Time: {start}-{end} | UTC+6 | M1 | Quotex | Source: db\n"
                   f"{pe('chart')} Signals: {len(lines)} (cross-asset, accuracy-first, min 7-min gap)\n\n")
         body = "\n".join(lines) if lines else "No signals found after the filter."
@@ -980,6 +1208,10 @@ async def _compute_futures_text(context, start, end):
     (_run_futures, which edits the tapped message) and the text flow
     (custom time, which edits a 'Working...' message)."""
     asset = context.user_data.get("fs_asset", "USDMXN_otc")
+    if isinstance(asset, list) and len(asset) == 1:
+        # One picked asset behaves exactly like the old single pick
+        # (no cross-asset filter — there is nothing to rank across).
+        asset = asset[0]
     days = context.user_data.get("fs_days", 1)
     mode = context.user_data.get("fs_mode", "OTC FS")
     note = ""
@@ -991,14 +1223,27 @@ async def _compute_futures_text(context, start, end):
     # then the cross-asset filter (win rate + real strength + >= 7 min
     # gap between ANY two kept signals, max 6/hour, max 12 total).
     # Without a live login only USDMXN is shown.
-    if asset == "ALL":
-        if config.DATA_MODE != "live" or not config.has_quotex_login():
-            note = (f"\n\n{pe('info')} No live Quotex login here, so SELECT ALL "
-                    "shows only USDMXN. Full cross-asset SELECT ALL needs "
-                    "the Render database (db mode).")
-            asset = "USDMXN_otc"
+    # A list (multi-asset selection) takes the same path, restricted
+    # to the picked assets.
+    if asset == "ALL" or isinstance(asset, list):
+        if isinstance(asset, list):
+            assets = list(asset)
+            label = f"{len(assets)} selected"
         else:
             assets = context.user_data.get("fs_assets") or config.SAMPLE_ASSETS
+            label = f"SELECT ALL ({len(assets)} assets)"
+        if config.DATA_MODE != "live" or not config.has_quotex_login():
+            if isinstance(asset, list):
+                note = (f"\n\n{pe('info')} No live Quotex login here, so this shows only "
+                        f"{display_asset(assets[0])}. Full multi-asset needs "
+                        "the Render database (db mode).")
+                asset = assets[0]
+            else:
+                note = (f"\n\n{pe('info')} No live Quotex login here, so SELECT ALL "
+                        "shows only USDMXN. Full cross-asset SELECT ALL needs "
+                        "the Render database (db mode).")
+                asset = "USDMXN_otc"
+        else:
             all_signals = []
             failed = []
             async def _one(a):
@@ -1030,7 +1275,7 @@ async def _compute_futures_text(context, start, end):
             kept = cross_asset_filter(all_signals)
             lines = format_signals_list(kept)
             header = (f"{pe('diamond')}{pe('lightning')} BLUE FISH PRIME • FUTURE SIGNALS — {mode} {pe('fire')}\n{DIVIDER}\n"
-                      f"Assets: SELECT ALL ({len(assets)} assets) | Date: {eff_date} | Days: 1 (live)\n"
+                      f"Assets: {label} | Date: {eff_date} | Days: 1 (live)\n"
                       f"Time: {start}-{end} | UTC+6 | M1 | Quotex | Source: live\n"
                       f"{pe('chart')} Signals: {len(lines)} (cross-asset, accuracy-first, min 7-min gap)\n\n")
             body = "\n".join(lines) if lines else "No signals found after the filter."
@@ -1074,79 +1319,92 @@ async def _compute_futures_text(context, start, end):
     return text[:4000]
 
 
-async def _run_futures(query, context, start, end):
+async def _run_futures(query, context, start, end, animate=True):
     """Callback flow: animated progress, then the final result.
-    Only a Back button is attached — the main menu stays above."""
+    The result carries its build time (Generated: HH:MM:SS Dhaka) and
+    a Refresh button that re-runs exactly this selection."""
     asset = context.user_data.get("fs_asset", "USDMXN_otc")
     days = context.user_data.get("fs_days", 1)
+    mode = context.user_data.get("fs_mode", "OTC FS")
+    label = _fs_asset_label(asset)
     step1 = ("Reading database..." if config.DATA_MODE == "db"
              else "Connecting to Quotex...")
-    try:
-        await query.edit_message_text(
-            f"{pe('hourglass')} {step1} {pe('diamond')} {display_asset(asset)} | {days} day(s) | {start}-{end}",
-            parse_mode="HTML")
-        await asyncio.sleep(0.5)
-        await query.edit_message_text(
-            f"{pe('refresh')} Fetching candles... {pe('chart')} {display_asset(asset)} | {start}-{end}",
-            parse_mode="HTML")
-        await asyncio.sleep(0.5)
-        await query.edit_message_text(
-            f"{pe('lightning')} Generating signals... {pe('chart')} {display_asset(asset)} | {start}-{end}",
-            parse_mode="HTML")
-        await asyncio.sleep(0.5)
-    except Exception:
-        pass  # progress edits are cosmetic; never block the result
+    if animate:
+        try:
+            await query.edit_message_text(
+                f"{pe('hourglass')} {step1} {pe('diamond')} {label} | {days} day(s) | {start}-{end}",
+                parse_mode="HTML")
+            await asyncio.sleep(0.5)
+            await query.edit_message_text(
+                f"{pe('refresh')} Fetching candles... {pe('chart')} {label} | {start}-{end}",
+                parse_mode="HTML")
+            await asyncio.sleep(0.5)
+            await query.edit_message_text(
+                f"{pe('lightning')} Generating signals... {pe('chart')} {label} | {start}-{end}",
+                parse_mode="HTML")
+            await asyncio.sleep(0.5)
+        except Exception:
+            pass  # progress edits are cosmetic; never block the result
     text = await _compute_futures_text(context, start, end)
-    await query.edit_message_text(text, reply_markup=back_keyboard(),
+    text = text + f"\n\n{_generated_line()}"
+    await query.edit_message_text(text, reply_markup=_refresh_keyboard(),
                                   parse_mode=_html_mode(text))
+    _store_result_spec(context, query, ("fs", asset, days, mode, start, end))
 
 
-async def _run_market(query, asset=None):
-    """Market Live detail for one market (picked by the user): last
-    candle (Dhaka time, close, direction), today's high/low and
+async def _run_market(query, assets=None, context=None):
+    """Market Live detail for each picked market: last candle (Dhaka
+    time, close, direction, and how old it is), today's high/low and
     candle count, EMA trend + RSI. DB only — the live stream keeps
     the last candle at most ~1 minute old, the 2-hourly collector
-    fills any gap. `asset` comes from the picker; None keeps the old
-    default-asset behaviour."""
-    asset = asset or _default_analysis_asset()
-    if asset is None:
+    fills any gap. `assets` comes from the picker (str, list or None);
+    None keeps the old default-asset behaviour."""
+    assets = _resolve_analysis_assets(assets)
+    if not assets:
         await query.edit_message_text(
             f"{pe('diamond')} Market Live {pe('chart')}\n"
             "No candles in the database yet — the backfill is still running.",
             reply_markup=back_keyboard(), parse_mode="HTML")
         return
     today = _today_date_str()
-    try:
-        candles = _db().get_candles(asset, today)
-    except Exception:
-        candles = []
-    if not candles:
-        await query.edit_message_text(
-            f"{pe('diamond')} Market Live — {display_asset(asset)} {pe('chart')}\n"
-            f"{DIVIDER}\nNo candles for {display_asset(asset)} today yet. "
-            "Try again after the next collection.",
-            reply_markup=back_keyboard(), parse_mode="HTML")
-        return
-    norm = [normalize_candle(c) for c in candles]
-    last = norm[-1]
-    direction = "CALL" if last["close"] > last["open"] else "PUT"
-    hi = max(c["high"] for c in norm)
-    lo = min(c["low"] for c in norm)
-    closes = [c["close"] for c in norm]
-    if len(closes) >= 21:
-        trend = trend_direction(closes)
-        trend_emoji = pe("up") if trend == "UP" else pe("down")
-        trend_line = (f"{trend_emoji} Trend (EMA9/21): {trend} | "
-                      f"{pe('chart')} RSI(14): {rsi(closes):.1f}")
-    else:
-        trend_line = "Not enough candles for trend/RSI yet."
-    text = (f"{pe('diamond')} Market Live — {display_asset(asset)} {pe('chart')}\n"
-            f"{DIVIDER}\n"
-            f"Last: {last['datetime'][11:16]} | {last['close']} | {direction}\n"
+    sections = []
+    for asset in assets:
+        try:
+            candles = _db().get_candles(asset, today)
+        except Exception:
+            candles = []
+        if not candles:
+            sections.append(f"{display_asset(asset)}: No candles today yet. "
+                            "Try again after the next collection.")
+            continue
+        norm = [normalize_candle(c) for c in candles]
+        last = norm[-1]
+        direction = "CALL" if last["close"] > last["open"] else "PUT"
+        hi = max(c["high"] for c in norm)
+        lo = min(c["low"] for c in norm)
+        closes = [c["close"] for c in norm]
+        if len(closes) >= 21:
+            trend = trend_direction(closes)
+            trend_emoji = pe("up") if trend == "UP" else pe("down")
+            trend_line = (f"{trend_emoji} Trend (EMA9/21): {trend} | "
+                          f"{pe('chart')} RSI(14): {rsi(closes):.1f}")
+        else:
+            trend_line = "Not enough candles for trend/RSI yet."
+        sections.append(
+            f"{display_asset(asset)}\n"
+            f"Last: {last['datetime'][11:16]} | {last['close']} | {direction} ({_candle_age_text(last)})\n"
             f"Today: {len(norm)} candles | High: {hi} | Low: {lo}\n"
-            f"{trend_line}\n\n"
-            "Data updates every minute via the live stream.")
-    await query.edit_message_text(text, reply_markup=back_keyboard(), parse_mode="HTML")
+            f"{trend_line}")
+    title = (f" — {display_asset(assets[0])}" if len(assets) == 1
+             else f" — {len(assets)} markets")
+    text = (f"{pe('diamond')} Market Live{title} {pe('chart')}\n"
+            f"{DIVIDER}\n"
+            + "\n\n".join(sections)
+            + "\n\nData updates every minute via the live stream.\n"
+            + _generated_line())
+    await query.edit_message_text(text, reply_markup=_refresh_keyboard(), parse_mode="HTML")
+    if context is not None:
+        _store_result_spec(context, query, ("an", "market", assets))
 
 
 async def _run_payouts(query):
@@ -1195,10 +1453,11 @@ async def _run_news(query):
     await query.edit_message_text(text, reply_markup=back_keyboard(), parse_mode="HTML")
 
 
-async def _run_bot_status(query):
+async def _run_bot_status(query, context=None):
     """Bot Status view: mode, database, days, per-asset candles,
-    last/next collection, Quotex session, today's coverage.
-    DB only — no Quotex login here."""
+    last/next collection, Quotex session, live stream, today's
+    coverage. DB only — no Quotex login here. The result carries a
+    Refresh button that re-reads the database on demand."""
     s = collector.get_status_summary(_db())
     if config.DATA_MODE == "db":
         mode_text = "Render / Database"
@@ -1211,6 +1470,14 @@ async def _run_bot_status(query):
     dates_text = ", ".join(s["dates"]) if s["dates"] else "none yet (backfill running)"
     per_asset = "\n".join(
         f"{display_asset(a)}: {n}" for a, n in sorted(s["by_asset"].items())) or "—"
+    stream_status = s.get("live_stream_status")
+    stream_last = s.get("live_stream_last_seen")
+    if stream_status == "connected":
+        stream_line = f"connected — last candle {stream_last or '—'} (Dhaka)"
+    elif stream_status:
+        stream_line = f"{stream_status} — last candle {stream_last or '—'} (Dhaka)"
+    else:
+        stream_line = "not running (stream off or not started yet)"
     text = (f"{pe('green')}{pe('diamond')} BLUE FISH PRIME • BOT STATUS {pe('sparkle')}\n{DIVIDER}\n"
             f"Mode: {mode_text}\n"
             f"Database: {db_text}\n"
@@ -1219,11 +1486,14 @@ async def _run_bot_status(query):
             f"Last collection: {s['last_collection'] or '—'}\n"
             f"Next collection: {s['next_collection'] or '—'}\n"
             f"Quotex session: {html.escape(str(s['quotex_session']))}\n"
+            f"Live stream: {stream_line}\n"
             f"Last Quotex login: {s['quotex_last_login'] or '—'}\n"
             f"Today ({s['today_date']}) 00:00-now: {s['today_count']} candles\n"
             f"Time now (Dhaka): {s['now_dhaka']}")
-    await query.edit_message_text(text, reply_markup=back_keyboard(),
+    await query.edit_message_text(text, reply_markup=_refresh_keyboard(),
                                   parse_mode="HTML")
+    if context is not None:
+        _store_result_spec(context, query, ("botstatus",))
 
 
 async def _run_otc_board(query, context):
@@ -1262,95 +1532,146 @@ async def _run_otc_board(query, context):
     await query.edit_message_text(text, reply_markup=back_keyboard(), parse_mode="HTML")
 
 
-async def _run_ai_signal(query, context, asset=None):
-    """AI Signal from the DB: the picked asset's last candle (today),
+def _normalize_assets_arg(assets):
+    """A single asset str, a list of assets, or None -> list (or None)."""
+    if assets is None:
+        return None
+    if isinstance(assets, str):
+        return [assets]
+    return list(assets)
+
+
+def _resolve_analysis_assets(assets):
+    """Picker selection (str/list/None) -> list of assets. None keeps
+    the old default-asset behaviour (BTCUSD first)."""
+    assets = _normalize_assets_arg(assets)
+    if not assets:
+        default = _default_analysis_asset()
+        return [default] if default else []
+    return assets
+
+
+async def _run_ai_signal(query, context, assets=None, animate=True):
+    """AI Signal from the DB: each picked market's last candle (today),
     EMA9/21 trend and RSI(14) over its last 60 candles. No Quotex
-    login, no sample file. `asset` comes from the picker; None keeps
-    the old default-asset behaviour."""
-    try:
-        await query.edit_message_text(
-            f"{pe('hourglass')} Analysing candles... {pe('star')}", parse_mode="HTML")
-        await asyncio.sleep(0.5)
-        await query.edit_message_text(
-            f"{pe('lightning')} AI Signal — checking trend &amp; RSI... {pe('chart')}",
-            parse_mode="HTML")
-        await asyncio.sleep(0.5)
-    except Exception:
-        pass
-    asset = asset or _default_analysis_asset()
-    if asset is None:
+    login, no sample file. `assets` comes from the picker (str, list
+    or None); None keeps the old default-asset behaviour. The result
+    carries its build time and a Refresh button, so a 12:52 result is
+    never mistaken for live data at 12:57."""
+    if animate:
+        try:
+            await query.edit_message_text(
+                f"{pe('hourglass')} Analysing candles... {pe('star')}", parse_mode="HTML")
+            await asyncio.sleep(0.5)
+            await query.edit_message_text(
+                f"{pe('lightning')} AI Signal — checking trend &amp; RSI... {pe('chart')}",
+                parse_mode="HTML")
+            await asyncio.sleep(0.5)
+        except Exception:
+            pass
+    assets = _resolve_analysis_assets(assets)
+    if not assets:
         await query.edit_message_text(
             f"{pe('cross')} No candles in the database yet.\n"
             "The backfill collects the last 5 days first. "
             "Press Bot Status to see the progress, then try again.",
             reply_markup=back_keyboard(), parse_mode="HTML")
         return
-    recent = _db_recent_candles(asset, 60)
-    if len(recent) < 21:
-        await query.edit_message_text(
-            f"{pe('cross')} Not enough candles for {display_asset(asset)} yet "
-            f"({len(recent)} today). Try again after the next collection.",
-            reply_markup=back_keyboard(), parse_mode="HTML")
-        return
-    closes = [c["close"] for c in recent]
-    last = recent[-1]
-    direction = "CALL" if last["close"] > last["open"] else "PUT"
-    trend = trend_direction(closes)
-    value = rsi(closes)
-    trend_emoji = pe("up") if trend == "UP" else pe("down")
+    sections = []
+    for asset in assets:
+        recent = _db_recent_candles(asset, 60)
+        if len(recent) < 21:
+            sections.append(f"{display_asset(asset)}: Not enough candles yet "
+                            f"({len(recent)} today). Try again after the next collection.")
+            continue
+        closes = [c["close"] for c in recent]
+        last = recent[-1]
+        direction = "CALL" if last["close"] > last["open"] else "PUT"
+        trend = trend_direction(closes)
+        value = rsi(closes)
+        trend_emoji = pe("up") if trend == "UP" else pe("down")
+        sections.append(
+            f"{display_asset(asset)}\n"
+            f"Last: {last['datetime']} M1 {direction} ({_candle_age_text(last)})\n"
+            f"{trend_emoji} Trend (EMA9/21): {trend} | {pe('chart')} RSI(14): {value:.1f}\n"
+            f"{pe('money')} Close: {last['close']} | Open: {last['open']}")
+    title = (f" — {display_asset(assets[0])}" if len(assets) == 1
+             else f" — {len(assets)} markets")
     await query.edit_message_text(
-        f"{pe('star')}{pe('diamond')} BLUE FISH PRIME • AI SIGNAL — {display_asset(asset)} {pe('sparkle')}\n{DIVIDER}\n"
-        f"Last: {last['datetime']} M1 {direction}\n"
-        f"{trend_emoji} Trend (EMA9/21): {trend} | {pe('chart')} RSI(14): {value:.1f}\n"
-        f"{pe('money')} Close: {last['close']} | Open: {last['open']}\n\n{DISCLAIMER}",
-        reply_markup=back_keyboard(), parse_mode="HTML")
+        f"{pe('star')}{pe('diamond')} BLUE FISH PRIME • AI SIGNAL{title} {pe('sparkle')}\n{DIVIDER}\n"
+        + "\n\n".join(sections)
+        + f"\n\n{DISCLAIMER}\n{_generated_line()}",
+        reply_markup=_refresh_keyboard(), parse_mode="HTML")
+    _store_result_spec(context, query, ("an", "ai", assets))
 
 
-async def _run_counter(query, asset=None):
-    """Candle Scan from the DB: green/red count of the picked asset's
-    last 10 candles today. `asset` comes from the picker; None keeps
-    the old default-asset behaviour."""
-    asset = asset or _default_analysis_asset()
-    if asset is None:
+async def _run_counter(query, assets=None, context=None):
+    """Candle Scan from the DB: green/red count of each picked
+    market's last 10 candles today. `assets` comes from the picker
+    (str, list or None); None keeps the old default-asset behaviour."""
+    assets = _resolve_analysis_assets(assets)
+    if not assets:
         await query.edit_message_text(
             f"{pe('cross')} No candles in the database yet.\n"
             "The backfill collects the last 5 days first.",
             reply_markup=back_keyboard(), parse_mode="HTML")
         return
-    recent = _db_recent_candles(asset, 10)
-    green = sum(1 for c in recent if c["close"] > c["open"])
-    red = sum(1 for c in recent if c["close"] < c["open"])
+    sections = []
+    for asset in assets:
+        recent = _db_recent_candles(asset, 10)
+        if not recent:
+            sections.append(f"{display_asset(asset)}: No candles today yet.")
+            continue
+        green = sum(1 for c in recent if c["close"] > c["open"])
+        red = sum(1 for c in recent if c["close"] < c["open"])
+        sections.append(f"{display_asset(asset)} (last {len(recent)} today)\n"
+                        f"{pe('green')} Green: {green} | {pe('red')} Red: {red}")
+    title = (f" — {display_asset(assets[0])}" if len(assets) == 1
+             else f" — {len(assets)} markets")
     await query.edit_message_text(
-        f"{pe('chart')}{pe('diamond')} CANDLE SCAN — {display_asset(asset)} (last {len(recent)} today)\n{DIVIDER}\n{pe('green')} Green: {green} | {pe('red')} Red: {red}",
-        reply_markup=back_keyboard(), parse_mode="HTML")
+        f"{pe('chart')}{pe('diamond')} CANDLE SCAN{title}\n{DIVIDER}\n"
+        + "\n\n".join(sections)
+        + f"\n\n{_generated_line()}",
+        reply_markup=_refresh_keyboard(), parse_mode="HTML")
+    if context is not None:
+        _store_result_spec(context, query, ("an", "counter", assets))
 
 
-async def _run_trend(query, asset=None):
-    """Trend Scan from the DB: EMA9/21 of the picked asset's
-    last 60 candles today. `asset` comes from the picker; None keeps
-    the old default-asset behaviour."""
-    asset = asset or _default_analysis_asset()
-    if asset is None:
+async def _run_trend(query, assets=None, context=None):
+    """Trend Scan from the DB: EMA9/21 of each picked market's
+    last 60 candles today. `assets` comes from the picker (str, list
+    or None); None keeps the old default-asset behaviour."""
+    assets = _resolve_analysis_assets(assets)
+    if not assets:
         await query.edit_message_text(
             f"{pe('cross')} No candles in the database yet.\n"
             "The backfill collects the last 5 days first.",
             reply_markup=back_keyboard(), parse_mode="HTML")
         return
-    recent = _db_recent_candles(asset, 60)
-    if len(recent) < 21:
-        await query.edit_message_text(
-            f"{pe('cross')} Not enough candles for {display_asset(asset)} yet "
-            f"({len(recent)} today). Try again after the next collection.",
-            reply_markup=back_keyboard(), parse_mode="HTML")
-        return
-    closes = [c["close"] for c in recent]
-    trend = trend_direction(closes)
-    e9 = ema(closes, 9)[-1]
-    e21 = ema(closes, 21)[-1]
-    trend_emoji = pe("up") if trend == "UP" else pe("down")
+    sections = []
+    for asset in assets:
+        recent = _db_recent_candles(asset, 60)
+        if len(recent) < 21:
+            sections.append(f"{display_asset(asset)}: Not enough candles yet "
+                            f"({len(recent)} today).")
+            continue
+        closes = [c["close"] for c in recent]
+        trend = trend_direction(closes)
+        e9 = ema(closes, 9)[-1]
+        e21 = ema(closes, 21)[-1]
+        trend_emoji = pe("up") if trend == "UP" else pe("down")
+        sections.append(f"{display_asset(asset)}\n"
+                        f"{trend_emoji} Trend: {trend}\n"
+                        f"EMA9: {e9:.5f} | EMA21: {e21:.5f}")
+    title = (f" — {display_asset(assets[0])}" if len(assets) == 1
+             else f" — {len(assets)} markets")
     await query.edit_message_text(
-        f"{trend_emoji}{pe('diamond')} TREND SCAN — {display_asset(asset)}\n{DIVIDER}\nTrend: {trend}\nEMA9: {e9:.5f} | EMA21: {e21:.5f}",
-        reply_markup=back_keyboard(), parse_mode="HTML")
+        f"{pe('diamond')} TREND SCAN{title}\n{DIVIDER}\n"
+        + "\n\n".join(sections)
+        + f"\n\n{_generated_line()}",
+        reply_markup=_refresh_keyboard(), parse_mode="HTML")
+    if context is not None:
+        _store_result_spec(context, query, ("an", "trend", assets))
 
 
 async def _run_backtest(query):
@@ -1482,8 +1803,14 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         result = await _compute_futures_text(context, start, end)
-        await working.edit_text(result, reply_markup=back_keyboard(),
+        result = result + f"\n\n{_generated_line()}"
+        await working.edit_text(result, reply_markup=_refresh_keyboard(),
                                 parse_mode=_html_mode(result))
+        _store_result_spec(context, working.message_id,
+                           ("fs", context.user_data.get("fs_asset", "USDMXN_otc"),
+                            context.user_data.get("fs_days", 1),
+                            context.user_data.get("fs_mode", "OTC FS"),
+                            start, end))
         return
 
     if flow == "checker_date":

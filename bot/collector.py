@@ -504,18 +504,43 @@ async def run_incremental(db, session, now=None):
 # ---------------------------------------------------------------------------
 # Status summary (used by the Bot Status button + backfill log)
 # ---------------------------------------------------------------------------
+def _dhaka_display(utc_iso_str):
+    """Stored UTC 'YYYY-MM-DD HH:MM:SS' -> Dhaka string for display.
+
+    Bot Status used to show the raw UTC value next to a Dhaka 'Time
+    now', so every time looked 6 hours stale (last collection 05:48
+    read as 5 AM when it was really 11:48 Dhaka).
+    """
+    if not utc_iso_str:
+        return None
+    try:
+        dt = datetime.strptime(str(utc_iso_str), "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=timezone.utc)
+        return dt.astimezone(DHAKA).strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return str(utc_iso_str)
+
+
 def get_status_summary(db, now=None):
-    """Dict for the Bot Status view. No Quotex login here — DB only."""
+    """Dict for the Bot Status view. No Quotex login here — DB only.
+
+    Times are Dhaka (the stored values are UTC). The live stream's
+    own status is included too — the 'Quotex session' line only
+    covers the collector, which is deliberately disconnected between
+    its 2-hourly runs.
+    """
     now = now or dhaka_now()
     total = db.count_total()
     by_asset = db.count_by_asset()
     dates = db.get_dates()
     today_count, today_str = db.today_coverage(now)
-    last_collection = db.get_state("last_collection")
-    next_collection = db.get_state("next_collection")
-    last_backfill = db.get_state("last_backfill")
-    last_login = db.get_state("quotex_last_login")
+    last_collection = _dhaka_display(db.get_state("last_collection"))
+    next_collection = _dhaka_display(db.get_state("next_collection"))
+    last_backfill = _dhaka_display(db.get_state("last_backfill"))
+    last_login = _dhaka_display(db.get_state("quotex_last_login"))
     session_state = db.get_state("quotex_session", "not connected yet")
+    stream_status = db.get_state("live_stream_status")
+    stream_last_seen = _dhaka_display(db.get_state("live_stream_last_seen"))
     return {
         "mode": config.DATA_MODE,
         "backend": db.backend,
@@ -529,6 +554,8 @@ def get_status_summary(db, now=None):
         "last_backfill": last_backfill,
         "quotex_last_login": last_login,
         "quotex_session": session_state,
+        "live_stream_status": stream_status,
+        "live_stream_last_seen": stream_last_seen,
         "now_dhaka": now.strftime("%Y-%m-%d %H:%M"),
     }
 

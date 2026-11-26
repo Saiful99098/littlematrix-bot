@@ -216,6 +216,30 @@ def test_analysis_pickers_use_picked_asset():
     print("PASS c) analysis pickers run the picked market, not the default")
 
 
+def test_bot_status_times_are_dhaka_and_stream_shown():
+    """Bot Status times are Dhaka, not raw UTC: a stored 05:48 UTC
+    last collection is 11:48 Dhaka. The live stream's own status is
+    in the summary too (the 'Quotex session' line only covers the
+    collector, which is disconnected between its 2-hourly runs)."""
+    import bot.collector as collector
+
+    db, tmp = _tmp_db()
+    db.set_state("last_collection", "2026-11-26 05:48:35")  # UTC
+    db.set_state("next_collection", "2026-11-26 07:48:35")  # UTC
+    db.set_state("quotex_last_login", "2026-11-26 05:48:34")  # UTC
+    db.set_state("quotex_session", "disconnected (between runs)")
+    db.set_state("live_stream_status", "connected")
+    db.set_state("live_stream_last_seen", "2026-11-26 06:54:14")  # UTC
+    s = collector.get_status_summary(db)
+    assert s["last_collection"] == "2026-11-26 11:48:35", s
+    assert s["next_collection"] == "2026-11-26 13:48:35", s
+    assert s["quotex_last_login"] == "2026-11-26 11:48:34", s
+    assert s["quotex_session"] == "disconnected (between runs)", s
+    assert s["live_stream_status"] == "connected", s
+    assert s["live_stream_last_seen"] == "2026-11-26 12:54:14", s
+    print("PASS e) Bot Status times are Dhaka, live stream status included")
+
+
 def _all_buttons(keyboard):
     return [b for row in keyboard.inline_keyboard for b in row]
 
@@ -258,4 +282,5 @@ if __name__ == "__main__":
     test_stream_reconnects_and_tail_fills()
     test_analysis_pickers_use_picked_asset()
     test_every_button_has_premium_icon()
+    test_bot_status_times_are_dhaka_and_stream_shown()
     print("ALL LIVE-STREAM TESTS PASSED")
