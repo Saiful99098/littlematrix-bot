@@ -275,9 +275,20 @@ class SharedQuotexSession:
         # while the history/fetch path on the same session works. The
         # pyquotex helper that waits for the first event
         # (start_candles_one_stream) follows with the asset's NUMERIC
-        # code, not its name — so also follow with the code, best
-        # effort only. A missing code map or a failed follow must
-        # never break the stream (the batch still collects).
+        # code, not its name — so also follow with the code. The code
+        # map (codes_asset) is only built by get_all_assets(), which
+        # nothing in the bot ever called — the first version of this
+        # fix looked the map up empty and sent zero follows (no "code
+        # follow sent" line in the Render log). Fill it here first.
+        try:
+            get_all = getattr(self.client, "get_all_assets", None)
+            if get_all is not None:
+                await get_all()
+        except Exception as exc:
+            logger.warning("collector: stream code map failed: %s", exc)
+        codes = getattr(self.client, "codes_asset", None) or {}
+        if not codes:
+            logger.warning("collector: stream code map empty — code follow skipped")
         code_follows = 0
         for asset in assets:
             try:
@@ -286,7 +297,6 @@ class SharedQuotexSession:
                 logger.warning("collector: stream subscribe failed for %s: %s",
                                asset, exc)
             try:
-                codes = getattr(self.client, "codes_asset", None) or {}
                 code = codes.get(asset)
                 api = getattr(self.client, "api", None)
                 if code is not None and api is not None:

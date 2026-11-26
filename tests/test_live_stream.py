@@ -380,9 +380,11 @@ def test_stream_logs_silence():
 def test_stream_subscribe_also_follows_by_code():
     """i) The name-based subscribe alone never delivered an event,
     so start_asset_streams also follows with the asset's NUMERIC
-    code (what pyquotex's own one-stream helper does). A client
-    without a code map still subscribes fine — the follow is best
-    effort and must never break the stream."""
+    code (what pyquotex's own one-stream helper does). The code map
+    starts EMPTY in a real session — get_all_assets() is the only
+    thing that fills it, and nothing in the bot called it before —
+    so the method fills the map first; without that step zero
+    follows are sent. A failed map fill still subscribes fine."""
     import bot.collector as collector_mod
 
     class FakeApi:
@@ -393,31 +395,39 @@ def test_stream_subscribe_also_follows_by_code():
             self.followed.append(code)
 
     class FakeClient:
-        def __init__(self, codes):
+        def __init__(self, codes, fill):
             self.started = []
-            self.codes_asset = codes
+            self.codes_asset = dict(codes)
             self.api = FakeApi()
+            self._fill = fill  # dict get_all_assets() fills, or None
+
+        async def get_all_assets(self):
+            if self._fill is None:
+                raise RuntimeError("no instruments")
+            self.codes_asset.update(self._fill)
+            return self.codes_asset
 
         async def start_candles_stream(self, asset, period=60):
             self.started.append((asset, period))
 
-    async def _run(codes):
+    async def _run(codes, fill):
         session = collector_mod.SharedQuotexSession()
-        session.client = FakeClient(codes)
+        session.client = FakeClient(codes, fill)
         await session.start_asset_streams(
             ["BTCUSD_otc", "ETHUSD_otc"], 60)
         return session.client
 
-    client = asyncio.run(_run({"BTCUSD_otc": "99", "ETHUSD_otc": "42"}))
+    # Production case: the map starts empty, get_all_assets fills it.
+    client = asyncio.run(_run({}, {"BTCUSD_otc": "99", "ETHUSD_otc": "42"}))
     assert client.started == [("BTCUSD_otc", 60), ("ETHUSD_otc", 60)], \
         client.started
     assert client.api.followed == ["99", "42"], client.api.followed
-    # No code map at all: subscribe still works, nothing followed.
-    client = asyncio.run(_run({}))
+    # Map fill fails: subscribe still works, nothing followed.
+    client = asyncio.run(_run({}, None))
     assert client.started == [("BTCUSD_otc", 60), ("ETHUSD_otc", 60)], \
         client.started
     assert client.api.followed == [], client.api.followed
-    print("PASS i) stream subscribe also follows by numeric code")
+    print("PASS i) stream subscribe fills the code map, then follows by code")
 
 
 def test_candle_generated_handler_logs_and_stores():
