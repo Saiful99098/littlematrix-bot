@@ -14,6 +14,7 @@ c) Every button in every keyboard carries a premium icon — the only
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -48,9 +49,15 @@ TAIL_TS = EVENT_TS + 60
 
 class FakeSession:
     """Fake Quotex session: scripted open assets, generated-candle
-    events and connection drops. No login, no network."""
+    events and connection drops. No login, no network.
 
-    def __init__(self, event_from_poll=1, connected_polls=None):
+    event_dict overrides the emitted event (e.g. one without 'open'
+    for the seed test); tail_candles overrides the tail-fill rows
+    ([] disables the tail-fill so the stream is tested alone).
+    """
+
+    def __init__(self, event_from_poll=1, connected_polls=None,
+                 event_dict=None, tail_candles="default"):
         self.connects = 0
         self.subscribed = []
         self.closed = 0
@@ -59,6 +66,8 @@ class FakeSession:
         # connected_polls=None -> stays connected; a number -> the
         # poll count after which is_connected() returns False.
         self.connected_polls = connected_polls
+        self.event_dict = event_dict
+        self.tail_candles = tail_candles
 
     async def connect(self):
         self.connects += 1
@@ -73,9 +82,10 @@ class FakeSession:
     def generated_candles(self):
         if self.polls < self.event_from_poll:
             return {}
-        return {"BTCUSD_otc": {60: {
+        ev = self.event_dict if self.event_dict is not None else {
             "asset": "BTCUSD_otc", "period": 60, "index": EVENT_TS,
-            "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5}}}
+            "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5}
+        return {"BTCUSD_otc": {60: ev}}
 
     async def is_connected(self):
         self.polls += 1
@@ -84,6 +94,8 @@ class FakeSession:
         return self.polls <= self.connected_polls
 
     async def fetch_asset_span(self, asset, seconds_back):
+        if self.tail_candles != "default":
+            return list(self.tail_candles)
         # Tail-fill: one candle, the minute after the stream event.
         return [{"time": TAIL_TS, "open": 100.5, "high": 101.5,
                  "low": 100.0, "close": 101.0}]
@@ -277,10 +289,101 @@ def test_every_button_has_premium_icon():
     print("PASS d) every button carries a premium icon")
 
 
+def test_stream_seeds_open_from_db():
+    """f) An event without 'open' used to be skipped forever: the
+    first event per asset has no previous stream candle, so the
+    open-fill had nothing to use. The loop now seeds the previous
+    candle from the DB — when the event continues it exactly (60s),
+    its close becomes the missing open and the candle is stored."""
+    db, tmp = _tmp_db()
+    db.insert_candles("BTCUSD_otc", [{
+        "ts": datetime(2026, 11, 26, 12, 0, tzinfo=timezone.utc),
+        "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5}])
+    no_open = {"asset": "BTCUSD_otc", "period": 60, "index": TAIL_TS,
+               "high": 101.5, "low": 100.0, "close": 101.0}
+    session = FakeSession(event_from_poll=1, event_dict=no_open,
+                          tail_candles=[])
+    try:
+        asyncio.run(live_stream.live_stream_loop(
+            db=db, session_factory=lambda: session,
+            sleep=_CountingSleep(max_calls=3)))
+    except _StopLoop:
+        pass
+    else:
+        raise AssertionError("loop ended without reaching the fake sleep")
+    rows = _candles_for(db, "BTCUSD_otc", "2026-11-26")
+    by_time = {r["time"]: r for r in rows}
+    assert TAIL_TS in by_time, rows
+    assert by_time[TAIL_TS]["O"] == 100.5, rows  # DB close became open
+    assert by_time[TAIL_TS]["C"] == 101.0, rows
+    assert db.get_state("live_stream_last_seen"), "last_seen never set"
+    print("PASS f) stream seeds a missing 'open' from the DB's last candle")
+
+
+class _CaptureHandler(logging.Handler):
+    """Collects log records from the live-stream logger."""
+
+    def __init__(self):
+        super().__init__(level=logging.WARNING)
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record.getMessage())
+
+
+def _run_with_log_capture(db, session, max_calls):
+    cap = _CaptureHandler()
+    logger = logging.getLogger("littlematrix.live_stream")
+    logger.addHandler(cap)
+    try:
+        asyncio.run(live_stream.live_stream_loop(
+            db=db, session_factory=lambda: session,
+            sleep=_CountingSleep(max_calls=max_calls)))
+    except _StopLoop:
+        pass
+    finally:
+        logger.removeHandler(cap)
+    return cap.records
+
+
+def test_stream_logs_dropped_events():
+    """g) Events arriving but 0 candles stored for ~60s logs one
+    diagnostic warning with a sample of the dropped event (keys +
+    whether 'open' is present) — the log, not silence, tells the
+    owner why Bot Status shows last candle '—'."""
+    db, tmp = _tmp_db()
+    no_open = {"asset": "BTCUSD_otc", "period": 60, "index": TAIL_TS,
+               "high": 101.5, "low": 100.0, "close": 101.0}
+    session = FakeSession(event_from_poll=1, event_dict=no_open,
+                          tail_candles=[])
+    msgs = _run_with_log_capture(db, session, max_calls=15)
+    hit = [m for m in msgs if "0 candles stored" in m]
+    assert hit, msgs
+    assert "open=False" in hit[0], hit
+    assert "BTCUSD_otc" in hit[0], hit
+    print("PASS g) stream logs a diagnostic when events are dropped")
+
+
+def test_stream_logs_silence():
+    """h) No candle-generated events at all for ~60s logs one
+    diagnostic warning naming the subscribed asset count — the
+    server is silent or the subscription is not delivering."""
+    db, tmp = _tmp_db()
+    session = FakeSession(event_from_poll=999, tail_candles=[])
+    msgs = _run_with_log_capture(db, session, max_calls=15)
+    hit = [m for m in msgs if "no candle-generated events" in m]
+    assert hit, msgs
+    assert "2 assets subscribed" in hit[0], hit
+    print("PASS h) stream logs a diagnostic when no events arrive")
+
+
 if __name__ == "__main__":
     test_stream_stores_generated_candles()
     test_stream_reconnects_and_tail_fills()
     test_analysis_pickers_use_picked_asset()
     test_every_button_has_premium_icon()
     test_bot_status_times_are_dhaka_and_stream_shown()
+    test_stream_seeds_open_from_db()
+    test_stream_logs_dropped_events()
+    test_stream_logs_silence()
     print("ALL LIVE-STREAM TESTS PASSED")

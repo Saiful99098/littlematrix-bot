@@ -119,19 +119,42 @@ async def _tail_fill(db, session, assets, now=None):
         logger.warning("live stream: tail-fill failed: %s", exc)
 
 
-async def _poll_loop(db, session, sleep):
+async def _poll_loop(db, session, sleep, n_assets=0):
     """Watch for newly closed candles and store them.
 
     Returns only when the connection is lost or goes stale — the
     caller reconnects. Raises nothing except the injected sleep's
     stop signal (tests) and QuotexRateLimited.
+
+    Diagnostic (the owner, 2026-11-26): the stream can sit
+    "connected" while delivering nothing — Bot Status then shows
+    last candle "—" and the checker shows "?" for recent minutes.
+    So the loop reports, at most once a minute, which of the two
+    silent states it is in: no candle-generated events at all, or
+    events arriving but no candle stored (with a sample of the
+    dropped event's keys, so the log shows whether 'open' is
+    missing or the shape is wrong). The tail-fill and the 2-hourly
+    batch keep the DB fed meanwhile, so silence is a warning,
+    never a crash.
     """
     period = config.LIVE_STREAM_PERIOD
     poll = config.LIVE_STREAM_POLL_SECONDS
     stale_after = config.LIVE_STREAM_STALE_MINUTES * 60
+    diag_polls = max(1, int(60 // poll))  # ~60s between diagnostic lines
     last_ts = {}     # asset -> datetime (UTC) of last stored stream candle
     last_close = {}  # asset -> close of that candle
+    # Seed for the FIRST event only: the DB's last candle (ts, close),
+    # used solely to fill a missing 'open' when the event continues
+    # it exactly. Never the dedup watermark — the tail-fill already
+    # stored newer candles, so seeding last_ts itself would wrongly
+    # suppress the stream's own older events.
+    seed_ts = {}
+    seed_close = {}
+    seeded = set()
     last_any = time.monotonic()
+    quiet_polls = 0    # consecutive polls with no events at all
+    drop_polls = 0     # consecutive polls with events but 0 stored
+    drop_sample = None  # (asset, keys, open_present) of a dropped event
     while True:
         await sleep(poll)
         if not await session.is_connected():
@@ -142,13 +165,29 @@ async def _poll_loop(db, session, sleep):
         except Exception:
             generated = {}
         inserted = 0
+        events_seen = 0
+        dropped_this_poll = False
         for asset, by_period in generated.items():
             ev = (by_period or {}).get(period)
-            if not isinstance(ev, dict):
+            if not isinstance(ev, dict) or not ev:
                 continue
-            row = _row_from_event(asset, ev, last_ts.get(asset),
-                                  last_close.get(asset))
+            events_seen += 1
+            if asset not in last_ts and asset not in seeded:
+                seeded.add(asset)
+                try:
+                    prev = db.last_candle(asset)
+                except Exception:
+                    prev = None
+                if prev:
+                    seed_ts[asset] = prev["ts"]
+                    seed_close[asset] = prev["close"]
+            row = _row_from_event(
+                asset, ev,
+                last_ts.get(asset, seed_ts.get(asset)),
+                last_close.get(asset, seed_close.get(asset)))
             if row is None:
+                dropped_this_poll = True
+                drop_sample = (asset, sorted(ev.keys()), "open" in ev)
                 continue
             if asset in last_ts and row["ts"] <= last_ts[asset]:
                 continue
@@ -164,8 +203,37 @@ async def _poll_loop(db, session, sleep):
             last_close[asset] = row["close"]
         if inserted:
             last_any = time.monotonic()
+            quiet_polls = 0
+            drop_polls = 0
             _safe_set_state(db, "live_stream_last_seen", utc_iso(dhaka_now()))
             logger.info("live stream: %d new candles", inserted)
+        elif dropped_this_poll:
+            # Events arrived but at least one was dropped by the row
+            # builder (missing fields / missing 'open' with no
+            # continuous previous candle). A healthy stream re-reads
+            # the same already-stored event most polls — that is a
+            # dedup skip, not a drop, and resets this counter.
+            drop_polls += 1
+            quiet_polls = 0
+            if drop_polls >= diag_polls and drop_sample is not None:
+                logger.warning(
+                    "live stream: events arrived but 0 candles stored in "
+                    "the last 60s (sample %s keys=%s open=%s — the event "
+                    "shape is being dropped)", drop_sample[0],
+                    drop_sample[1], drop_sample[2])
+                drop_polls = 0
+        elif events_seen:
+            drop_polls = 0
+            quiet_polls = 0
+        else:
+            quiet_polls += 1
+            drop_polls = 0
+            if quiet_polls >= diag_polls:
+                logger.warning(
+                    "live stream: no candle-generated events in the last "
+                    "60s (%d assets subscribed — server silent or "
+                    "subscription not delivering)", n_assets)
+                quiet_polls = 0
         if time.monotonic() - last_any > stale_after:
             logger.warning("live stream: stale — no new candle for %d "
                            "minutes, reconnecting",
@@ -198,7 +266,7 @@ async def live_stream_loop(db=None, session_factory=None, sleep=None):
             await _tail_fill(db, session, assets)
             _safe_set_state(db, "live_stream_status", "connected")
             run_started = time.monotonic()
-            await _poll_loop(db, session, sleep)
+            await _poll_loop(db, session, sleep, len(assets))
             # A long clean run resets the backoff; a flapping
             # connection keeps doubling it (up to 5 minutes).
             if time.monotonic() - run_started > 300:

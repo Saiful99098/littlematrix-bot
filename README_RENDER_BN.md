@@ -313,7 +313,13 @@ Postgres ডেটাবেসে candle লেখে)।
   স্ট্রিম বন্ধ করতে চাইলে Render Environment-এ
   `LIVE_STREAM_ENABLED=false` বসান — বট আগের মতো শুধু batch দিয়েই
   চলবে। স্ট্রিম চালালে proxy ডেটা কিছুটা বেশি খরচ হবে (শুধু login-এর
-  চেয়ে বেশি), তবে ৫ GB অনেকদিন চলবে।
+  চেয়ে বেশি), তবে ৫ GB অনেকদিন চলবে। স্ট্রিম যদি "connected" দেখায়
+  কিন্তু candle না আসে, Bot Status-এ "Live stream: connected — last
+  candle —" লেখা থাকবে — তখন Render Logs-এ এই লাইনগুলো দেখুন: ৬০
+  সেকেন্ড কোনো event না এলে `no candle-generated events in the last
+  60s`, event এলেও candle না জমলে `events arrived but 0 candles
+  stored` (সাথে sample event-এর keys আর `open=` লেখা থাকে — এটাই বলে
+  দেয় event-এর আকারে সমস্যা নাকি server-ই পাঠাচ্ছে না)।
 - **AI Signal / Market Live / Trend Scan / Candle Scan — মার্কেট বাছাই:**
   এই ৪টা বোতাম চাপলে বট প্রথমে জিজ্ঞেস করবে কোন মার্কেটের ডেটা দেখতে
   চান — লিস্ট থেকে asset বাছুন, তারপর সেই asset-এর রেজাল্ট দেখাবে।

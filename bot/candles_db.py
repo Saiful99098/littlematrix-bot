@@ -299,6 +299,26 @@ class CandleDB:
             (asset, utc_iso(start), utc_iso(end)))
         return cur.fetchone()[0]
 
+    def last_candle(self, asset):
+        """Newest stored candle for one asset as {"ts": aware UTC
+        datetime, "close": float}, or None. Used by the live stream
+        to seed the previous candle, so a stream event without 'open'
+        can still be stored when it continues the DB's last candle
+        exactly (60s later)."""
+        asset = normalize_asset_name(asset)
+        cur = self._execute(
+            "SELECT ts, close FROM candles WHERE asset = ? "
+            "ORDER BY ts DESC LIMIT 1", (asset,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        iso = _to_iso(row[0])
+        try:
+            ts = datetime.strptime(iso, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+        except ValueError:
+            return None
+        return {"ts": ts, "close": float(row[1])}
+
     def last_candle_time(self, asset):
         """UTC ISO string of the newest stored candle for one asset,
         or None when the asset has no candles. Used by the backfill
