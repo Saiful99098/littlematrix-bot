@@ -38,6 +38,13 @@ from .candles_db import DHAKA, utc_iso
 
 logger = logging.getLogger("littlematrix.collector")
 
+# One Quotex login at a time, across the whole process: the 2-hourly
+# collector runs and the live stream's reconnects share this lock, so
+# they can never log in simultaneously (two logins at once is what
+# trips Quotex 429). Only the login call itself is locked, never a
+# whole collection run.
+_CONNECT_LOCK = asyncio.Lock()
+
 def _safe_set_state(db, key, value):
     """Write one collector_state row; never raise.
 
@@ -189,7 +196,10 @@ class SharedQuotexSession:
         logger.info("collector: Quotex session connecting (proxy=%s, host=%s)",
                     "set" if config.QUOTEX_PROXY else "none",
                     config.QUOTEX_HOST or "market-qx.info (default)")
-        check, message = await self.client.connect()
+        # One login at a time across the process (see _CONNECT_LOCK):
+        # the collector runs and the live stream's reconnects share it.
+        async with _CONNECT_LOCK:
+            check, message = await self.client.connect()
         if not check:
             msg = str(message or "")
             self.last_error = msg
@@ -250,6 +260,41 @@ class SharedQuotexSession:
             max_workers=5,
         )
         return quotex_client._to_raw_candles(candles)
+
+    async def start_asset_streams(self, assets, period=60):
+        """Subscribe to closed-candle events for `assets` (live stream).
+
+        One subscribe per asset, with a small delay between them —
+        sending 90 subscribes at once risks a ban/rate-limit (see the
+        pyquotex README warning). A failed subscribe is logged and
+        skipped; the 2-hourly batch still collects that asset.
+        """
+        for asset in assets:
+            try:
+                await self.client.start_candles_stream(asset, period)
+            except Exception as exc:
+                logger.warning("collector: stream subscribe failed for %s: %s",
+                               asset, exc)
+            await asyncio.sleep(config.LIVE_STREAM_SUBSCRIBE_DELAY)
+
+    async def is_connected(self):
+        """True when the WebSocket is still up (state check, no network)."""
+        try:
+            return bool(await self.client.check_connect())
+        except Exception:
+            return False
+
+    def generated_candles(self):
+        """Latest closed-candle event per asset: {asset: {period: event}}.
+
+        The Quotex server sends a 'candle-generated' event each time a
+        candle closes; pyquotex stores the newest per asset+period.
+        An event carries index (unix ts), open, high, low, close.
+        """
+        try:
+            return self.client.api.candle_generated_check or {}
+        except Exception:
+            return {}
 
     async def close(self):
         self.connected = False

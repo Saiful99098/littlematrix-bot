@@ -108,7 +108,7 @@ def pe(name):
 # python-telegram-bot 22.7+). Keys are button names, values are REAL
 # custom_emoji_id strings fetched with getStickerSet (never invented).
 # A button is listed here ONLY when its Unicode emoji has a matching
-# custom emoji in the owner's packs. All 19 main-menu buttons now have
+# custom emoji in the owner's packs. All 21 main-menu buttons now have
 # icons (the last 6 — Market Live, OTC Board, News Desk, Timezone,
 # Signal Filter, My Status — were added from Decoration_Pack2,
 # NewsEmoji and ZEROX_660_by_TgEmodziBot).
@@ -174,4 +174,26 @@ BUTTON_ICONS = {
     "mode_real": "5800720664620961831",
     # ✏️ Custom Time — NewsEmoji (same pencil as Signal Formatter)
     "custom_time": "5395444784611480792",
+    # --- sub-flow buttons (live stream release) — all IDs are REAL,
+    # reused from PREMIUM_EMOJI above, never invented ---
+    # 💬 Contact Owner — same ID as pe("message")
+    "contact": "6266794310671275367",
+    # 🎉 Join Now — same ID as pe("party")
+    "join": "6267117038808870117",
+    # ✅ I Joined / Turn ON / Approve / Non-MTG — same ID as pe("check")
+    "joined": "6267008582294705964",
+    "toggle_on": "6267008582294705964",
+    "approve": "6267008582294705964",
+    "nomtg": "6267008582294705964",
+    # ❌ Turn OFF / Reject — same ID as pe("cross")
+    "toggle_off": "5210952531676504517",
+    "reject": "5210952531676504517",
+    # 📊 asset picker buttons — same ID as pe("chart")
+    "asset": "5231200819986047254",
+    # ⏳ day picker — same ID as pe("hourglass")
+    "days": "6010111371251815589",
+    # ⏰ time picker — same ID as the Timezone button icon
+    "time": "6285240160120477644",
+    # 🔄 MTG1 — same ID as the Swap button icon
+    "mtg": "5017470156276761427",
 }

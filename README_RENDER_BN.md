@@ -304,3 +304,21 @@ Postgres ডেটাবেসে candle লেখে)।
   `BTCUSD-OTC,10:57 M1 PUT` ফেরত দেবে।
 - **লগে যা দেখবেন:** প্রতি ২ ঘণ্টার রানে `collector: 2-hourly run
   finished — N assets, M new candles` লেখা আসে।
+- **লাইভ স্ট্রিম (সব asset, ১ মিনিট):** বট এখন Quotex-এর সাথে একটা
+  সংযোগ খোলা রেখে সব খোলা asset-এর প্রতি মিনিটের candle বন্ধ হলেই
+  Database-এ লিখে রাখে। তাই AI Signal, Market Live, Trend Scan আর
+  Candle Scan-এ ডেটা সর্বোচ্চ ১ মিনিট পুরনো থাকে, আর CHECKER-এ
+  সিগন্যালের ঠিক পরের সময়েই রেজাল্ট মেলে। ২ ঘণ্টার batch collector
+  আগের মতোই চলবে — ওটাই আসল ভরসা, স্ট্রিম বন্ধ হলে ওটাই gap ভরে দেবে।
+  স্ট্রিম বন্ধ করতে চাইলে Render Environment-এ
+  `LIVE_STREAM_ENABLED=false` বসান — বট আগের মতো শুধু batch দিয়েই
+  চলবে। স্ট্রিম চালালে proxy ডেটা কিছুটা বেশি খরচ হবে (শুধু login-এর
+  চেয়ে বেশি), তবে ৫ GB অনেকদিন চলবে।
+- **AI Signal / Market Live / Trend Scan / Candle Scan — মার্কেট বাছাই:**
+  এই ৪টা বোতাম চাপলে বট প্রথমে জিজ্ঞেস করবে কোন মার্কেটের ডেটা দেখতে
+  চান — লিস্ট থেকে asset বাছুন, তারপর সেই asset-এর রেজাল্ট দেখাবে।
+  Market Live এখন একটা মার্কেটের বিস্তারিত দেখায়: শেষ candle,
+  আজকের High/Low, কয়টা candle জমেছে, Trend আর RSI।
+- **সব বোতামে প্রিমিয়াম ইমোজি:** মেনু, Join, দিন/সময় বাছাই, MTG1,
+  Today, Turn ON/OFF, Approve/Reject — সব বোতামেই এখন প্রিমিয়াম
+  আইকন আছে।

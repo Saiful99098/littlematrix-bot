@@ -84,6 +84,19 @@ def _collector_task_done(task):
         logger.exception("collector task died — Bot Status will freeze until restart")
 
 
+def _live_stream_task_done(task):
+    """Log a dead live-stream task instead of losing it silently.
+
+    A dead stream only makes data staler (the 2-hourly batch keeps
+    filling gaps), so it is easy to miss — log it loudly.
+    """
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception("live stream task died — data stays 2-hourly until restart")
+
 
 async def post_init(app):
     """Runs after the Application is built, before polling/webhook
@@ -98,6 +111,17 @@ async def post_init(app):
     else:
         logger.info("collector not active (DATA_MODE=%s, COLLECTOR_ENABLED=%s)",
                     config.DATA_MODE, config.COLLECTOR_ENABLED)
+    if config.live_stream_active():
+        from bot import live_stream
+        logger.info("live stream enabled — starting background task")
+        task = asyncio.create_task(live_stream.live_stream_loop())
+        task.add_done_callback(_live_stream_task_done)
+        app.bot_data["live_stream_task"] = task
+    else:
+        logger.info("live stream not active (DATA_MODE=%s, COLLECTOR_ENABLED=%s, "
+                    "LIVE_STREAM_ENABLED=%s)",
+                    config.DATA_MODE, config.COLLECTOR_ENABLED,
+                    config.LIVE_STREAM_ENABLED)
 
 
 async def channel_member_update(update, context):

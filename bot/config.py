@@ -112,6 +112,24 @@ COLLECTOR_INTERVAL_SECONDS = int(os.getenv("COLLECTOR_INTERVAL_SECONDS", "7200")
 COLLECTOR_OVERLAP_MINUTES = int(os.getenv("COLLECTOR_OVERLAP_MINUTES", "10"))
 # Minutes to wait and retry after a Quotex 429 inside the collector.
 COLLECTOR_429_RETRY_MINUTES = int(os.getenv("COLLECTOR_429_RETRY_MINUTES", "10"))
+# Live candle stream (hybrid): one persistent Quotex WebSocket that
+# writes each closed 1-minute candle for every open asset into the DB
+# as it arrives. The 2-hourly batch collector stays the backbone
+# (gap-filling source of truth); the stream only makes data fresher.
+# Set LIVE_STREAM_ENABLED=false to turn the stream off — the bot then
+# works exactly as before, from the 2-hourly batch alone.
+LIVE_STREAM_ENABLED = os.getenv("LIVE_STREAM_ENABLED", "true").strip().lower() in (
+    "1", "true", "yes", "on")
+# Candle period the stream subscribes to (60 = 1-minute candles).
+LIVE_STREAM_PERIOD = int(os.getenv("LIVE_STREAM_PERIOD", "60") or 60)
+# Seconds between subscribe requests (flooding the server with 90
+# subscribes at once risks a ban/rate-limit — see pyquotex README).
+LIVE_STREAM_SUBSCRIBE_DELAY = float(os.getenv("LIVE_STREAM_SUBSCRIBE_DELAY", "0.2") or 0.2)
+# Seconds between checks for newly closed candles.
+LIVE_STREAM_POLL_SECONDS = float(os.getenv("LIVE_STREAM_POLL_SECONDS", "5") or 5)
+# Minutes with no new candle from any asset before the stream treats
+# the connection as dead and reconnects.
+LIVE_STREAM_STALE_MINUTES = int(os.getenv("LIVE_STREAM_STALE_MINUTES", "10") or 10)
 # How many days of history the day picker may offer (1-20 in code;
 # the Render-test backfill gives 5, so the picker shows 1-5 in db mode).
 MAX_SIGNAL_DAYS = int(os.getenv("MAX_SIGNAL_DAYS", "20"))
@@ -145,3 +163,12 @@ def collector_active():
     runs (local test keeps the old behaviour).
     """
     return DATA_MODE == "db" and COLLECTOR_ENABLED
+
+
+def live_stream_active():
+    """True when the live candle stream must run.
+
+    db mode + collector + stream flag. The stream shares the
+    collector's Quotex login, so it never runs without the collector.
+    """
+    return collector_active() and LIVE_STREAM_ENABLED
