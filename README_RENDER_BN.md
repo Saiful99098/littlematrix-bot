@@ -319,7 +319,9 @@ Postgres ডেটাবেসে candle লেখে)।
   সেকেন্ড কোনো event না এলে `no candle-generated events in the last
   60s`, event এলেও candle না জমলে `events arrived but 0 candles
   stored` (সাথে sample event-এর keys আর `open=` লেখা থাকে — এটাই বলে
-  দেয় event-এর আকারে সমস্যা নাকি server-ই পাঠাচ্ছে না)।
+  দেয় event-এর আকারে সমস্যা নাকি server-ই পাঠাচ্ছে না)। আর কোনো
+  event আদৌ এলে `candle-generated event: asset=... keys=[...]` লাইন
+  আসবে (প্রথম ৩টা) — ওই লাইন না এলে বুঝবেন server event পাঠাচ্ছেই না।
 - **AI Signal / Market Live / Trend Scan / Candle Scan — মার্কেট বাছাই:**
   এই ৪টা বোতাম চাপলে বট প্রথমে জিজ্ঞেস করবে কোন মার্কেটের ডেটা দেখতে
   চান — লিস্ট থেকে asset বাছুন, তারপর সেই asset-এর রেজাল্ট দেখাবে।

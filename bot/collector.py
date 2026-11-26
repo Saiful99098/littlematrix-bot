@@ -269,13 +269,36 @@ class SharedQuotexSession:
         pyquotex README warning). A failed subscribe is logged and
         skipped; the 2-hourly batch still collects that asset.
         """
+        # 2026-11-26: the name-based subscribe alone never delivered
+        # a single 'candle-generated' event (live diagnostic: "no
+        # candle-generated events in the last 60s" on every instance),
+        # while the history/fetch path on the same session works. The
+        # pyquotex helper that waits for the first event
+        # (start_candles_one_stream) follows with the asset's NUMERIC
+        # code, not its name — so also follow with the code, best
+        # effort only. A missing code map or a failed follow must
+        # never break the stream (the batch still collects).
+        code_follows = 0
         for asset in assets:
             try:
                 await self.client.start_candles_stream(asset, period)
             except Exception as exc:
                 logger.warning("collector: stream subscribe failed for %s: %s",
                                asset, exc)
+            try:
+                codes = getattr(self.client, "codes_asset", None) or {}
+                code = codes.get(asset)
+                api = getattr(self.client, "api", None)
+                if code is not None and api is not None:
+                    await api.follow_candle(code)
+                    code_follows += 1
+            except Exception as exc:
+                logger.warning("collector: stream code follow failed for %s: %s",
+                               asset, exc)
             await asyncio.sleep(config.LIVE_STREAM_SUBSCRIBE_DELAY)
+        if code_follows:
+            logger.info("collector: stream code follow sent for %d assets",
+                        code_follows)
 
     async def is_connected(self):
         """True when the WebSocket is still up (state check, no network)."""

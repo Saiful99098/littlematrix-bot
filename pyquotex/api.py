@@ -205,6 +205,23 @@ class QuotexAPI:
         if asset and period:
             self.candle_generated_check[str(asset)][int(period)] = data
             self.candle_generated_all_size_check[str(asset)] = data
+            # Diagnostic (2026-11-26): the stream sat "connected" for
+            # hours with zero events recorded, so log the first few
+            # events received — this proves they arrive and shows
+            # their shape. Throttled: a healthy stream delivers
+            # ~1/min/asset, and the log must not spam.
+            if getattr(self, "_candle_event_logs", 0) < 3:
+                self._candle_event_logs = getattr(self, "_candle_event_logs", 0) + 1
+                logger.info("candle-generated event: asset=%s period=%s keys=%s",
+                            asset, period, sorted(data.keys()))
+        else:
+            # An event without asset/period is silently dropped above
+            # — log it, or a malformed event looks exactly like a
+            # silent server in the stream diagnostic.
+            if getattr(self, "_candle_bad_logs", 0) < 3:
+                self._candle_bad_logs = getattr(self, "_candle_bad_logs", 0) + 1
+                logger.warning("candle-generated event without asset/period: keys=%s",
+                               sorted(data.keys()))
 
     async def _h_sentiment(self, data: Any) -> None:
         if not isinstance(data, dict):

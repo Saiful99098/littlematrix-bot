@@ -321,10 +321,10 @@ def test_stream_seeds_open_from_db():
 
 
 class _CaptureHandler(logging.Handler):
-    """Collects log records from the live-stream logger."""
+    """Collects log records from a logger."""
 
-    def __init__(self):
-        super().__init__(level=logging.WARNING)
+    def __init__(self, level=logging.WARNING):
+        super().__init__(level=level)
         self.records = []
 
     def emit(self, record):
@@ -377,6 +377,82 @@ def test_stream_logs_silence():
     print("PASS h) stream logs a diagnostic when no events arrive")
 
 
+def test_stream_subscribe_also_follows_by_code():
+    """i) The name-based subscribe alone never delivered an event,
+    so start_asset_streams also follows with the asset's NUMERIC
+    code (what pyquotex's own one-stream helper does). A client
+    without a code map still subscribes fine — the follow is best
+    effort and must never break the stream."""
+    import bot.collector as collector_mod
+
+    class FakeApi:
+        def __init__(self):
+            self.followed = []
+
+        async def follow_candle(self, code):
+            self.followed.append(code)
+
+    class FakeClient:
+        def __init__(self, codes):
+            self.started = []
+            self.codes_asset = codes
+            self.api = FakeApi()
+
+        async def start_candles_stream(self, asset, period=60):
+            self.started.append((asset, period))
+
+    async def _run(codes):
+        session = collector_mod.SharedQuotexSession()
+        session.client = FakeClient(codes)
+        await session.start_asset_streams(
+            ["BTCUSD_otc", "ETHUSD_otc"], 60)
+        return session.client
+
+    client = asyncio.run(_run({"BTCUSD_otc": "99", "ETHUSD_otc": "42"}))
+    assert client.started == [("BTCUSD_otc", 60), ("ETHUSD_otc", 60)], \
+        client.started
+    assert client.api.followed == ["99", "42"], client.api.followed
+    # No code map at all: subscribe still works, nothing followed.
+    client = asyncio.run(_run({}))
+    assert client.started == [("BTCUSD_otc", 60), ("ETHUSD_otc", 60)], \
+        client.started
+    assert client.api.followed == [], client.api.followed
+    print("PASS i) stream subscribe also follows by numeric code")
+
+
+def test_candle_generated_handler_logs_and_stores():
+    """j) The vendored handler stores the event AND logs the first
+    few received (proving events arrive + showing their shape);
+    an event without asset/period is logged as a warning instead
+    of vanishing silently."""
+    from collections import defaultdict
+    from pyquotex.api import QuotexAPI
+
+    api = object.__new__(QuotexAPI)
+    api.candle_generated_check = defaultdict(lambda: defaultdict(dict))
+    api.candle_generated_all_size_check = {}
+    cap = _CaptureHandler(level=logging.INFO)
+    logger = logging.getLogger("pyquotex.api")
+    old_level = logger.level
+    logger.setLevel(logging.INFO)
+    logger.addHandler(cap)
+    try:
+        asyncio.run(api._h_candle_generated({
+            "asset": "BTCUSD_otc", "period": 60, "index": EVENT_TS,
+            "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5}))
+        assert api.candle_generated_check["BTCUSD_otc"][60]["close"] == 100.5
+        assert any("candle-generated event: asset=BTCUSD_otc" in m
+                   for m in cap.records), cap.records
+        asyncio.run(api._h_candle_generated(
+            {"index": EVENT_TS, "close": 1.0}))
+        assert any("without asset/period" in m for m in cap.records), \
+            cap.records
+    finally:
+        logger.removeHandler(cap)
+        logger.setLevel(old_level)
+    print("PASS j) candle-generated handler logs first events + bad shape")
+
+
 if __name__ == "__main__":
     test_stream_stores_generated_candles()
     test_stream_reconnects_and_tail_fills()
@@ -386,4 +462,6 @@ if __name__ == "__main__":
     test_stream_seeds_open_from_db()
     test_stream_logs_dropped_events()
     test_stream_logs_silence()
+    test_stream_subscribe_also_follows_by_code()
+    test_candle_generated_handler_logs_and_stores()
     print("ALL LIVE-STREAM TESTS PASSED")
