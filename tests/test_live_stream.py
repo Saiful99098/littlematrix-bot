@@ -463,6 +463,66 @@ def test_candle_generated_handler_logs_and_stores():
     print("PASS j) candle-generated handler logs first events + bad shape")
 
 
+def test_stream_test_asset_picks_one():
+    """k) TEST MODE: LIVE_STREAM_TEST_ASSET names one asset and the
+    stream subscribes to that asset only ('-' and '_' spellings both
+    match); an unknown name falls back to all assets with a warning;
+    empty (default) streams everything."""
+    from bot.live_stream import _pick_stream_assets
+
+    assets = ["BTCUSD_otc", "ETHUSD_otc", "EURUSD_otc"]
+    assert _pick_stream_assets(assets, "") == assets
+    assert _pick_stream_assets(assets, "BTCUSD-OTC") == ["BTCUSD_otc"]
+    assert _pick_stream_assets(assets, "ethusd_otc") == ["ETHUSD_otc"]
+    assert _pick_stream_assets(assets, "NOPE_otc") == assets
+    print("PASS k) test-asset picker streams one asset only")
+
+
+def test_ws_logs_unknown_control_events():
+    """l) The stream never receives 'candle-generated' — if the
+    server answers under a different event name, the dispatch must
+    log the first few unknown names instead of dropping them
+    silently. Known events still route to their handler."""
+    from types import SimpleNamespace
+    from pyquotex.api import QuotexAPI
+    from pyquotex.global_value import AuthStatus
+
+    calls = []
+
+    async def _fake_candle(data):
+        calls.append(data)
+
+    api = object.__new__(QuotexAPI)
+    api.state = SimpleNamespace(auth_status=AuthStatus.AUTHENTICATED)
+    api._temp_status = ""
+    api._control_handlers = {"candle-generated": _fake_candle}
+    cap = _CaptureHandler(level=logging.INFO)
+    logger = logging.getLogger("pyquotex.api")
+    old_level = logger.level
+    logger.setLevel(logging.INFO)
+    logger.addHandler(cap)
+    try:
+        asyncio.run(api._on_message('42["mystery-event", {"x": 1}]'))
+        assert any("WS unknown control event: mystery-event" in m
+                   for m in cap.records), cap.records
+        assert calls == []
+        asyncio.run(api._on_message(
+            '42["candle-generated", {"asset": "BTCUSD_otc", "period": 60}]'))
+        assert len(calls) == 1 and calls[0]["asset"] == "BTCUSD_otc"
+        assert not any("unknown control event: candle-generated" in m
+                       for m in cap.records), cap.records
+        # Throttle: at most 5 unknown-event lines in total.
+        for i in range(6):
+            asyncio.run(api._on_message(f'42["other-{i}", {{}}]'))
+        unknown = [m for m in cap.records
+                   if m.startswith("WS unknown control event:")]
+        assert len(unknown) == 5, unknown
+    finally:
+        logger.removeHandler(cap)
+        logger.setLevel(old_level)
+    print("PASS l) WS dispatch logs unknown control event names (max 5)")
+
+
 if __name__ == "__main__":
     test_stream_stores_generated_candles()
     test_stream_reconnects_and_tail_fills()
@@ -474,4 +534,6 @@ if __name__ == "__main__":
     test_stream_logs_silence()
     test_stream_subscribe_also_follows_by_code()
     test_candle_generated_handler_logs_and_stores()
+    test_stream_test_asset_picks_one()
+    test_ws_logs_unknown_control_events()
     print("ALL LIVE-STREAM TESTS PASSED")

@@ -95,6 +95,26 @@ async def _stream_assets(db, session):
         return []
 
 
+def _pick_stream_assets(assets, test_asset):
+    """TEST MODE (2026-11-26): the 61-asset bulk subscribe never
+    delivered a single 'candle-generated' event, even with the
+    numeric-code follow sent for all 61. When LIVE_STREAM_TEST_ASSET
+    names one asset, stream only that asset — if events flow for one,
+    the server caps bulk subscribes; if not, the subscribe itself is
+    wrong. An empty test asset (default) streams everything, as
+    before. The name may use '-' or '_' (BTCUSD-OTC = BTCUSD_otc)."""
+    if not test_asset:
+        return list(assets)
+    wanted = test_asset.replace("-", "_").upper()
+    for asset in assets:
+        if asset.replace("-", "_").upper() == wanted:
+            logger.info("live stream: TEST MODE — streaming only %s", asset)
+            return [asset]
+    logger.warning("live stream: TEST asset %s is not open — streaming all %d assets",
+                   test_asset, len(assets))
+    return list(assets)
+
+
 async def _tail_fill(db, session, assets, now=None):
     """Fetch only each asset's missing tail (last stored candle ->
     now) and store it — closes the gap a disconnect left behind.
@@ -261,6 +281,7 @@ async def live_stream_loop(db=None, session_factory=None, sleep=None):
             assets = await _stream_assets(db, session)
             if not assets:
                 raise RuntimeError("no assets to stream")
+            assets = _pick_stream_assets(assets, config.LIVE_STREAM_TEST_ASSET)
             logger.info("live stream: subscribed to %d assets", len(assets))
             await session.start_asset_streams(assets, config.LIVE_STREAM_PERIOD)
             await _tail_fill(db, session, assets)

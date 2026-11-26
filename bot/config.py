@@ -130,6 +130,11 @@ LIVE_STREAM_POLL_SECONDS = float(os.getenv("LIVE_STREAM_POLL_SECONDS", "5") or 5
 # Minutes with no new candle from any asset before the stream treats
 # the connection as dead and reconnects.
 LIVE_STREAM_STALE_MINUTES = int(os.getenv("LIVE_STREAM_STALE_MINUTES", "10") or 10)
+# TEST MODE for the silent-stream investigation (2026-11-26): when
+# set to one asset name (e.g. BTCUSD-OTC), the stream subscribes to
+# that asset only — if events flow for one asset, the server caps
+# bulk subscribes. Empty (default) = stream all open assets.
+LIVE_STREAM_TEST_ASSET = os.getenv("LIVE_STREAM_TEST_ASSET", "").strip()
 # How many days of history the day picker may offer (1-20 in code;
 # the Render-test backfill gives 5, so the picker shows 1-5 in db mode).
 MAX_SIGNAL_DAYS = int(os.getenv("MAX_SIGNAL_DAYS", "20"))

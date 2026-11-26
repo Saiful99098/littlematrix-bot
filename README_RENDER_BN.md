@@ -322,6 +322,17 @@ Postgres ডেটাবেসে candle লেখে)।
   দেয় event-এর আকারে সমস্যা নাকি server-ই পাঠাচ্ছে না)। আর কোনো
   event আদৌ এলে `candle-generated event: asset=... keys=[...]` লাইন
   আসবে (প্রথম ৩টা) — ওই লাইন না এলে বুঝবেন server event পাঠাচ্ছেই না।
+  **এক asset-এর টেস্ট (২৬ নভেম্বর):** ৬১টা asset একসাথে subscribe
+  করেও কোনো event আসেনি — এমনকি নম্বর কোডের follow পাঠানোর পরও।
+  আসল ব্রাউজার একসাথে একটাই chart খোলে, তাই সন্দেহ: server হয়তো
+  একসাথে এতগুলো subscribe নেয় না। পরীক্ষা করতে Render Environment-এ
+  `LIVE_STREAM_TEST_ASSET=BTCUSD-OTC` বসান (Save দিলে বট restart
+  হবে) — স্ট্রিম তখন শুধু ওই একটা asset-এ subscribe করবে। ২-৩ মিনিট
+  log দেখুন: `candle-generated event:` এলে বুঝবেন একটার জন্য event
+  আসে — তখন স্ট্রিম হবে অল্প কয়েকটা asset-এর, বাকিটা batch-এর ভরসায়।
+  না এলে subscribe-এর ধরনটাই ভুল — তখন log-এ `WS unknown control
+  event:` লাইন দেখুন (server অন্য নামে কিছু পাঠাচ্ছে কিনা)। টেস্ট
+  শেষে var-টা মুছে দিলে আবার সব asset-এর স্ট্রিম চালু হবে।
 - **AI Signal / Market Live / Trend Scan / Candle Scan — মার্কেট বাছাই:**
   এই ৪টা বোতাম চাপলে বট প্রথমে জিজ্ঞেস করবে কোন মার্কেটের ডেটা দেখতে
   চান — লিস্ট থেকে asset বাছুন, তারপর সেই asset-এর রেজাল্ট দেখাবে।

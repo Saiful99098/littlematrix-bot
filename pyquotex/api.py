@@ -331,6 +331,16 @@ class QuotexAPI:
                     handler = self._control_handlers.get(event)
                     if handler is not None:
                         await handler(data)
+                    else:
+                        # Diagnostic (2026-11-26): the stream never
+                        # receives 'candle-generated' — log the first
+                        # few unknown event names, so we can see
+                        # whether the server answers under a different
+                        # name instead of staying silent.
+                        if getattr(self, "_unknown_event_logs", 0) < 5:
+                            self._unknown_event_logs = getattr(
+                                self, "_unknown_event_logs", 0) + 1
+                            logger.info("WS unknown control event: %s", event)
 
             # 2. Handle Data Payloads (Placeholder fulfillment)
             elif message is not None and not is_control:
