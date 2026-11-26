@@ -212,11 +212,15 @@ class CandleDB:
         return cur
 
     # -- candles ------------------------------------------------------
-    def insert_candles(self, asset, rows):
+    def insert_candles(self, asset, rows, on_conflict="nothing"):
         """Insert candles. rows: list of dicts with keys
         ts (aware datetime, UTC, or ISO string), open, high, low, close.
         Duplicates (same asset+ts) are ignored by the UNIQUE index.
-        Returns the number of NEW rows inserted."""
+        Returns the number of NEW rows inserted.
+        on_conflict="update" (batch/event truth only): a later insert
+        OVERWRITES the row — the 2-hourly batch and the server's own
+        closed-candle events correct tick-built rows (the tick builder
+        inserts with "nothing" and can never overwrite truth)."""
         asset = normalize_asset_name(asset)
         if not rows:
             return 0
@@ -227,7 +231,21 @@ class CandleDB:
                 ts = utc_iso(ts)
             data.append((asset, ts, float(r["open"]), float(r["high"]),
                          float(r["low"]), float(r["close"])))
-        if self.backend == "postgres":
+        if on_conflict == "update":
+            # The WHERE keeps the "new rows" count honest: a repeat
+            # insert of identical values updates nothing and counts
+            # 0 (the collector's idempotency tests rely on this), while
+            # a genuinely different row (a tick-built minute corrected
+            # by the batch) is overwritten and counted.
+            sql = ("INSERT INTO candles (asset, ts, open, high, low, close) "
+                   "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (asset, ts) DO UPDATE SET "
+                   "open = EXCLUDED.open, high = EXCLUDED.high, "
+                   "low = EXCLUDED.low, close = EXCLUDED.close "
+                   "WHERE candles.open <> EXCLUDED.open "
+                   "OR candles.high <> EXCLUDED.high "
+                   "OR candles.low <> EXCLUDED.low "
+                   "OR candles.close <> EXCLUDED.close")
+        elif self.backend == "postgres":
             sql = ("INSERT INTO candles (asset, ts, open, high, low, close) "
                    "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (asset, ts) DO NOTHING")
         else:

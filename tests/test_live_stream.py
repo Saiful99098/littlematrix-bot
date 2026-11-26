@@ -57,7 +57,7 @@ class FakeSession:
     """
 
     def __init__(self, event_from_poll=1, connected_polls=None,
-                 event_dict=None, tail_candles="default"):
+                 event_dict=None, tail_candles="default", ticks=None):
         self.connects = 0
         self.subscribed = []
         self.closed = 0
@@ -68,6 +68,9 @@ class FakeSession:
         self.connected_polls = connected_polls
         self.event_dict = event_dict
         self.tail_candles = tail_candles
+        # ticks: {asset: [{"time": unix-seconds, "price": float}]}
+        # returned by generated_ticks() every poll (default: none).
+        self.ticks = ticks or {}
 
     async def connect(self):
         self.connects += 1
@@ -86,6 +89,9 @@ class FakeSession:
             "asset": "BTCUSD_otc", "period": 60, "index": EVENT_TS,
             "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5}
         return {"BTCUSD_otc": {60: ev}}
+
+    def generated_ticks(self):
+        return {a: list(v) for a, v in self.ticks.items() if v}
 
     async def is_connected(self):
         self.polls += 1
@@ -523,6 +529,78 @@ def test_ws_logs_unknown_control_events():
     print("PASS l) WS dispatch logs unknown control event names (max 5)")
 
 
+def test_stream_builds_candles_from_ticks():
+    """m) The server never sends 'candle-generated' — but the same
+    subscribe delivers price ticks, so closed minutes are built
+    from ticks (open = first tick, close = latest, high/low =
+    extremes). The current (open) minute is never stored, and a
+    minute is stored exactly once."""
+    import time as _time
+
+    db, tmp = _tmp_db()
+    now = int(_time.time())
+    closed_min = now - (now % 60) - 60  # the just-closed minute
+    cur_min = closed_min + 60
+    ticks = {"BTCUSD_otc": [
+        {"time": closed_min + 5, "price": 100.0},
+        {"time": closed_min + 20, "price": 101.0},
+        {"time": closed_min + 40, "price": 99.5},
+        {"time": closed_min + 55, "price": 100.5},
+        {"time": cur_min + 5, "price": 102.0},
+    ]}
+    # No events at all: the event channel is dead in this test.
+    session = FakeSession(event_from_poll=999, ticks=ticks,
+                          tail_candles=[])
+    try:
+        asyncio.run(live_stream.live_stream_loop(
+            db=db, session_factory=lambda: session,
+            sleep=_CountingSleep(max_calls=4)))
+    except _StopLoop:
+        pass
+    else:
+        raise AssertionError("loop ended without reaching the fake sleep")
+    date_str = datetime.fromtimestamp(
+        closed_min, tz=timezone.utc).astimezone(DHAKA).strftime("%Y-%m-%d")
+    rows = _candles_for(db, "BTCUSD_otc", date_str)
+    by_time = {r["time"]: r for r in rows}
+    assert closed_min in by_time, rows
+    candle = by_time[closed_min]
+    assert (candle["O"], candle["H"], candle["L"], candle["C"]) == \
+        (100.0, 101.0, 99.5, 100.5), candle
+    # The current minute was NOT stored, and the closed minute once.
+    assert cur_min not in by_time, rows
+    assert [r["time"] for r in rows].count(closed_min) == 1, rows
+    print("PASS m) stream builds closed-minute candles from live ticks")
+
+
+def test_batch_corrects_tick_rows_but_not_vice_versa():
+    """n) A tick-built row is an approximation: it must never
+    overwrite batch/event truth, and the batch must correct it.
+    insert_candles(on_conflict="update") overwrites; the default
+    ("nothing") leaves the existing row alone."""
+    db, tmp = _tmp_db()
+    ts = datetime(2026, 11, 26, 12, 0, tzinfo=timezone.utc)
+    tick_row = {"ts": ts, "open": 100.0, "high": 101.0,
+                "low": 99.0, "close": 100.5}
+    batch_row = {"ts": ts, "open": 100.2, "high": 101.2,
+                 "low": 99.2, "close": 100.8}
+    assert db.insert_candles("BTCUSD_otc", [tick_row]) == 1
+    # A second tick insert for the same minute changes nothing.
+    assert db.insert_candles("BTCUSD_otc", [tick_row]) == 0
+    rows = _candles_for(db, "BTCUSD_otc", "2026-11-26")
+    assert rows[0]["O"] == 100.0 and rows[0]["C"] == 100.5, rows
+    # The batch corrects the minute with the true values.
+    assert db.insert_candles("BTCUSD_otc", [batch_row],
+                             on_conflict="update") == 1
+    rows = _candles_for(db, "BTCUSD_otc", "2026-11-26")
+    assert rows[0]["O"] == 100.2 and rows[0]["C"] == 100.8, rows
+    # And a late tick insert can never overwrite the batch row.
+    assert db.insert_candles("BTCUSD_otc", [tick_row]) == 0
+    rows = _candles_for(db, "BTCUSD_otc", "2026-11-26")
+    assert rows[0]["O"] == 100.2, rows
+    print("PASS n) batch corrects tick rows; ticks never overwrite truth")
+
+
 if __name__ == "__main__":
     test_stream_stores_generated_candles()
     test_stream_reconnects_and_tail_fills()
@@ -536,4 +614,6 @@ if __name__ == "__main__":
     test_candle_generated_handler_logs_and_stores()
     test_stream_test_asset_picks_one()
     test_ws_logs_unknown_control_events()
+    test_stream_builds_candles_from_ticks()
+    test_batch_corrects_tick_rows_but_not_vice_versa()
     print("ALL LIVE-STREAM TESTS PASSED")

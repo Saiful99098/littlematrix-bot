@@ -317,6 +317,22 @@ class SharedQuotexSession:
         except Exception:
             return False
 
+    def generated_ticks(self):
+        """Live price ticks per asset, as stored by the vendored
+        handler: {asset: [{"time": unix-seconds, "price": float}]}.
+        Filled by the same instruments/update subscribe the stream
+        already sends — the server pushes a tick on every price move,
+        and the lib's own realtime-price path waits on these (not on
+        'candle-generated'). Empty when nothing has arrived yet."""
+        try:
+            api = getattr(self.client, "api", None)
+            ticks = getattr(api, "realtime_price", None) if api else None
+            if not ticks:
+                return {}
+            return {a: list(v) for a, v in ticks.items() if v}
+        except Exception:
+            return {}
+
     def generated_candles(self):
         """Latest closed-candle event per asset: {asset: {period: event}}.
 
@@ -432,7 +448,8 @@ def _store_rows(db, asset, raw, ts_min, ts_max=None):
             if r["ts"] >= ts_min and (ts_max is None or r["ts"] < ts_max)]
     if not rows:
         return 0, 0
-    return len(rows), db.insert_candles(asset, rows)
+    # Batch truth: overwrite tick-built rows for the same minutes.
+    return len(rows), db.insert_candles(asset, rows, on_conflict="update")
 
 
 async def run_backfill(db, session, days=None, now=None):

@@ -322,17 +322,21 @@ Postgres ডেটাবেসে candle লেখে)।
   দেয় event-এর আকারে সমস্যা নাকি server-ই পাঠাচ্ছে না)। আর কোনো
   event আদৌ এলে `candle-generated event: asset=... keys=[...]` লাইন
   আসবে (প্রথম ৩টা) — ওই লাইন না এলে বুঝবেন server event পাঠাচ্ছেই না।
-  **এক asset-এর টেস্ট (২৬ নভেম্বর):** ৬১টা asset একসাথে subscribe
-  করেও কোনো event আসেনি — এমনকি নম্বর কোডের follow পাঠানোর পরও।
-  আসল ব্রাউজার একসাথে একটাই chart খোলে, তাই সন্দেহ: server হয়তো
-  একসাথে এতগুলো subscribe নেয় না। পরীক্ষা করতে Render Environment-এ
-  `LIVE_STREAM_TEST_ASSET=BTCUSD-OTC` বসান (Save দিলে বট restart
-  হবে) — স্ট্রিম তখন শুধু ওই একটা asset-এ subscribe করবে। ২-৩ মিনিট
-  log দেখুন: `candle-generated event:` এলে বুঝবেন একটার জন্য event
-  আসে — তখন স্ট্রিম হবে অল্প কয়েকটা asset-এর, বাকিটা batch-এর ভরসায়।
-  না এলে subscribe-এর ধরনটাই ভুল — তখন log-এ `WS unknown control
-  event:` লাইন দেখুন (server অন্য নামে কিছু পাঠাচ্ছে কিনা)। টেস্ট
-  শেষে var-টা মুছে দিলে আবার সব asset-এর স্ট্রিম চালু হবে।
+  **স্ট্রিম কীভাবে candle বানায় (২৬ নভেম্বর):** Quotex-এর
+  `candle-generated` event আসলে কখনোই আসে না — ৬১টা asset-এও না,
+  ১টাতেও না, নম্বর কোডের follow পাঠানোর পরও না। কিন্তু একই subscribe-এ
+  **দামের tick** ঠিকই আসে (প্রতি দাম বদলে একটা করে)। তাই স্ট্রিম এখন
+  tick থেকে ১ মিনিটের candle বানায়: ওই মিনিটের প্রথম tick = Open,
+  শেষ tick = Close, সর্বোচ্চ/সর্বনিম্ন = High/Low। মিনিট বন্ধ হলেই
+  candle DB-তে যায়। Tick-এর candle একটা আনুমানিক হিসাব — তাই ২
+  ঘণ্টার batch পরে ওই মিনিটের আসল candle দিয়ে সেটা ঠিক করে দেয়
+  (আর tick-এর candle কখনো batch-এর ডেটা মুছতে পারে না)। Log-এ
+  `tick-built candles` লাইন এলে বুঝবেন tick থেকে candle জমছে; `no
+  candle-generated events ... building candles from ticks` মানে event
+  আসছে না কিন্তু tick চলছে; tick-ও না এলে `server silent` warning
+  আসবে — তখন subscription-ই পৌঁছাচ্ছে না। এক asset-এর টেস্ট করতে
+  `LIVE_STREAM_TEST_ASSET=BTCUSD-OTC` বসান — টেস্ট শেষে var-টা মুছে
+  দিলে আবার সব asset-এর স্ট্রিম চালু হবে।
 - **AI Signal / Market Live / Trend Scan / Candle Scan — মার্কেট বাছাই:**
   এই ৪টা বোতাম চাপলে বট প্রথমে জিজ্ঞেস করবে কোন মার্কেটের ডেটা দেখতে
   চান — লিস্ট থেকে asset বাছুন, তারপর সেই asset-এর রেজাল্ট দেখাবে।

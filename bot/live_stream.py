@@ -130,13 +130,73 @@ async def _tail_fill(db, session, assets, now=None):
         for asset, raw in results.items():
             if not raw:
                 continue
-            total += db.insert_candles(asset, rows_from_raw(raw))
+            # Batch truth: overwrite tick-built rows for the same minutes.
+            total += db.insert_candles(asset, rows_from_raw(raw),
+                                       on_conflict="update")
         if total:
             logger.info("live stream: tail-fill stored %d candles", total)
     except quotex_client.QuotexRateLimited:
         raise
     except Exception as exc:
         logger.warning("live stream: tail-fill failed: %s", exc)
+
+
+def _store_tick_candles(db, ticks, period, buckets, built_until, now_s):
+    """Build 1-minute candles from live price ticks and store the
+    minutes that have closed.
+
+    2026-11-26: the server never sends 'candle-generated' — not for
+    61 assets, not even for 1 — but the SAME subscribe already
+    delivers price ticks (the lib's own realtime-price path waits on
+    them, not on the event). A tick is [asset, ts-seconds, price]:
+    feed it through the vendored process_tick (open = first tick of
+    the minute, close = latest, high/low = extremes). Closed minutes
+    are inserted with on_conflict="nothing", so a tick-built row
+    never overwrites a batch/event row — the 2-hourly batch
+    (on_conflict="update") corrects it with the server's true candle
+    within 2 hours. Returns (n_inserted, n_assets_with_ticks,
+    newest_tick_ts|None)."""
+    from pyquotex.utils.processor import process_tick
+
+    cur_min = now_s - (now_s % period)
+    inserted = 0
+    newest_ts = None
+    for asset, tick_list in (ticks or {}).items():
+        if not tick_list:
+            continue
+        asset_buckets = buckets.setdefault(asset, {})
+        for t in tick_list:
+            try:
+                ts = float(t["time"])
+                price = float(t["price"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if ts > 1e11:  # milliseconds — normalize to seconds
+                ts /= 1000.0
+            if newest_ts is None or ts > newest_ts:
+                newest_ts = ts
+            minute = int(ts // period * period)
+            if minute <= built_until.get(asset, -1):
+                continue
+            process_tick([asset, ts, price, 0], period, asset_buckets)
+        for minute in sorted(asset_buckets):
+            if minute >= cur_min:
+                break
+            candle = asset_buckets.pop(minute)
+            row = {"ts": datetime.fromtimestamp(minute, tz=timezone.utc),
+                   "open": candle["open"], "high": candle["high"],
+                   "low": candle["low"], "close": candle["close"]}
+            try:
+                n = db.insert_candles(asset, [row])
+            except Exception as exc:
+                logger.warning("live stream: tick insert failed for %s: %s",
+                               asset, exc)
+                continue
+            if n:
+                inserted += 1
+            built_until[asset] = minute
+    n_assets = sum(1 for a in (ticks or {}) if ticks[a])
+    return inserted, n_assets, newest_ts
 
 
 async def _poll_loop(db, session, sleep, n_assets=0):
@@ -153,9 +213,12 @@ async def _poll_loop(db, session, sleep, n_assets=0):
     silent states it is in: no candle-generated events at all, or
     events arriving but no candle stored (with a sample of the
     dropped event's keys, so the log shows whether 'open' is
-    missing or the shape is wrong). The tail-fill and the 2-hourly
-    batch keep the DB fed meanwhile, so silence is a warning,
-    never a crash.
+    missing or the shape is wrong). Since 2026-11-26 the event
+    channel never delivers at all — so closed minutes are ALSO
+    built from live price ticks (_store_tick_candles), and the
+    diagnostic says which channel is alive. The tail-fill and the
+    2-hourly batch keep the DB fed meanwhile, so silence is a
+    warning, never a crash.
     """
     period = config.LIVE_STREAM_PERIOD
     poll = config.LIVE_STREAM_POLL_SECONDS
@@ -175,6 +238,13 @@ async def _poll_loop(db, session, sleep, n_assets=0):
     quiet_polls = 0    # consecutive polls with no events at all
     drop_polls = 0     # consecutive polls with events but 0 stored
     drop_sample = None  # (asset, keys, open_present) of a dropped event
+    # Tick-built candles (2026-11-26): 'candle-generated' never
+    # arrives, so closed minutes are built from live price ticks
+    # instead — see _store_tick_candles. Buckets hold the minutes
+    # still being built; built_until remembers the last stored
+    # minute per asset so late ticks never rebuild it.
+    tick_buckets = {}
+    built_until = {}
     while True:
         await sleep(poll)
         if not await session.is_connected():
@@ -212,7 +282,9 @@ async def _poll_loop(db, session, sleep, n_assets=0):
             if asset in last_ts and row["ts"] <= last_ts[asset]:
                 continue
             try:
-                n = db.insert_candles(asset, [row])
+                # Server truth: a closed-candle event corrects a
+                # tick-built row for the same minute at once.
+                n = db.insert_candles(asset, [row], on_conflict="update")
             except Exception as exc:
                 logger.warning("live stream: insert failed for %s: %s",
                                asset, exc)
@@ -221,12 +293,34 @@ async def _poll_loop(db, session, sleep, n_assets=0):
                 inserted += 1
             last_ts[asset] = row["ts"]
             last_close[asset] = row["close"]
-        if inserted:
+        # Tick path: build closed minutes from live price ticks.
+        # Runs every poll; inert when no ticks arrive.
+        tick_inserted = 0
+        tick_assets = 0
+        tick_age = None
+        try:
+            ticks = session.generated_ticks() or {}
+        except Exception:
+            ticks = {}
+        try:
+            tick_inserted, tick_assets, newest_ts = _store_tick_candles(
+                db, ticks, period, tick_buckets, built_until,
+                int(time.time()))
+        except Exception as exc:
+            logger.warning("live stream: tick build failed: %s", exc)
+            tick_inserted, tick_assets, newest_ts = 0, 0, None
+        if newest_ts is not None:
+            tick_age = max(0, int(time.time() - newest_ts))
+        if inserted or tick_inserted:
             last_any = time.monotonic()
             quiet_polls = 0
             drop_polls = 0
             _safe_set_state(db, "live_stream_last_seen", utc_iso(dhaka_now()))
-            logger.info("live stream: %d new candles", inserted)
+            if inserted:
+                logger.info("live stream: %d new candles", inserted)
+            if tick_inserted:
+                logger.info("live stream: %d tick-built candles",
+                            tick_inserted)
         elif dropped_this_poll:
             # Events arrived but at least one was dropped by the row
             # builder (missing fields / missing 'open' with no
@@ -249,10 +343,23 @@ async def _poll_loop(db, session, sleep, n_assets=0):
             quiet_polls += 1
             drop_polls = 0
             if quiet_polls >= diag_polls:
-                logger.warning(
-                    "live stream: no candle-generated events in the last "
-                    "60s (%d assets subscribed — server silent or "
-                    "subscription not delivering)", n_assets)
+                if tick_assets:
+                    # The event channel is dead but ticks flow and
+                    # candles are being built from them — info, not a
+                    # warning. (When tick_inserted > 0 this branch is
+                    # never reached; this covers ticks arriving but no
+                    # minute closing yet.)
+                    logger.info(
+                        "live stream: no candle-generated events in the "
+                        "last 60s (%d assets subscribed) — building "
+                        "candles from ticks (%d assets, newest tick %ds ago)",
+                        n_assets, tick_assets,
+                        tick_age if tick_age is not None else -1)
+                else:
+                    logger.warning(
+                        "live stream: no candle-generated events in the last "
+                        "60s (%d assets subscribed — server silent or "
+                        "subscription not delivering)", n_assets)
                 quiet_polls = 0
         if time.monotonic() - last_any > stale_after:
             logger.warning("live stream: stale — no new candle for %d "
