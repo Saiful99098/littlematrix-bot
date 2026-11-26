@@ -92,12 +92,68 @@ async def post_init(app):
     the bot from answering Telegram."""
     if config.collector_active():
         logger.info("collector enabled (DATA_MODE=db) — starting background task")
-        task = asyncio.create_task(collector.collector_loop())
+        task = asyncio.create_task(collector.collector_loop(bot=app.bot))
         task.add_done_callback(_collector_task_done)
         app.bot_data["collector_task"] = task
     else:
         logger.info("collector not active (DATA_MODE=%s, COLLECTOR_ENABLED=%s)",
                     config.DATA_MODE, config.COLLECTOR_ENABLED)
+
+
+async def channel_member_update(update, context):
+    """Auto-detect a channel join: when a user joins the required
+    channel, welcome them and unlock the bot. Fires only when the
+    bot is an admin in that channel; the "I Joined" button is the
+    fallback when it does not fire."""
+    if not config.REQUIRED_CHANNEL:
+        return
+    member_update = update.chat_member
+    if member_update is None:
+        return
+    chat = member_update.chat
+    channel = (config.REQUIRED_CHANNEL or "").strip().lstrip("@")
+    chat_matches = (str(chat.id) == channel
+                    or (chat.username or "") == channel)
+    if not chat_matches:
+        return
+    old = member_update.old_chat_member.status
+    new = member_update.new_chat_member.status
+    if old in ("left", "kicked") and new in ("member", "administrator",
+                                             "creator", "restricted"):
+        user = member_update.new_chat_member.user
+        try:
+            from bot.handlers import main_keyboard, pe as _pe
+            await context.bot.send_message(
+                chat_id=user.id,
+                text=(f"{_pe('diamond')}{_pe('lightning')} Welcome to BLUE FISH PRIME! {_pe('fire')}\n"
+                      "You joined the Blue Fish trading community — the tools are now unlocked.\n"
+                      "Pick a tool below to start."),
+                reply_markup=main_keyboard(), parse_mode="HTML")
+        except Exception:
+            pass
+
+
+async def my_chat_member_update(update, context):
+    """Log the channel id when the bot is added to a channel as admin.
+
+    The membership gate needs the channel's numeric id (-100...) in
+    REQUIRED_CHANNEL — a private channel has no @username, so the id
+    cannot be guessed. When the owner adds the bot as admin, Telegram
+    sends this update with the chat id; it is logged here so the owner
+    can copy it from the Render logs into REQUIRED_CHANNEL.
+    """
+    member_update = update.my_chat_member
+    if member_update is None:
+        return
+    chat = member_update.chat
+    new = member_update.new_chat_member.status
+    old = member_update.old_chat_member.status
+    if chat.type == "channel" and old in ("left", "kicked") and new in (
+            "administrator", "member"):
+        logger.warning(
+            "Bot added to channel '%s' (id: %s) — set this id as "
+            "REQUIRED_CHANNEL to turn the membership gate on.",
+            chat.title, chat.id)
 
 
 def build_application():
@@ -119,7 +175,9 @@ def build_application():
     for _var in ("NO_PROXY", "no_proxy"):
         if _var in os.environ:
             os.environ[_var] = "localhost,127.0.0.1"
-    from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
+    from telegram.ext import (Application, CallbackQueryHandler,
+                              ChatMemberHandler, CommandHandler,
+                              MessageHandler, filters)
     from bot.handlers import menu_callback, start, text_message
 
     if not config.has_telegram_token():
@@ -130,6 +188,14 @@ def build_application():
            .build())
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(menu_callback))
+    # Auto-detect channel joins (fires only when the bot is an admin
+    # in the required channel — see channel_member_update).
+    app.add_handler(ChatMemberHandler(channel_member_update,
+                                      ChatMemberHandler.CHAT_MEMBER))
+    # Log the channel id when the bot is added as admin — the owner
+    # copies it into REQUIRED_CHANNEL (see my_chat_member_update).
+    app.add_handler(ChatMemberHandler(my_chat_member_update,
+                                      ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
     return app
 

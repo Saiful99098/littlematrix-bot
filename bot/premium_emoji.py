@@ -1,6 +1,6 @@
 """Telegram Premium custom emojis for Blue Fish Prime.
 
-Saiful's emoji packs (all IDs below are REAL, fetched with
+the owner's emoji packs (all IDs below are REAL, fetched with
 Telegram Bot API getStickerSet — never invent an ID, a wrong ID
 renders as a broken/blank emoji):
 - https://t.me/addemoji/ZEROX_660_by_TgEmodziBot (200 emojis)
@@ -60,7 +60,7 @@ PREMIUM_EMOJI = {
     "star": ("6264925819508888658", "⭐"),
     "sparkle": ("6285088169817805553", "✨"),
     # CARDERS_by_TgEmodziBot — premium animated warning (used for the
-    # DISCLAIMER; Saiful circled the plain ⚠️ and wants this one).
+    # DISCLAIMER; the owner circled the plain ⚠️ and wants this one).
     "warning": ("6089079808187174973", "⚠️"),
     "bell": ("6264510702329797113", "🔔"),
     "pin": ("6267172559851099903", "📌"),
@@ -108,7 +108,7 @@ def pe(name):
 # python-telegram-bot 22.7+). Keys are button names, values are REAL
 # custom_emoji_id strings fetched with getStickerSet (never invented).
 # A button is listed here ONLY when its Unicode emoji has a matching
-# custom emoji in Saiful's packs. All 19 main-menu buttons now have
+# custom emoji in the owner's packs. All 19 main-menu buttons now have
 # icons (the last 6 — Market Live, OTC Board, News Desk, Timezone,
 # Signal Filter, My Status — were added from Decoration_Pack2,
 # NewsEmoji and ZEROX_660_by_TgEmodziBot).

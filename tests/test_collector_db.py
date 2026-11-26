@@ -10,14 +10,17 @@ b2) DB recovers after the connection is closed (Render's Postgres
 b3) DB asset names are case-insensitive: candles stored as
    'BTCUSD_otc' are found when the checker asks for 'BTCUSD-OTC'
    (pasted signal form) — the 2026-11-25 all-NO-DATA bug.
-c) signals FROM the DB (sample USDMXN 2026-11-21 loaded in) give the
-   same 13 signals for 09:00-10:59 as tests/test_signal.py.
+c) signals FROM the DB (synthetic USDMXN 2026-11-21 loaded in) give the
+   same 16 signals for 09:00-10:59 as tests/test_signal.py.
 d) checker lookup from the DB returns the right result.
 e) webhook mode branches on WEBHOOK_URL (no real bind, no real login).
 f) collector backfill with a fake session inserts 1440/day/asset in the
    window; a second run inserts 0 new; a 429 stops the run.
 g) backfill resumes after a mid-run crash: assets stored before the
    crash stay in the DB, the next run skips them and finishes the rest.
+
+The old bundled sample file is deleted — tests c/d/h now load
+deterministic synthetic days from tests/synthetic_data.py.
 """
 from __future__ import annotations
 
@@ -29,6 +32,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from bot import collector, config
 from bot.candles_db import CandleDB, DHAKA, dhaka_date_range_utc, utc_iso
@@ -45,16 +49,27 @@ from bot.collector import (
 )
 from bot.quotex_client import QuotexRateLimited
 from bot.signal_engine import generate_futures_signals_from_db
+from synthetic_data import force_candle, make_day, to_raw
 
 ROOT = Path(__file__).resolve().parent.parent
-SAMPLE = ROOT / "data" / "sample_candles_USDMXN_otc_2026-11-21.json"
 
-EXPECTED_13 = [
-    ("09:02", "CALL"), ("09:11", "CALL"), ("09:18", "PUT"),
-    ("09:31", "PUT"), ("09:42", "PUT"), ("09:49", "PUT"),
-    ("10:02", "PUT"), ("10:09", "CALL"), ("10:16", "CALL"),
-    ("10:24", "CALL"), ("10:31", "CALL"), ("10:40", "CALL"),
-    ("10:56", "CALL"),
+# Same regression list as tests/test_signal.py (synthetic 2026-11-21,
+# seed 8, window 09:00-10:59, 1-day vote).
+EXPECTED_16 = [
+    ("09:00", "CALL"), ("09:07", "PUT"), ("09:14", "CALL"),
+    ("09:21", "PUT"), ("09:28", "CALL"), ("09:35", "CALL"),
+    ("09:43", "PUT"), ("09:50", "PUT"), ("09:58", "PUT"),
+    ("10:05", "PUT"), ("10:13", "CALL"), ("10:22", "PUT"),
+    ("10:30", "PUT"), ("10:39", "CALL"), ("10:47", "CALL"),
+    ("10:57", "CALL"),
+]
+# 2-day vote (2026-11-20 seed 7 + 2026-11-21 seed 8), same window.
+EXPECTED_2DAY_14 = [
+    ("09:00", "CALL"), ("09:07", "PUT"), ("09:14", "CALL"),
+    ("09:21", "PUT"), ("09:28", "CALL"), ("09:38", "PUT"),
+    ("09:47", "PUT"), ("09:54", "CALL"), ("10:10", "PUT"),
+    ("10:18", "PUT"), ("10:30", "PUT"), ("10:41", "PUT"),
+    ("10:49", "PUT"), ("10:57", "CALL"),
 ]
 
 
@@ -111,7 +126,7 @@ def test_db_roundtrip():
     assert db.count_total() == 2
     got = db.get_candles("USDMXN_otc", "2026-11-21")
     assert len(got) == 2, got
-    # Dhaka datetimes come back in sample-file format.
+    # Dhaka datetimes come back in raw-like dict format.
     assert got[0]["datetime"] == "2026-11-21 03:02:00", got[0]
     assert got[0]["O"] == 19.9 and got[0]["C"] == 19.93
     assert got[0]["time"] == int(datetime(2026, 11, 21, 3, 2,
@@ -185,39 +200,41 @@ def test_db_asset_name_case_insensitive():
           "finds stored BTCUSD_otc, checker gives WIN/WIN/DOJI")
 
 
-def _load_sample_into_db(db):
-    """Load the bundled USDMXN sample file into the DB (full file)."""
-    data = json.loads(SAMPLE.read_text(encoding="utf-8"))
-    rows = rows_from_raw(data["candles"])
-    inserted = db.insert_candles("USDMXN_otc", rows)
-    return inserted
+def _load_synth_into_db(db):
+    """Load two synthetic full days (2026-11-20 seed 7, 2026-11-21
+    seed 8) into the DB: 2 x 1440 = 2880 candles. 09:02 on the 21st
+    is forced CALL and 00:38 forced DOJI, like the old sample file."""
+    d20 = make_day("USDMXN_otc", "2026-11-20", seed=7)
+    d21 = make_day("USDMXN_otc", "2026-11-21", seed=8)
+    force_candle(d21, "09:02", "CALL")
+    force_candle(d21, "00:38", "DOJI")
+    rows = rows_from_raw(to_raw(d20) + to_raw(d21))
+    return db.insert_candles("USDMXN_otc", rows)
 
 
 def test_signals_from_db():
     db = _tmp_db()
-    inserted = _load_sample_into_db(db)
-    # Sample file spans 2026-11-20 19:59 -> 2026-11-21 19:55 (1437
-    # candles); the full 2026-11-21 day holds 1196 of them (00:00-19:55).
-    assert inserted == 1437, inserted
-    assert len(db.get_candles("USDMXN_otc", "2026-11-21")) == 1196
+    inserted = _load_synth_into_db(db)
+    # Two full synthetic days: 2 x 1440 = 2880 candles.
+    assert inserted == 2880, inserted
+    assert len(db.get_candles("USDMXN_otc", "2026-11-21")) == 1440
     signals = generate_futures_signals_from_db(
         db, "USDMXN_otc", ["2026-11-21"], "09:00", "10:59")
     got = [(s["hhmm"], s["direction"]) for s in signals]
-    assert got == EXPECTED_13, f"DB signals mismatch:\n got={got}\n exp={EXPECTED_13}"
-    print("PASS c) signals from DB — same 13 for 09:00-10:59 as the file test")
+    assert got == EXPECTED_16, f"DB signals mismatch:\n got={got}\n exp={EXPECTED_16}"
+    print("PASS c) signals from DB — same 16 for 09:00-10:59 as the file test")
 
 
 def test_checker_from_db():
     db = _tmp_db()
-    _load_sample_into_db(db)
+    _load_synth_into_db(db)
     candles = db.get_candles("USDMXN_otc", "2026-11-21")
     lookup = build_lookup(candles, "USDMXN_otc")
     results, summary = check_signals(
         ["USDMXN-OTC,09:02 M1 CALL", "USDMXN-OTC,09:02 M1 PUT",
          "USDMXN-OTC,00:38 M1 CALL"],
         lookup, "2026-11-21")
-    # 09:02 is CALL in the sample; 00:38 is a DOJI candle (O == C)
-    # inside the full-day collection window.
+    # 09:02 is CALL (forced); 00:38 is a DOJI candle (O == C).
     assert [r["result"] for r in results] == ["WIN", "LOSS", "DOJI"], results
     assert summary["win"] == 1 and summary["loss"] == 1 and summary["doji"] == 1
     assert summary["win_pct"] == 50.0, summary
@@ -439,6 +456,7 @@ def test_post_init_starts_collector_only_when_active():
         config.COLLECTOR_ENABLED = True
 
         class FakeApp:
+            bot = None
             bot_data = {}
 
         async def run():
@@ -451,10 +469,11 @@ def test_post_init_starts_collector_only_when_active():
         asyncio.run(run())
         assert calls, "collector_loop was not started in db mode"
         # Inactive mode: no task is created.
-        config.DATA_MODE = "sample"
+        config.DATA_MODE = "live"
         config.COLLECTOR_ENABLED = False
 
         class FakeApp2:
+            bot = None
             bot_data = {}
 
         async def run2():
@@ -476,7 +495,7 @@ def test_handlers_db_end_to_end():
     import bot.handlers as handlers
 
     db = _tmp_db()
-    _load_sample_into_db(db)
+    _load_synth_into_db(db)
     real_get_db = candles_db_mod.get_candle_db
     real_mode = config.DATA_MODE
     try:
@@ -491,30 +510,34 @@ def test_handlers_db_end_to_end():
             handlers._compute_futures_text(Ctx(), "09:00", "10:59"))
         assert "Source: db" in text, text
         assert "Days: 1 (database)" in text, text
-        assert "USDMXN-OTC,09:02 M1 CALL" in text, text
+        assert "USDMXN-OTC,09:00 M1 CALL" in text, text
         # Header also contains "M1" once — count signal lines instead.
         sig_lines = [ln for ln in text.splitlines()
                      if ln.startswith("USDMXN-OTC,")]
-        assert len(sig_lines) == 13, text
+        assert len(sig_lines) == 16, text
 
-        # 5 days requested, only 2 in the DB: honest note, 1-day result
-        # for 09:00-10:59 (the 20th has no candles in that window).
+        # 5 days requested, only 2 in the DB: honest note, 2-day vote
+        # for 09:00-10:59 (both days have candles in that window).
         Ctx.user_data["fs_days"] = 5
         text5 = asyncio.run(
             handlers._compute_futures_text(Ctx(), "09:00", "10:59"))
         assert "has only 2 day(s)" in text5, text5
         sig_lines5 = [ln for ln in text5.splitlines()
                       if ln.startswith("USDMXN-OTC,")]
-        assert len(sig_lines5) == 13, text5
+        assert len(sig_lines5) == 14, text5
 
         # SELECT ALL from the DB (no Quotex login anywhere).
         Ctx.user_data = {"fs_asset": "ALL", "fs_days": 1, "fs_mode": "OTC FS"}
         text_all = asyncio.run(
             handlers._compute_futures_text(Ctx(), "09:00", "10:59"))
         assert "SELECT ALL (1 assets)" in text_all, text_all
-        assert "USDMXN-OTC,09:02 M1 CALL" in text_all, text_all
+        # Cross-asset filter keeps 12 of the 16 (09:00 is dropped).
+        assert "USDMXN-OTC,09:07 M1 PUT" in text_all, text_all
+        sig_all = [ln for ln in text_all.splitlines()
+                   if ln.startswith("USDMXN-OTC,")]
+        assert len(sig_all) == 12, text_all
 
-        # Checker lookup from the DB for the sample date.
+        # Checker lookup from the DB for the synthetic date.
         lines = ["USDMXN-OTC,09:02 M1 CALL", "USDMXN-OTC,09:02 M1 PUT"]
         lookup = asyncio.run(
             handlers._build_checker_lookup(lines, "2026-11-21"))
@@ -524,9 +547,9 @@ def test_handlers_db_end_to_end():
 
         # Bot Status summary from the same DB.
         s = collector.get_status_summary(db)
-        assert s["total_candles"] == 1437, s
+        assert s["total_candles"] == 2880, s
         assert s["dates"] == ["2026-11-20", "2026-11-21"], s
-        assert s["by_asset"] == {"USDMXN_otc": 1437}, s
+        assert s["by_asset"] == {"USDMXN_otc": 2880}, s
         assert s["backend"] == "sqlite", s
     finally:
         candles_db_mod.get_candle_db = real_get_db

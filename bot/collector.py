@@ -1,6 +1,6 @@
 """Background candle collector (Render / db mode).
 
-Anti-429 design (agreed with Saiful):
+Anti-429 design (agreed with the owner):
 - ONE shared Quotex session per collector run: login once, fetch
   all assets on that session, close. Signals and CHECKER never
   log in — they read only from the database.
@@ -215,6 +215,32 @@ class SharedQuotexSession:
                 continue
         return sorted(set(open_assets))
 
+    async def get_payouts(self):
+        """{asset: (payout_1m, is_open)} from the live instruments list.
+
+        Same WS call as get_open_assets. The 1M payout is row[-9]
+        (falling back to row[5], the base payment). The collector
+        stores one snapshot per run, so the Payouts button reads from
+        the DB and never logs in to Quotex.
+        """
+        instruments = await self.client.get_instruments()
+        out = {}
+        for row in instruments or []:
+            try:
+                if not row or len(row) < 15 or not row[1]:
+                    continue
+                payout = None
+                for idx in (-9, 5):
+                    try:
+                        payout = float(row[idx])
+                        break
+                    except (TypeError, ValueError, IndexError):
+                        continue
+                out[str(row[1])] = (payout, bool(row[14]))
+            except Exception:
+                continue
+        return out
+
     async def fetch_asset_span(self, asset, seconds_back):
         """All 1-min candles from now back `seconds_back` seconds."""
         candles = await self.client.get_historical_candles(
@@ -240,13 +266,16 @@ class SharedQuotexSession:
 # ---------------------------------------------------------------------------
 async def _fetch_assets_3_at_a_time(session, assets, seconds_back):
     """Fetch one span per asset, 3 at a time, 1s pause between batches.
+    `seconds_back` may be one number (same span for all) or a dict
+    {asset: seconds} for per-asset tail fetches.
     Returns {asset: raw_candles or None}. Raises QuotexRateLimited."""
     results = {}
     for i in range(0, len(assets), 3):
         batch = assets[i:i + 3]
         for asset in batch:
+            sb = seconds_back[asset] if isinstance(seconds_back, dict) else seconds_back
             try:
-                results[asset] = await session.fetch_asset_span(asset, seconds_back)
+                results[asset] = await session.fetch_asset_span(asset, sb)
             except quotex_client.QuotexRateLimited:
                 raise
             except Exception as exc:
@@ -254,6 +283,49 @@ async def _fetch_assets_3_at_a_time(session, assets, seconds_back):
                 results[asset] = None
         await asyncio.sleep(1)
     return results
+
+
+async def _capture_payouts(db, session):
+    """Store one payout snapshot from the live session. Nice-to-have:
+    it must never fail a collection run, so every error is swallowed."""
+    try:
+        payouts = await session.get_payouts()
+    except AttributeError:
+        return  # FakeSession in tests has no get_payouts()
+    except Exception as exc:
+        logger.warning("collector: payout capture failed: %s", exc)
+        return
+    if not payouts:
+        return
+    try:
+        # Dhaka time string — the Payouts button shows it as-is.
+        now = dhaka_now().strftime("%Y-%m-%d %H:%M:%S")
+        db.set_payouts([(a, p, o, now) for a, (p, o) in payouts.items()])
+        logger.info("collector: payouts stored for %d assets", len(payouts))
+    except Exception as exc:
+        logger.warning("collector: payout store failed: %s", exc)
+
+
+def _tail_seconds_back(db, asset, oldest_start, now):
+    """Seconds to fetch for one asset: only the missing tail.
+
+    When the asset already has candles up to `last`, only the span
+    from `last` (minus a 10-min overlap) to now is fetched — the daily
+    top-up becomes a few batches instead of the whole 5-day span
+    (~40 batches). Assets with no candles, or whose last candle is
+    older than the backfill window, still get the full span.
+    """
+    last = db.last_candle_time(asset)
+    if not last:
+        return fetch_seconds_back(oldest_start, now)
+    try:
+        last_dt = datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return fetch_seconds_back(oldest_start, now)
+    if last_dt < oldest_start:
+        return fetch_seconds_back(oldest_start, now)
+    tail_start = last_dt - timedelta(minutes=10)
+    return max(600, int((now.astimezone(timezone.utc) - tail_start).total_seconds()))
 
 
 def _asset_backfill_complete(db, asset, dates, now):
@@ -320,7 +392,10 @@ async def run_backfill(db, session, days=None, now=None):
                         ", ".join(batch))
             done += len(batch)
             continue
-        raw_by_asset = await _fetch_assets_3_at_a_time(session, todo, seconds_back)
+        # Tail fetch: each asset fetches only its missing part
+        # (last stored candle -> now), not the whole 5-day span.
+        spans = {a: _tail_seconds_back(db, a, oldest_start, now) for a in todo}
+        raw_by_asset = await _fetch_assets_3_at_a_time(session, todo, spans)
         for asset, raw in raw_by_asset.items():
             if not raw:
                 continue
@@ -428,12 +503,61 @@ def log_status_summary(db, prefix="collector status"):
 # ---------------------------------------------------------------------------
 # Background loop (started from main.py post_init)
 # ---------------------------------------------------------------------------
-async def collector_loop(db=None, session_factory=None, sleep=None):
+async def _send_auto_signals(bot, db):
+    """After a 2-hourly collection, send the next window's top signals
+    to Auto Signal subscribers. Best-effort: failures are logged,
+    never raised — the collector loop must keep running."""
+    if bot is None:
+        return
+    try:
+        from . import database as users_db
+        subs = users_db.get_auto_subscribers()
+    except Exception:
+        return
+    if not subs:
+        return
+    try:
+        from .signal_engine import (
+            cross_asset_filter, format_signals_list,
+            generate_futures_signals_from_db)
+        from .premium_emoji import pe as _pe
+        now = dhaka_now()
+        start_dt = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        end_dt = start_dt + timedelta(hours=1, minutes=59)
+        start, end = start_dt.strftime("%H:%M"), end_dt.strftime("%H:%M")
+        today = now.strftime("%Y-%m-%d")
+        all_dates = db.get_dates()
+        completed = [d for d in all_dates if d < today] or all_dates
+        dates = completed[-3:]
+        assets = [a for a in db.get_assets() if a.endswith("_otc")]
+        all_signals = []
+        for a in assets:
+            all_signals.extend(
+                generate_futures_signals_from_db(db, a, dates, start, end))
+        kept = cross_asset_filter(all_signals)
+        lines = format_signals_list(kept)
+        if not lines:
+            return
+        text = (f"{_pe('diamond')}{_pe('lightning')} BLUE FISH PRIME • AUTO SIGNALS {start}-{end} (UTC+6)\n"
+                f"Dates: {dates[0]} to {dates[-1]} | M1 | Quotex | Source: db\n\n"
+                + "\n".join(lines))[:4000]
+        for uid in subs:
+            try:
+                await bot.send_message(chat_id=uid, text=text, parse_mode="HTML")
+                await asyncio.sleep(0.1)
+            except Exception as exc:
+                logger.warning("collector: auto signal to %s failed: %s", uid, exc)
+    except Exception as exc:
+        logger.warning("collector: auto signal send failed: %s", exc)
+
+
+async def collector_loop(db=None, session_factory=None, sleep=None, bot=None):
     """Backfill once, then an incremental run every 2 hours, forever.
 
     session_factory: callable returning a SharedQuotexSession
     (tests inject a fake one). sleep: awaitable seconds (tests inject
-    a fast one). Never raises out of the loop — errors are logged
+    a fast one). bot: telegram Bot for Auto Signal sends (None = off).
+    Never raises out of the loop — errors are logged
     and the next cycle is tried.
     """
     db = db or candles_db.get_candle_db()
@@ -453,10 +577,12 @@ async def collector_loop(db=None, session_factory=None, sleep=None):
             await session.connect()
             _safe_set_state(db, "quotex_last_login", utc_iso(dhaka_now()))
             _safe_set_state(db, "quotex_session", "connected")
+            await _capture_payouts(db, session)
             if kind == "backfill":
                 await run_backfill(db, session)
             else:
                 await run_incremental(db, session)
+                await _send_auto_signals(bot, db)
             return True
         except quotex_client.QuotexRateLimited as exc:
             _safe_set_state(db, "quotex_session", f"rate limited (429): {exc}")

@@ -1,6 +1,6 @@
 """CHECKER — check a pasted signal list against candle data.
 
-Rules agreed with Saiful:
+Rules agreed with the owner:
 - Input line: ASSET-OTC,HH:MM M1 CALL/PUT
   (asset may be given with or without -OTC; case-insensitive).
 - Lookup the candle for that asset + date + HH:MM in the DB/sample data.
@@ -160,7 +160,7 @@ def build_lookup(candles, asset):
 
 def format_check_results(results, summary):
     """Format checker output for Telegram — symbols only, no outcome words."""
-    # Premium symbols (Saiful: checker symbols must be premium too).
+    # Premium symbols (the owner: checker symbols must be premium too).
     # NO DATA is plain "?" on purpose: the ZEROX premium ❓
     # (ID 6282525354242348869) renders as a gold "WIN?" sticker,
     # so users read NO DATA as WIN. Plain "?" cannot be misread.
@@ -171,7 +171,7 @@ def format_check_results(results, summary):
         asset = r['asset'].upper().replace("_OTC", "-OTC")
         if r.get("mtg1"):
             # MTG1 mode: the MTG1 outcome IS the line's symbol — no
-            # "(MTG1: ...)" suffix written beside it (Saiful, 2026-11-25).
+            # "(MTG1: ...)" suffix written beside it (the owner, 2026-11-25).
             # MTG1 WIN  -> check sticker + dot (won on MTG1, not M1).
             # MTG1 LOSS -> loss sticker. MTG1 DOJI -> minus + dot.
             # MTG1 NO DATA -> the M1 loss stands (nothing to show).
@@ -184,7 +184,7 @@ def format_check_results(results, summary):
         else:
             emoji = _sym.get(r["result"], "")
         # No arrow between the direction and the result symbol —
-        # just the symbol (Saiful, 2026-11-25).
+        # just the symbol (the owner, 2026-11-25).
         line = f"{asset},{r['hhmm']} M1 {r['direction']} {emoji}"
         lines.append(line)
     lines.append("")

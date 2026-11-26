@@ -1,26 +1,32 @@
-"""Telegram handlers — Blue Fish Prime local-test bot (built by LittleMatrix) (polling mode).
+"""Telegram handlers — Blue Fish Prime (Render / db mode for members).
 
 All flows are state machines stored in context.user_data.
 Data source:
-- DATA_MODE=db (Render): signals + CHECKER read ONLY from the
-  candle database (Postgres on Render, SQLite locally). A background
-  collector fills the DB (5-day backfill on startup, then every
-  2 hours). No Quotex login happens for signals or CHECKER.
+- DATA_MODE=db (Render): signals + CHECKER + every analysis tool read
+  ONLY from the candle database (Postgres on Render, SQLite locally).
+  A background collector fills the DB (5-day backfill on startup,
+  then every 2 hours). No Quotex login happens for signals, CHECKER
+  or any menu button — that is the anti-429 design, and what lets
+  many members use the bot at once.
 - DATA_MODE=live + Quotex login in .env: fetch yesterday's 1-day
   candles live from Quotex with get_historical_candles() for ANY
   asset the user picks (3-at-a-time for SELECT ALL), cached to
   data/candles_<asset>_<date>.json so a second request does not
   log in again. See bot/quotex_client.py.
-- Otherwise: yesterday's 1-day sample file
-  (data/sample_candles_USDMXN_otc_2026-11-21.json, USDMXN_otc only).
+- Channel gate: when REQUIRED_CHANNEL is set, /start and every menu
+  tap first check the user is a member of that channel (the bot must
+  be an admin there); non-members get a Join button instead.
 """
 from __future__ import annotations
 
 import asyncio
 import html
 import inspect
+import logging
 import re
 from datetime import datetime, timedelta, timezone
+
+logger = logging.getLogger("littlematrix.handlers")
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
@@ -29,9 +35,11 @@ from . import candles_db, collector, config, database, quotex_client
 from .checker import (build_lookup, check_signals, format_check_results,
                       parse_checker_date, parse_signal_line)
 from .filters import filter_personal, format_filter_result
+from .news import events_for_dhaka_dates
 from .premium_emoji import BUTTON_ICONS, pe
 from .signal_engine import (
     available_signal_dates,
+    candle_direction,
     cross_asset_filter,
     diagnose_window,
     display_asset,
@@ -41,12 +49,12 @@ from .signal_engine import (
     generate_futures_signals_from_db,
     load_days_from_db,
     load_json_candles,
+    normalize_candle,
     rsi,
     trend_direction,
 )
 from .text_tools import convert_timezone, format_signal_list, formatter, swap_call_put, text_font
 
-SAMPLE_DATE = "2026-11-21"
 # Premium animated warning (CARDERS pack) — a <tg-emoji> tag, so every
 # send site that includes DISCLAIMER must pass parse_mode="HTML"
 # (all 7 sites do: start, menu_market, menu_about, _run_futures x2
@@ -67,7 +75,7 @@ def _btn(text, callback_data, icon=None, style=None):
     """Build an InlineKeyboardButton, with a premium icon when available.
 
     icon: key into BUTTON_ICONS. The icon renders BEFORE the text.
-    Button text is plain (no Unicode emoji): Saiful wants premium-only
+    Button text is plain (no Unicode emoji): the owner wants premium-only
     buttons, so the premium icon is the button's only emoji.
     style: 'primary' only for the Premium button, 'success' only for
     SELECT ALL; every other button uses no style (clean look)."""
@@ -80,7 +88,7 @@ def _btn(text, callback_data, icon=None, style=None):
 
 
 # Main menu: all 19 buttons carry a premium icon; their text is
-# plain (premium-only, per Saiful). If an icon does not render
+# plain (premium-only, per the owner). If an icon does not render
 # (old client / old library), the button still shows its text.
 MAIN_MENU = [
     [_btn("Check Signals", "menu_checker", icon="checker"),
@@ -103,6 +111,7 @@ MAIN_MENU = [
      _btn("Auto Signals", "menu_autolive", icon="autolive")],
     [_btn("Bot Status", "menu_botstatus", icon="bot_status")],
     [_btn("Premium — 5 USDT", "menu_premium", icon="premium", style="primary")],
+    [InlineKeyboardButton("Contact Owner", url="https://t.me/LittleMatrix")],
 ]
 
 
@@ -174,7 +183,7 @@ def _asset_picker_text(assets, page, total_pages, mode, live):
     elif live:
         src = f"{pe('diamond')} Live open assets ({len(assets)} for {mode})"
     else:
-        src = (f"{pe('diamond')} Sample mode — only these 6 assets here.\n"
+        src = (f"{pe('diamond')} Local test — only these 6 assets here.\n"
                "Live mode shows every open asset from Quotex.")
     return (f"{pe('diamond')} BLUE FISH PRIME • CHOOSE ASSET\n{DIVIDER}\n"
             f"{src}\nPage {page + 1}/{total_pages}")
@@ -197,11 +206,6 @@ def parse_custom_time(text):
     if times[1] <= times[0]:
         return None
     return times[0], times[1]
-
-
-def load_sample():
-    """Return (asset, candles) from the bundled sample file."""
-    return load_json_candles(config.SAMPLE_CANDLES)
 
 
 def _yesterday_date_str():
@@ -230,10 +234,10 @@ def _db():
 
 
 def _effective_date():
-    """Live mode: yesterday (real date). Sample mode: 2026-11-21."""
-    if config.DATA_MODE == "live" and config.has_quotex_login():
-        return _yesterday_date_str()
-    return SAMPLE_DATE
+    """Live mode: yesterday (real date). db mode: today (DB covers it)."""
+    if config.DATA_MODE == "db":
+        return _today_date_str()
+    return _yesterday_date_str()
 
 
 async def get_candles_for(asset, date_str):
@@ -241,8 +245,7 @@ async def get_candles_for(asset, date_str):
 
     Order: candle DB first (DATA_MODE=db — no Quotex login) ->
     live Quotex (DATA_MODE=live + login, yesterday only) ->
-    data/candles_<asset>_<date>.json if collected before ->
-    sample file for USDMXN_otc.
+    data/candles_<asset>_<date>.json if collected before.
     Returns (candles list, source_str). Candles are raw dicts with
     datetime + O/H/L/C (or open/high/low/close + time).
     Login/fetch failures return (None, 'error: ...') with the reason,
@@ -282,19 +285,119 @@ async def get_candles_for(asset, date_str):
                 return raw, "file"
     except Exception:
         pass
-    # 3) Sample fallback (USDMXN only).
-    if asset in ("USDMXN_otc", "USDMXN-OTC"):
-        _, candles = load_sample()
-        # load_sample returns normalized candles; return raw-like form.
-        raw = [{"datetime": c["datetime"], "O": c["open"], "H": c["high"],
-                "L": c["low"], "C": c["close"]} for c in candles]
-        return raw, "sample"
     return None, "no-data"
+
+
+# ---------------------------------------------------------------------------
+# Channel membership gate
+# ---------------------------------------------------------------------------
+_member_cache = {}  # user_id -> (unix_ts, is_member); 10-min TTL
+
+
+def _channel_join_url():
+    invite = (config.CHANNEL_INVITE_LINK or "").strip()
+    if invite:
+        return invite
+    ch = (config.REQUIRED_CHANNEL or "").strip()
+    if not ch:
+        return None
+    if ch.startswith("https://"):
+        return ch
+    if ch.startswith("@"):
+        return "https://t.me/" + ch[1:]
+    return "https://t.me/" + ch
+
+
+async def _is_channel_member(bot, user_id, use_cache=True):
+    """True when the user may use the bot: no gate configured, or the
+    user is a member/admin/creator of REQUIRED_CHANNEL. A check that
+    itself fails (bot not admin in the channel, wrong id) fails OPEN
+    with a loud log — a config mistake must never lock out members."""
+    ch = (config.REQUIRED_CHANNEL or "").strip()
+    if not ch:
+        return True
+    import time as _time
+    if use_cache:
+        hit = _member_cache.get(user_id)
+        if hit and _time.time() - hit[0] < 600:
+            return hit[1]
+    try:
+        member = await bot.get_chat_member(chat_id=ch, user_id=user_id)
+        ok = member.status in ("member", "administrator", "creator", "restricted")
+    except Exception as exc:
+        logger.warning("channel gate check failed (%s): %s — letting user through",
+                       ch, exc)
+        return True
+    _member_cache[user_id] = (_time.time(), ok)
+    return ok
+
+
+def _join_keyboard():
+    rows = []
+    url = _channel_join_url()
+    if url:
+        rows.append([InlineKeyboardButton("Join Now", url=url)])
+    rows.append([InlineKeyboardButton("I Joined — Check Again",
+                                      callback_data="check_member")])
+    rows.append([_btn("Back", "menu_main", icon="back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _join_gate_text():
+    return (f"{pe('diamond')} Join the channel to use this bot {pe('fire')}\n{DIVIDER}\n\n"
+            "BLUE FISH PRIME is free for members of the Blue Fish trading community.\n"
+            "Join the channel first, then tap \"I Joined\" — the bot will welcome you "
+            "and unlock the tools.")
+
+
+# ---------------------------------------------------------------------------
+# DB-backed analysis tools (AI Signal / Candle Scan / Trend Scan / Backtest)
+# ---------------------------------------------------------------------------
+def _default_analysis_asset():
+    """Asset for the one-tap analysis tools: BTCUSD-OTC first (most
+    members watch it), else the OTC asset with the most candles today,
+    else any asset with the most candles today. None when the DB is empty."""
+    db = _db()
+    try:
+        today = _today_date_str()
+        counts = {}
+        for a in db.get_assets():
+            n = db.count_candles(a, today)
+            if n:
+                counts[a] = n
+        if not counts:
+            return None
+        for pref in ("BTCUSD_otc", "ETHUSD_otc", "EURUSD_otc"):
+            if counts.get(pref, 0) >= 60:
+                return pref
+        otc = {a: n for a, n in counts.items() if a.endswith("_otc")}
+        pool = otc or counts
+        return max(pool, key=pool.get)
+    except Exception:
+        return None
+
+
+def _db_recent_candles(asset, n):
+    """Last `n` normalized candles of today for one asset, or []."""
+    try:
+        candles = _db().get_candles(asset, _today_date_str())
+    except Exception:
+        return []
+    return [normalize_candle(c) for c in candles[-n:]]
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     database.get_or_create_user(user.id, user.username or "")
+    if not await _is_channel_member(context.bot, user.id):
+        text = _join_gate_text()
+        if update.message:
+            await update.message.reply_text(text, reply_markup=_join_keyboard(),
+                                            parse_mode="HTML")
+        elif update.callback_query:
+            await update.callback_query.edit_message_text(
+                text, reply_markup=_join_keyboard(), parse_mode="HTML")
+        return
     text = (f"{pe('diamond')}{pe('lightning')} BLUE FISH PRIME — Trading Terminal {pe('sparkle')}\n"
             f"Created by LITTLE MATRIX {pe('crown')}\n"
             f"Pick a tool below to start. {pe('fire')}\n"
@@ -318,6 +421,76 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     user = update.effective_user
     database.get_or_create_user(user.id, user.username or "")
+
+    # Channel gate: members only (except the re-check itself and
+    # admin premium decisions, which must always work).
+    if (data != "check_member"
+            and not data.startswith("premium_approve_")
+            and not data.startswith("premium_reject_")):
+        if not await _is_channel_member(context.bot, user.id):
+            await query.edit_message_text(
+                _join_gate_text(), reply_markup=_join_keyboard(),
+                parse_mode="HTML")
+            return
+
+    if data == "check_member":
+        _member_cache.pop(user.id, None)
+        if await _is_channel_member(context.bot, user.id, use_cache=False):
+            await query.edit_message_text(
+                f"{pe('diamond')}{pe('lightning')} Welcome to BLUE FISH PRIME! {pe('fire')}\n"
+                "You joined the Blue Fish trading community — the tools are now unlocked.\n"
+                "Pick a tool below to start.",
+                reply_markup=main_keyboard(), parse_mode="HTML")
+        else:
+            await query.edit_message_text(
+                _join_gate_text() + "\n\nStill not a member — join the channel first, "
+                "then tap \"I Joined\" again.",
+                reply_markup=_join_keyboard(), parse_mode="HTML")
+        return
+
+    if data.startswith("premium_approve_") or data.startswith("premium_reject_"):
+        if user.id not in config.ADMIN_USER_IDS:
+            await query.edit_message_text(
+                "Only the owner can approve premium requests.",
+                reply_markup=back_keyboard(), parse_mode="HTML")
+            return
+        approve = data.startswith("premium_approve_")
+        try:
+            req_id = int(data.rsplit("_", 1)[1])
+        except ValueError:
+            return
+        req = database.get_premium_request(req_id)
+        if not req:
+            await query.edit_message_text("Request not found.",
+                                          reply_markup=back_keyboard(), parse_mode="HTML")
+            return
+        if approve:
+            until = database.grant_premium(req["telegram_id"], days=30)
+            database.set_premium_request_status(req_id, "approved")
+            verdict = f"Approved — premium until {until}."
+            try:
+                await context.bot.send_message(
+                    chat_id=req["telegram_id"],
+                    text=f"{pe('crown')}{pe('diamond')} Your BLUE FISH PRIME Premium is active! "
+                         f"Valid until {until}. {pe('fire')}",
+                    parse_mode="HTML")
+            except Exception:
+                pass
+        else:
+            database.set_premium_request_status(req_id, "rejected")
+            verdict = "Rejected."
+            try:
+                await context.bot.send_message(
+                    chat_id=req["telegram_id"],
+                    text=f"{pe('cross')} Your premium request was not approved. "
+                         "Contact @LittleMatrix if you think this is a mistake.",
+                    parse_mode="HTML")
+            except Exception:
+                pass
+        await query.edit_message_text(
+            f"Premium request #{req_id} ({html.escape(str(req['txn_hash']))}): {verdict}",
+            reply_markup=back_keyboard(), parse_mode="HTML")
+        return
 
     if data == "menu_main":
         await query.edit_message_text(
@@ -366,7 +539,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=back_keyboard(), parse_mode="HTML")
             return
         # Live mode: show EVERY open asset from Quotex (get_all_assets).
-        # Sample mode / fetch failure: fall back to the 6 sample assets.
+        # No login / fetch failure: fall back to the 6 known assets.
         assets = None
         live = False
         if config.DATA_MODE == "live" and config.has_quotex_login():
@@ -390,8 +563,8 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not assets:
             assets = _filter_assets_by_mode(config.SAMPLE_ASSETS, mode)
             if not assets:
-                # Sample mode has no real-market assets; show the 6
-                # sample assets instead of an empty picker.
+                # No real-market assets; show the 6 known assets
+                # instead of an empty picker.
                 assets = list(config.SAMPLE_ASSETS)
             context.user_data["open_assets"] = list(config.SAMPLE_ASSETS)
         context.user_data["fs_assets"] = assets
@@ -498,10 +671,10 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 _checker_date_prompt(),
                 reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
         else:
-            context.user_data["checker_date"] = SAMPLE_DATE
+            context.user_data["checker_date"] = _yesterday_date_str()
             context.user_data["flow"] = "checker_list"
             await query.edit_message_text(
-                _checker_list_prompt(SAMPLE_DATE),
+                _checker_list_prompt(_yesterday_date_str()),
                 reply_markup=back_keyboard(), parse_mode="HTML")
         return
     if data == "checker_date_today":
@@ -513,21 +686,13 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=back_keyboard(), parse_mode="HTML")
         return
     if data == "menu_market":
-        await query.edit_message_text(
-            f"{pe('diamond')} Market Live {pe('chart')}\n"
-            "Live market status needs a Quotex login.\n"
-            "Sample mode: USDMXN_otc — data available (2026-11-21).\n\n" + DISCLAIMER,
-            reply_markup=back_keyboard(), parse_mode="HTML")
+        await _run_market(query)
         return
     if data == "menu_otc":
         await _run_otc_board(query, context)
         return
     if data == "menu_payouts":
-        await query.edit_message_text(
-            f"{pe('money')} Live Payouts {pe('dollar')}\n"
-            "Live payouts need a Quotex login.\n"
-            "In live mode payouts are cached for 60 seconds.",
-            reply_markup=back_keyboard(), parse_mode="HTML")
+        await _run_payouts(query)
         return
     if data == "menu_counter":
         await _run_counter(query)
@@ -539,10 +704,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _run_backtest(query)
         return
     if data == "menu_news":
-        await query.edit_message_text(
-            f"{pe('bell')}{pe('diamond')} Blue Fish Prime News\nNo outside news feed is connected yet. "
-            "It will be added in the Render step.",
-            reply_markup=back_keyboard(), parse_mode="HTML")
+        await _run_news(query)
         return
     if data == "menu_formatter":
         context.user_data["flow"] = "formatter"
@@ -598,16 +760,46 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=back_keyboard(), parse_mode="HTML")
         return
     if data == "menu_autolive":
+        on = database.is_auto_subscriber(user.id)
+        toggle = InlineKeyboardButton(
+            "Turn OFF" if on else "Turn ON",
+            callback_data="autolive_toggle")
         await query.edit_message_text(
-            f"{pe('bell')} Auto Live Signal\nOff in local test. It runs once the bot "
-            "is live 24/7 on Render.",
-            reply_markup=back_keyboard(), parse_mode="HTML")
+            f"{pe('bell')} Auto Live Signal\n{DIVIDER}\n"
+            f"Status: {'ON' if on else 'OFF'}\n\n"
+            "When ON, the bot sends you the next 2-hour window's top "
+            "signals right after every collection run.",
+            reply_markup=InlineKeyboardMarkup([[toggle],
+                                               [_btn("Back", "menu_main", icon="back")]]),
+            parse_mode="HTML")
+        return
+    if data == "autolive_toggle":
+        on = not database.is_auto_subscriber(user.id)
+        database.set_auto_signals(user.id, on)
+        toggle = InlineKeyboardButton(
+            "Turn OFF" if on else "Turn ON",
+            callback_data="autolive_toggle")
+        await query.edit_message_text(
+            f"{pe('bell')} Auto Live Signal\n{DIVIDER}\n"
+            f"Status: {'ON' if on else 'OFF'}\n\n"
+            "When ON, the bot sends you the next 2-hour window's top "
+            "signals right after every collection run.",
+            reply_markup=InlineKeyboardMarkup([[toggle],
+                                               [_btn("Back", "menu_main", icon="back")]]),
+            parse_mode="HTML")
         return
     if data == "menu_premium":
         context.user_data["flow"] = "premium_txn"
+        pay_id = config.BINANCE_PAY_ID
+        if pay_id:
+            pay_text = (f"Pay {config.USDT_AMOUNT} USDT via Binance Pay ID:\n"
+                        f"{html.escape(pay_id)}\n\n")
+        else:
+            pay_text = "Ask the owner (@LittleMatrix) for the Binance Pay ID.\n\n"
         await query.edit_message_text(
-            f"{pe('diamond')}{pe('crown')} Blue Fish Prime Premium — 1 month, 5 USDT {pe('fire')}\n\n"
-            "Send USDT and paste the txn hash here. Saiful will check and "
+            f"{pe('diamond')}{pe('crown')} Blue Fish Prime Premium — 1 month, {config.USDT_AMOUNT} USDT {pe('fire')}\n\n"
+            + pay_text +
+            "After paying, paste the transaction ID here. The owner will check and "
             "approve it, then your 30-day Premium starts.",
             reply_markup=back_keyboard(), parse_mode="HTML")
         return
@@ -705,12 +897,12 @@ async def _compute_futures_text(context, start, end):
     # SELECT ALL: fetch the open assets for this mode (live), 3-at-a-time,
     # then the cross-asset filter (win rate + real strength + >= 7 min
     # gap between ANY two kept signals, max 6/hour, max 12 total).
-    # In sample mode only USDMXN exists.
+    # Without a live login only USDMXN is shown.
     if asset == "ALL":
         if config.DATA_MODE != "live" or not config.has_quotex_login():
-            note = (f"\n\n{pe('info')} Sample mode has only 1 day of USDMXN_otc sample data. "
-                    "Full cross-asset SELECT ALL needs live mode (Quotex login). "
-                    "Showing the USDMXN result for now.")
+            note = (f"\n\n{pe('info')} No live Quotex login here, so SELECT ALL "
+                    "shows only USDMXN. Full cross-asset SELECT ALL needs "
+                    "the Render database (db mode).")
             asset = "USDMXN_otc"
         else:
             assets = context.user_data.get("fs_assets") or config.SAMPLE_ASSETS
@@ -764,11 +956,6 @@ async def _compute_futures_text(context, start, end):
     # Filter candles to the requested date + window for the engine input.
     day_candles = [c for c in candles
                    if c.get("datetime", "").startswith(eff_date)]
-    # Sample fallback: if live date has no candles but sample does, use sample date.
-    if not day_candles and source == "sample":
-        day_candles = [c for c in candles
-                       if c.get("datetime", "").startswith(SAMPLE_DATE)]
-        eff_date = SAMPLE_DATE
     signals = generate_futures_signals([day_candles], asset, start, end)
     lines = format_signals_list(signals)
     # If still 0, show diagnostics so the user can see WHY (not just "0").
@@ -819,6 +1006,82 @@ async def _run_futures(query, context, start, end):
     text = await _compute_futures_text(context, start, end)
     await query.edit_message_text(text, reply_markup=back_keyboard(),
                                   parse_mode=_html_mode(text))
+
+
+async def _run_market(query):
+    """Market Live from the DB: last candle per major asset (Dhaka
+    time, close, direction) + candles today. Data refreshes every
+    2 hours with the collector — not live ticks."""
+    db = _db()
+    majors = ["BTCUSD_otc", "ETHUSD_otc", "EURUSD_otc", "GBPUSD_otc",
+              "USDMXN_otc", "AUDUSD_otc", "XAUUSD", "EURUSD"]
+    today = _today_date_str()
+    lines = []
+    for a in majors:
+        try:
+            candles = db.get_candles(a, today)
+        except Exception:
+            continue
+        if not candles:
+            continue
+        last = normalize_candle(candles[-1])
+        direction = "CALL" if last["close"] > last["open"] else "PUT"
+        lines.append(f"{display_asset(a)}: {last['datetime'][11:16]} | "
+                     f"{last['close']} | {direction} | today {len(candles)}")
+    if not lines:
+        text = (f"{pe('diamond')} Market Live {pe('chart')}\n"
+                "No candles in the database yet — the backfill is still running.")
+    else:
+        text = (f"{pe('diamond')} Market Live {pe('chart')}\n{DIVIDER}\n"
+                + "\n".join(lines)
+                + "\n\nData updates every 2 hours with the collector (not live ticks).")
+    await query.edit_message_text(text, reply_markup=back_keyboard(), parse_mode="HTML")
+
+
+async def _run_payouts(query):
+    """Payouts from the DB snapshot the collector stores each run."""
+    try:
+        rows = _db().get_payouts()
+    except Exception:
+        rows = []
+    if not rows:
+        text = (f"{pe('money')} Live Payouts {pe('dollar')}\n"
+                "No payout snapshot yet — the collector stores one on every run. "
+                "Try again after the next collection.")
+    else:
+        shown = rows[:15]
+        lines = []
+        for a, p, _o, _u in shown:
+            lines.append(f"{display_asset(a)}: {p:.0f}%" if p is not None
+                         else f"{display_asset(a)}: —")
+        updated = rows[0][3] if rows and rows[0][3] else "—"
+        text = (f"{pe('money')} Live Payouts (1M) {pe('dollar')}\n{DIVIDER}\n"
+                + "\n".join(lines)
+                + f"\n\nUpdated: {updated} (Dhaka, next update with the next collection)")
+    await query.edit_message_text(text, reply_markup=back_keyboard(), parse_mode="HTML")
+
+
+async def _run_news(query):
+    """News Desk: today + tomorrow's High/Medium impact events from
+    the ForexFactory calendar (cached 1h, times converted to Dhaka)."""
+    today = _today_date_str()
+    tomorrow = (datetime.strptime(today, "%Y-%m-%d")
+                + timedelta(days=1)).strftime("%Y-%m-%d")
+    events = events_for_dhaka_dates({today, tomorrow})
+    if events is None:
+        text = (f"{pe('bell')}{pe('diamond')} Blue Fish Prime News\n"
+                "News feed unavailable right now — try again later.")
+    elif not events:
+        text = (f"{pe('bell')}{pe('diamond')} Blue Fish Prime News\n"
+                "No High/Medium impact events today or tomorrow.")
+    else:
+        lines = []
+        for ev in events[:20]:
+            when = ev["dhaka"][5:16] if ev["dhaka"] else f"{ev['date']} {ev['time']}"
+            lines.append(f"{ev['impact']} | {when} | {ev['country']} — {ev['title']}")
+        text = (f"{pe('bell')}{pe('diamond')} Blue Fish Prime News (Dhaka time)\n{DIVIDER}\n"
+                + "\n".join(lines))
+    await query.edit_message_text(text, reply_markup=back_keyboard(), parse_mode="HTML")
 
 
 async def _run_bot_status(query):
@@ -889,6 +1152,9 @@ async def _run_otc_board(query, context):
 
 
 async def _run_ai_signal(query, context):
+    """AI Signal from the DB: the default asset's last candle (today),
+    EMA9/21 trend and RSI(14) over its last 60 candles. No Quotex
+    login, no sample file."""
     try:
         await query.edit_message_text(
             f"{pe('hourglass')} Analysing candles... {pe('star')}", parse_mode="HTML")
@@ -899,8 +1165,21 @@ async def _run_ai_signal(query, context):
         await asyncio.sleep(0.5)
     except Exception:
         pass
-    _, candles = load_sample()
-    recent = candles[-60:]
+    asset = _default_analysis_asset()
+    if asset is None:
+        await query.edit_message_text(
+            f"{pe('cross')} No candles in the database yet.\n"
+            "The backfill collects the last 5 days first. "
+            "Press Bot Status to see the progress, then try again.",
+            reply_markup=back_keyboard(), parse_mode="HTML")
+        return
+    recent = _db_recent_candles(asset, 60)
+    if len(recent) < 21:
+        await query.edit_message_text(
+            f"{pe('cross')} Not enough candles for {display_asset(asset)} yet "
+            f"({len(recent)} today). Try again after the next collection.",
+            reply_markup=back_keyboard(), parse_mode="HTML")
+        return
     closes = [c["close"] for c in recent]
     last = recent[-1]
     direction = "CALL" if last["close"] > last["open"] else "PUT"
@@ -908,7 +1187,7 @@ async def _run_ai_signal(query, context):
     value = rsi(closes)
     trend_emoji = pe("up") if trend == "UP" else pe("down")
     await query.edit_message_text(
-        f"{pe('star')}{pe('diamond')} BLUE FISH PRIME • AI SIGNAL — USDMXN-OTC (sample) {pe('sparkle')}\n{DIVIDER}\n"
+        f"{pe('star')}{pe('diamond')} BLUE FISH PRIME • AI SIGNAL — {display_asset(asset)} {pe('sparkle')}\n{DIVIDER}\n"
         f"Last: {last['datetime']} M1 {direction}\n"
         f"{trend_emoji} Trend (EMA9/21): {trend} | {pe('chart')} RSI(14): {value:.1f}\n"
         f"{pe('money')} Close: {last['close']} | Open: {last['open']}\n\n{DISCLAIMER}",
@@ -916,43 +1195,102 @@ async def _run_ai_signal(query, context):
 
 
 async def _run_counter(query):
-    _, candles = load_sample()
-    recent = candles[-10:]
+    """Candle Scan from the DB: green/red count of the default
+    asset's last 10 candles today."""
+    asset = _default_analysis_asset()
+    if asset is None:
+        await query.edit_message_text(
+            f"{pe('cross')} No candles in the database yet.\n"
+            "The backfill collects the last 5 days first.",
+            reply_markup=back_keyboard(), parse_mode="HTML")
+        return
+    recent = _db_recent_candles(asset, 10)
     green = sum(1 for c in recent if c["close"] > c["open"])
     red = sum(1 for c in recent if c["close"] < c["open"])
     await query.edit_message_text(
-        f"{pe('chart')}{pe('diamond')} CANDLE SCAN — USDMXN-OTC (last 10)\n{DIVIDER}\n{pe('green')} Green: {green} | {pe('red')} Red: {red}",
+        f"{pe('chart')}{pe('diamond')} CANDLE SCAN — {display_asset(asset)} (last {len(recent)} today)\n{DIVIDER}\n{pe('green')} Green: {green} | {pe('red')} Red: {red}",
         reply_markup=back_keyboard(), parse_mode="HTML")
 
 
 async def _run_trend(query):
-    _, candles = load_sample()
-    closes = [c["close"] for c in candles[-60:]]
+    """Trend Scan from the DB: EMA9/21 of the default asset's
+    last 60 candles today."""
+    asset = _default_analysis_asset()
+    if asset is None:
+        await query.edit_message_text(
+            f"{pe('cross')} No candles in the database yet.\n"
+            "The backfill collects the last 5 days first.",
+            reply_markup=back_keyboard(), parse_mode="HTML")
+        return
+    recent = _db_recent_candles(asset, 60)
+    if len(recent) < 21:
+        await query.edit_message_text(
+            f"{pe('cross')} Not enough candles for {display_asset(asset)} yet "
+            f"({len(recent)} today). Try again after the next collection.",
+            reply_markup=back_keyboard(), parse_mode="HTML")
+        return
+    closes = [c["close"] for c in recent]
     trend = trend_direction(closes)
     e9 = ema(closes, 9)[-1]
     e21 = ema(closes, 21)[-1]
     trend_emoji = pe("up") if trend == "UP" else pe("down")
     await query.edit_message_text(
-        f"{trend_emoji}{pe('diamond')} TREND SCAN — USDMXN-OTC\n{DIVIDER}\nTrend: {trend}\nEMA9: {e9:.5f} | EMA21: {e21:.5f}",
+        f"{trend_emoji}{pe('diamond')} TREND SCAN — {display_asset(asset)}\n{DIVIDER}\nTrend: {trend}\nEMA9: {e9:.5f} | EMA21: {e21:.5f}",
         reply_markup=back_keyboard(), parse_mode="HTML")
 
 
 async def _run_backtest(query):
+    """Backtest Lab from the DB — a real backtest this time: signals
+    for yesterday 09:00-10:59 built from the 2 days BEFORE yesterday
+    (majority vote), then checked against yesterday's actual candles."""
     try:
         await query.edit_message_text(
             f"{pe('hourglass')} Running backtest... {pe('chart')}", parse_mode="HTML")
         await asyncio.sleep(0.6)
     except Exception:
         pass
-    _, candles = load_sample()
-    day = [c for c in candles if c.get("datetime", "").startswith(SAMPLE_DATE)]
-    signals = generate_futures_signals([day], "USDMXN_otc", "09:00", "10:59")
+    asset = _default_analysis_asset()
+    if asset is None:
+        await query.edit_message_text(
+            f"{pe('cross')} No candles in the database yet.\n"
+            "The backfill collects the last 5 days first.",
+            reply_markup=back_keyboard(), parse_mode="HTML")
+        return
+    db = _db()
+    today = _today_date_str()
+    yesterday = (datetime.strptime(today, "%Y-%m-%d")
+                 - timedelta(days=1)).strftime("%Y-%m-%d")
+    all_dates = [d for d in db.get_dates() if d < today]
+    if yesterday not in all_dates:
+        await query.edit_message_text(
+            f"{pe('cross')} No candles for {yesterday} yet — the backtest "
+            "needs yesterday's full day. Try again tomorrow.",
+            reply_markup=back_keyboard(), parse_mode="HTML")
+        return
+    train = [d for d in all_dates if d < yesterday][-2:]
+    if not train:
+        await query.edit_message_text(
+            f"{pe('cross')} Not enough history yet — the backtest needs "
+            "at least 2 days before yesterday.",
+            reply_markup=back_keyboard(), parse_mode="HTML")
+        return
+    signals = generate_futures_signals_from_db(db, asset, train, "09:00", "10:59")
+    lines = format_signals_list(signals)
+    if not lines:
+        await query.edit_message_text(
+            f"{pe('chart')}{pe('diamond')} BACKTEST LAB — {display_asset(asset)} {yesterday} 09:00-10:59\n"
+            f"{DIVIDER}\n"
+            f"{pe('chart')} Filtered signals: 0\n"
+            "The filter removed every signal for this window. Try another asset later.",
+            reply_markup=back_keyboard(), parse_mode="HTML")
+        return
+    lookup = build_lookup(db.get_candles(asset, yesterday), asset)
+    results, summary = check_signals(lines, lookup, yesterday, with_mtg1=False)
+    text = format_check_results(results, summary)
     await query.edit_message_text(
-        f"{pe('chart')}{pe('diamond')} BACKTEST LAB — USDMXN-OTC 2026-11-21 09:00-10:59 (sample)\n"
-        f"{DIVIDER}\n"
-        f"{pe('chart')} Filtered signals: {len(signals)}\n"
-        "Note: this checks the same day's data against itself, it is not a real backtest. "
-        "A real backtest needs the multi-day database (Render step).\n\n" + DISCLAIMER,
+        f"{pe('chart')}{pe('diamond')} BACKTEST LAB — {display_asset(asset)} {yesterday} 09:00-10:59\n"
+        f"Signals built from {', '.join(train)} (majority vote), checked against {yesterday}.\n"
+        f"{DIVIDER}\n{text}",
         reply_markup=back_keyboard(), parse_mode="HTML")
 
 
@@ -973,8 +1311,8 @@ def _checker_date_prompt():
 async def _build_checker_lookup(lines, date_str):
     """Lookup {(asset, datetime): candle} for every asset in the
     pasted lines. DB first in db mode (today's candles included),
-    then data/*.json cache, then the sample file. No Quotex login
-    in db mode — get_candles_for() reads the DB there."""
+    then data/*.json cache. No Quotex login in db mode —
+    get_candles_for() reads the DB there."""
     lookup = {}
     assets = set()
     for line in lines:
@@ -988,14 +1326,6 @@ async def _build_checker_lookup(lines, date_str):
             candles = None
         if candles:
             lookup.update(build_lookup(candles, asset))
-    if not lookup:
-        # Fall back to the sample file (USDMXN only) so the checker
-        # still answers in sample mode / before the backfill finishes.
-        try:
-            _, candles = load_sample()
-            lookup.update(build_lookup(candles, "USDMXN_otc"))
-        except Exception:
-            pass
     return lookup
 
 
@@ -1003,6 +1333,12 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     flow = context.user_data.get("flow")
     text = update.message.text or ""
     user = update.effective_user
+
+    # Channel gate: members only (same as /start and the menu).
+    if not await _is_channel_member(context.bot, user.id):
+        await update.message.reply_text(
+            _join_gate_text(), reply_markup=_join_keyboard(), parse_mode="HTML")
+        return
 
     if flow == "futures_custom_time":
         parsed = parse_custom_time(text)
@@ -1074,7 +1410,7 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         lines = [x for x in text.splitlines() if x.strip()]
-        check_date = context.user_data.get("checker_date") or SAMPLE_DATE
+        check_date = context.user_data.get("checker_date") or _today_date_str()
         with_mtg1 = context.user_data.get("checker_mtg1", False)
         lookup = await _build_checker_lookup(lines, check_date)
         results, summary = check_signals(lines, lookup, check_date,
@@ -1136,11 +1472,26 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if flow == "premium_txn":
-        database.save_premium_request(user.id, text.strip())
+        req_id = database.save_premium_request(user.id, text.strip())
         await update.message.reply_text(
-            f"{pe('check')}{pe('diamond')} Txn hash saved. Saiful will check and approve it, "
+            f"{pe('check')}{pe('diamond')} Transaction ID saved. The owner will check and approve it, "
             f"then your 30-day Premium starts. {pe('crown')}",
             reply_markup=back_keyboard(), parse_mode="HTML")
+        for admin_id in config.ADMIN_USER_IDS:
+            try:
+                kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("Approve",
+                                         callback_data=f"premium_approve_{req_id}"),
+                    InlineKeyboardButton("Reject",
+                                         callback_data=f"premium_reject_{req_id}")]])
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=(f"Premium request #{req_id} from "
+                          f"@{user.username or user.id} (id {user.id}):\n"
+                          f"{html.escape(text.strip())}"),
+                    reply_markup=kb, parse_mode="HTML")
+            except Exception:
+                pass
         context.user_data["flow"] = None
         return
 

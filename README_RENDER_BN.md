@@ -119,6 +119,35 @@ git push
    `DATABASE_URL` (Postgres থেকে)।
 5. **Save Changes** চাপুন — সার্ভিস আবার রিস্টার্ট হবে।
 
+## ধাপ ৫.১ — মেম্বারদের জন্য: Channel Gate + Premium (নতুন)
+
+মেম্বার রিলিজে আরও কয়েকটা Environment Variable লাগবে (একই Environment
+পেজে বসান):
+
+| Key | Value |
+|---|---|
+| `REQUIRED_CHANNEL` | চ্যানেলের সংখ্যার id, যেমন `-1001234567890` (না থাকলে gate বন্ধ থাকে) |
+| `CHANNEL_INVITE_LINK` | `https://t.me/+HDiWRJothc5hNTQ9` (Join Now বাটনে এই লিংক যাবে) |
+| `ADMIN_USER_IDS` | `5618029321` (আপনার Telegram user id — Premium approve করার জন্য) |
+| `BINANCE_PAY_ID` | `968213178` (মেম্বাররা ৫ USDT এখানে পাঠাবে) |
+
+আপনার Telegram user id পাবেন যেভাবে: Telegram-এ `@userinfobot` খুলে
+যেকোনো মেসেজ পাঠান — ওই বট আপনার id (শুধু সংখ্যা) ফেরত দেবে। ওই
+সংখ্যাটা `ADMIN_USER_IDS`-এ বসান। (আপনার id: `5618029321` — ইতিমধ্যেই
+`.env.example`-এ বসানো আছে।)
+
+চ্যানেলের id পাবেন যেভাবে:
+1. Telegram-এ চ্যানেল খুলে বটটাকে **admin** বানান (Add Admins)।
+2. Render Logs-এ এই লাইনটা দেখুন: `Bot added to channel '...' (id: -100...)` —
+   ওই id-টাই `REQUIRED_CHANNEL`-এ বসান।
+3. (বিকল্প: চ্যানেলের যেকোনো মেসেজ @userinfobot-এ forward করলেও id দেখায়।)
+
+Premium কীভাবে চলে:
+1. মেম্বার Premium বাটনে Binance Pay ID-তে ৫ USDT পাঠিয়ে transaction ID পাঠায়।
+2. আপনার Telegram-এ Approve / Reject বাটনসহ মেসেজ আসে।
+3. Approve চাপলে মেম্বারের ৩০ দিনের Premium চালু হয় — এটা এখন
+   Postgres-এ থাকে, তাই Render রিস্টার্ট হলেও হারাবে না।
+
 ## ধাপ ৬ — লগ দেখে ডেপ্লয় ঠিক আছে কি না দেখুন
 
 1. সার্ভিস পেজে **Logs** ট্যাব খুলুন।

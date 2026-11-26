@@ -44,7 +44,7 @@ def host() -> str:
     """Get the broker host configured in settings/config.ini.
 
     Default is market-qx.info, not quotex.com: the browser login
-    Saiful uses is on market-qx.info, and logging in via quotex.com
+    the owner uses is on market-qx.info, and logging in via quotex.com
     redirects there and the server then rejects the session with
     HTTP 401 at /pt/trade. Override with host=... in
     settings/config.ini if the broker moves again.

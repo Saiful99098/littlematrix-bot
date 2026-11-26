@@ -1,6 +1,6 @@
 """LittleMatrix signal engine — pure, unit-testable logic.
 
-Decisions agreed with Saiful (see blueprint.md):
+Decisions agreed with the owner (see blueprint.md):
 - Per candle: C > O = CALL, C < O = PUT, C == O = DOJI.
 - FUTURES SIGNAL: same HH:MM across N days, majority vote.
   1 day = 1 vote (copy, weak). 2 days: 2-0 signal, 1-1 tie skip.
@@ -16,7 +16,7 @@ Decisions agreed with Saiful (see blueprint.md):
      as an OPT-IN flag. It is OFF by default in
      generate_futures_signals() because a strict EMA check drops
      4 of the 13 verified sample signals (09:18, 10:09, 10:16,
-     10:24) to 9. Saiful can enable it with apply_trend=True.
+     10:24) to 9. the owner can enable it with apply_trend=True.
 - Verified sample: USDMXN_otc 2026-11-21 09:00-10:59, 1 day:
   120 candles -> 118 raw signals (2 DOJI skipped) ->
   strength + gap 7 -> exactly 13 signals (see tests).

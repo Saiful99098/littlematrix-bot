@@ -86,13 +86,14 @@ async def fake_do_request(self, url, method, request_data=None, **kwargs):
 
 _httpxrequest.HTTPXRequest.do_request = fake_do_request
 
-# --- Fake Quotex session that SUCCEEDS (bundled sample candles) ---
+# --- Fake Quotex session that SUCCEEDS (synthetic candles) ---
 from bot import candles_db as candles_db_mod  # noqa: E402
 from bot import collector as collector_mod  # noqa: E402
 
-SAMPLE = json.loads(
-    (ROOT / "data" / "sample_candles_USDMXN_otc_2026-11-21.json"
-     ).read_text(encoding="utf-8"))["candles"]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from synthetic_data import make_day, to_raw  # noqa: E402
+
+SAMPLE = to_raw(make_day("USDMXN_otc", "2026-11-21", seed=8))
 
 
 class FakeSession:

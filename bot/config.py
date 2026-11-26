@@ -1,20 +1,19 @@
 """Config — loads .env, never contains real secrets in the repo.
 
-Only placeholders live in .env.example. Saiful copies it to .env
+Only placeholders live in .env.example. the owner copies it to .env
 on his PC and puts his own token there. On Render, the same values
 come from Render's Environment Variables (never from git).
 
 Modes (DATA_MODE):
-- sample: bundled USDMXN 2026-11-21 sample file (no login).
-- live:   fetch yesterday's candles live from Quotex (local PC test).
 - db:     signals + CHECKER read ONLY from the candle database
           (Postgres on Render when DATABASE_URL is set, SQLite file
           locally). A background collector fills the DB: on startup
           it backfills the last 5 completed days (Asia/Dhaka
-          00:00-11:59 each day) + today 00:00-now, then every 2 hours
+          00:00-23:59 each day) + today 00:00-now, then every 2 hours
           it collects the last 2 hours (+10 min overlap) into the DB.
           Signals and CHECKER never log in to Quotex in db mode —
           that is the anti-429 design.
+- live:   fetch yesterday's candles live from Quotex (local PC test).
 """
 from __future__ import annotations
 
@@ -65,6 +64,26 @@ def quotex_proxies_dict():
             "(use http://, https:// or socks5://)", scheme)
         return None
     return {"http": proxy, "https": proxy}
+# Channel membership gate: only members of this Telegram channel/group
+# may use the bot for free. Set to the channel username (e.g.
+# "@BlueFishFutureSignal") or numeric chat id (e.g. "-1001234567890").
+# Empty = gate off (bot works for everyone, local tests).
+# The bot must be an ADMIN in the channel, otherwise Telegram will
+# not let it check who joined.
+REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "").strip()
+# Telegram user ids allowed to approve premium requests (comma
+# separated, e.g. "123456789"). The owner's id goes here. Empty = no
+# admin commands; premium requests are only stored for manual check.
+ADMIN_USER_IDS = {int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",")
+                  if x.strip().isdigit()}
+# Premium payment: Binance Pay ID members send the amount to.
+# Empty = Premium shows "ask the owner" instead.
+BINANCE_PAY_ID = os.getenv("BINANCE_PAY_ID", "").strip()
+USDT_AMOUNT = os.getenv("USDT_AMOUNT", "5").strip() or "5"
+# Join link for the required channel (e.g. https://t.me/+HDiWRJothc5hNTQ9).
+# The Join button uses this link. When empty, the button links to
+# t.me/<REQUIRED_CHANNEL> instead.
+CHANNEL_INVITE_LINK = os.getenv("CHANNEL_INVITE_LINK", "").strip()
 DATA_MODE = os.getenv("DATA_MODE", "sample")  # sample | live | db
 # Render webhook: set WEBHOOK_URL to the public HTTPS base URL of the
 # Render web service, e.g. https://blue-fish-prime-bot.onrender.com
@@ -99,7 +118,6 @@ MAX_SIGNAL_DAYS = int(os.getenv("MAX_SIGNAL_DAYS", "20"))
 
 DB_PATH = BASE_DIR / "data" / "littlematrix.db"
 CANDLES_DB_PATH = BASE_DIR / "data" / "candles.db"
-SAMPLE_CANDLES = BASE_DIR / "data" / "sample_candles_USDMXN_otc_2026-11-21.json"
 DEFAULT_ASSET = "USDMXN_otc"
 TIMEZONE = "UTC+6"
 

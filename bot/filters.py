@@ -1,6 +1,6 @@
 """Personal FILTER system — SEPARATE from signal generation.
 
-This is Saiful's Aston/Newexe filter, exactly as specified on
+This is the owner's Aston/Newexe filter, exactly as specified on
 2026-11-22. It must NOT be added inside signal generation.
 It lives here, behind its own FILTER button, and works on lists
 the user pastes (Aston list + Newexe list).

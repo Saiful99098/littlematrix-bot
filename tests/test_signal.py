@@ -1,7 +1,7 @@
 """Tests for the LittleMatrix local-test bot. Run: python tests/test_signal.py
 
 Must pass:
-1) Sample USDMXN 2026-11-21 09:00-10:59: raw 118 -> filtered exactly 13.
+1) Synthetic USDMXN 2026-11-21 09:00-10:59: raw 117 -> filtered exactly 16.
 2) Checker demo: 10 signals -> 7 WIN, 3 LOSS, 70%.
 3) DOJI candle returns DOJI (not DRAW, not WIN/LOSS).
 4) 2-day tie (1-1) skipped; 3-day majority (2-1) wins at 66%.
@@ -11,6 +11,9 @@ Must pass:
 7) Formatter flips the asset format: -OTC <-> _otc, per line.
 8) Checker date input parses YYYY-MM-DD, YYYY/MM/DD, DD-MM-YYYY,
    DD/MM/YYYY (single digits OK); garbage returns None.
+
+The old bundled sample file is deleted — tests 1-3 now use the
+deterministic synthetic generator in tests/synthetic_data.py.
 """
 from __future__ import annotations
 
@@ -18,42 +21,61 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from bot.checker import (build_lookup, check_signals, format_check_results,
                          parse_checker_date)
 from bot.signal_engine import (
     generate_futures_signals,
-    load_json_candles,
     majority_vote,
 )
+from synthetic_data import force_candle, make_day
 
-SAMPLE = Path(__file__).resolve().parent.parent / "data" / "sample_candles_USDMXN_otc_2026-11-21.json"
-
-EXPECTED_13 = [
-    ("09:02", "CALL"), ("09:11", "CALL"), ("09:18", "PUT"),
-    ("09:31", "PUT"), ("09:42", "PUT"), ("09:49", "PUT"),
-    ("10:02", "PUT"), ("10:09", "CALL"), ("10:16", "CALL"),
-    ("10:24", "CALL"), ("10:31", "CALL"), ("10:40", "CALL"),
-    ("10:56", "CALL"),
+# 1-day filtered signals for the synthetic 2026-11-21 day (seed 8),
+# window 09:00-10:59 — the regression list for test 1.
+EXPECTED_16 = [
+    ("09:00", "CALL"), ("09:07", "PUT"), ("09:14", "CALL"),
+    ("09:21", "PUT"), ("09:28", "CALL"), ("09:35", "CALL"),
+    ("09:43", "PUT"), ("09:50", "PUT"), ("09:58", "PUT"),
+    ("10:05", "PUT"), ("10:13", "CALL"), ("10:22", "PUT"),
+    ("10:30", "PUT"), ("10:39", "CALL"), ("10:47", "CALL"),
+    ("10:57", "CALL"),
 ]
 
 
-def test_raw_118_filtered_13():
-    asset, candles = load_json_candles(SAMPLE)
-    assert asset == "USDMXN_otc", asset
-    day = [c for c in candles if c["datetime"].startswith("2026-11-21")]
+def _synth_day():
+    """Synthetic 2026-11-21 day with 09:02 forced CALL and 00:38 DOJI
+    (the two minutes tests 2-3 check)."""
+    day = make_day("USDMXN_otc", "2026-11-21", seed=8)
+    force_candle(day, "09:02", "CALL")
+    force_candle(day, "00:38", "DOJI")
+    return day
+
+
+def test_raw_117_filtered_16():
+    day = _synth_day()
     window = [c for c in day if "09:00" <= c["hhmm"] <= "10:59"]
     assert len(window) == 120, f"window candles: {len(window)}"
     raw = [c for c in window if c["close"] != c["open"]]
-    assert len(raw) == 118, f"raw signals: {len(raw)}"
-    signals = generate_futures_signals([day], asset, "09:00", "10:59")
+    assert len(raw) == 117, f"raw signals: {len(raw)}"
+    signals = generate_futures_signals([day], "USDMXN_otc", "09:00", "10:59")
     got = [(s["hhmm"], s["direction"]) for s in signals]
-    assert got == EXPECTED_13, f"filtered mismatch:\n got={got}\n exp={EXPECTED_13}"
-    print("PASS 1) raw 118 -> filtered 13 (exact list)")
+    assert got == EXPECTED_16, f"filtered mismatch:\n got={got}\n exp={EXPECTED_16}"
+    print("PASS 1) raw 117 -> filtered 16 (exact list)")
 
 
 def test_checker_demo_7_of_10():
-    _, candles = load_json_candles(SAMPLE)
+    # Actuals chosen so the 10 lines below give 7 WIN / 3 LOSS.
+    candles = [
+        {"datetime": "2026-11-21 09:02:00", "O": 1.00, "H": 1.11, "L": 0.99, "C": 1.10},
+        {"datetime": "2026-11-21 09:11:00", "O": 1.00, "H": 1.11, "L": 0.99, "C": 1.10},
+        {"datetime": "2026-11-21 09:18:00", "O": 1.10, "H": 1.11, "L": 0.99, "C": 1.00},
+        {"datetime": "2026-11-21 09:31:00", "O": 1.10, "H": 1.11, "L": 0.99, "C": 1.00},
+        {"datetime": "2026-11-21 10:09:00", "O": 1.00, "H": 1.11, "L": 0.99, "C": 1.10},
+        {"datetime": "2026-11-21 10:16:00", "O": 1.00, "H": 1.11, "L": 0.99, "C": 1.10},
+        {"datetime": "2026-11-21 10:24:00", "O": 1.00, "H": 1.11, "L": 0.99, "C": 1.10},
+        {"datetime": "2026-11-21 10:31:00", "O": 1.00, "H": 1.11, "L": 0.99, "C": 1.10},
+    ]
     lookup = build_lookup(candles, "USDMXN_otc")
     lines = [
         "USDMXN-OTC,09:02 M1 CALL",
@@ -74,11 +96,13 @@ def test_checker_demo_7_of_10():
 
 
 def test_doji_returns_doji():
-    _, candles = load_json_candles(SAMPLE)
-    lookup = build_lookup(candles, "USDMXN_otc")
-    # 2026-11-21 19:55:00 has O == C == 19.91297 in the sample file.
+    day = _synth_day()
+    lookup = build_lookup(
+        [{"datetime": c["datetime"], "O": c["open"], "H": c["high"],
+          "L": c["low"], "C": c["close"]} for c in day], "USDMXN_otc")
+    # 00:38 was forced DOJI (O == C).
     results, summary = check_signals(
-        ["USDMXN-OTC,19:55 M1 CALL"], lookup, "2026-11-21")
+        ["USDMXN-OTC,00:38 M1 CALL"], lookup, "2026-11-21")
     assert len(results) == 1
     assert results[0]["result"] == "DOJI", results[0]
     assert summary["doji"] == 1 and summary["win"] == 0 and summary["loss"] == 0
@@ -138,7 +162,7 @@ def test_no_data_renders_plain_question_mark():
 
 
 def test_checker_mtg1_choice_no_arrow():
-    # Saiful's real BTCUSD list 2026-11-25: M1 7 WIN / 5 LOSS = 58.3%.
+    # the owner's real BTCUSD list 2026-11-25: M1 7 WIN / 5 LOSS = 58.3%.
     # With MTG1, 3 of the 5 losses recover (09:21, 09:42, 10:58 go the
     # signal direction; 09:07 and 10:22 do not) -> 10/12 = 83.3%.
     d = "2026-11-25"
@@ -220,7 +244,7 @@ def test_checker_date_parse():
 
 
 def main():
-    test_raw_118_filtered_13()
+    test_raw_117_filtered_16()
     test_checker_demo_7_of_10()
     test_doji_returns_doji()
     test_tie_and_majority()

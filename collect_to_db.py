@@ -3,7 +3,7 @@
 Why this exists (2026-11-25): the Render bot is Live (webhook 200 OK),
 but Quotex returns 403 ("Error on access page") for logins from Render's
 datacenter IP, so the Render collector cannot collect any candles and
-Bot Status shows 0 candles. The same Quotex login works from Saiful's
+Bot Status shows 0 candles. The same Quotex login works from the owner's
 home PC IP, so this script runs on his PC and writes candles straight
 into the same Render Postgres database the bot reads from.
 

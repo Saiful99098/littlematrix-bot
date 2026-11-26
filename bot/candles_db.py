@@ -82,6 +82,15 @@ CREATE TABLE IF NOT EXISTS collector_state (
 );
 """
 
+SCHEMA_PAYOUTS = """
+CREATE TABLE IF NOT EXISTS payouts (
+    asset TEXT PRIMARY KEY,
+    payout_1m REAL,
+    is_open INTEGER NOT NULL DEFAULT 1,
+    updated_at TEXT
+);
+"""
+
 
 def utc_iso(dt):
     """Aware datetime -> 'YYYY-MM-DD HH:MM:SS' UTC string."""
@@ -153,9 +162,11 @@ class CandleDB:
             # psycopg2 accepts several statements in one execute().
             cur.execute(SCHEMA_CANDLES)
             cur.execute(SCHEMA_STATE)
+            cur.execute(SCHEMA_PAYOUTS)
         else:
             cur.executescript(SCHEMA_CANDLES)
             cur.executescript(SCHEMA_STATE)
+            cur.executescript(SCHEMA_PAYOUTS)
             conn.commit()
         return self
 
@@ -287,6 +298,46 @@ class CandleDB:
             "WHERE asset = ? AND ts >= ? AND ts < ?",
             (asset, utc_iso(start), utc_iso(end)))
         return cur.fetchone()[0]
+
+    def last_candle_time(self, asset):
+        """UTC ISO string of the newest stored candle for one asset,
+        or None when the asset has no candles. Used by the backfill
+        to fetch only the missing tail instead of the whole span."""
+        asset = normalize_asset_name(asset)
+        cur = self._execute(
+            "SELECT MAX(ts) FROM candles WHERE asset = ?", (asset,))
+        row = cur.fetchone()
+        if not row or row[0] is None:
+            return None
+        return _to_iso(row[0])
+
+    # -- payouts ------------------------------------------------------
+    def set_payouts(self, rows):
+        """Store one payout snapshot: rows are (asset, payout_1m,
+        is_open, updated_at_iso). Old rows for the asset are replaced.
+        Called once per collector run from the live instruments list,
+        so the Payouts button reads from the DB, never from Quotex."""
+        if not rows:
+            return
+        data = [(normalize_asset_name(a), float(p) if p is not None else None,
+                 1 if o else 0, u) for a, p, o, u in rows]
+        if self.backend == "postgres":
+            sql = ("INSERT INTO payouts (asset, payout_1m, is_open, updated_at) "
+                   "VALUES (?, ?, ?, ?) "
+                   "ON CONFLICT (asset) DO UPDATE SET payout_1m = EXCLUDED.payout_1m, "
+                   "is_open = EXCLUDED.is_open, updated_at = EXCLUDED.updated_at")
+        else:
+            sql = ("INSERT OR REPLACE INTO payouts (asset, payout_1m, is_open, updated_at) "
+                   "VALUES (?, ?, ?, ?)")
+        self._executemany(sql, data)
+
+    def get_payouts(self):
+        """[(asset, payout_1m, is_open, updated_at)] best payout first.
+        Empty when the collector has never stored a snapshot yet."""
+        cur = self._execute(
+            "SELECT asset, payout_1m, is_open, updated_at FROM payouts "
+            "ORDER BY payout_1m DESC NULLS LAST, asset")
+        return [(row[0], row[1], bool(row[2]), row[3]) for row in cur.fetchall()]
 
     def get_assets(self):
         cur = self._execute("SELECT DISTINCT asset FROM candles ORDER BY asset")
