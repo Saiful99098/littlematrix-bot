@@ -29,6 +29,24 @@ LINE_RE = re.compile(
 )
 
 
+def parse_checker_date(text):
+    """Parse a date the user typed for the CHECKER.
+
+    Accepts YYYY-MM-DD, YYYY/MM/DD, DD-MM-YYYY, DD/MM/YYYY
+    (single digits OK, e.g. 2026-11-5 or 5-11-2026).
+    Returns "YYYY-MM-DD" or None when it does not parse.
+    """
+    from datetime import datetime as _dt
+
+    s = (text or "").strip()
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y"):
+        try:
+            return _dt.strptime(s, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
+
+
 def parse_signal_line(line):
     """Parse one line. Returns (asset, hhmm, direction) or None."""
     m = LINE_RE.match(line.strip())

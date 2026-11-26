@@ -26,7 +26,8 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from . import candles_db, collector, config, database, quotex_client
-from .checker import build_lookup, check_signals, format_check_results, parse_signal_line
+from .checker import (build_lookup, check_signals, format_check_results,
+                      parse_checker_date, parse_signal_line)
 from .filters import filter_personal, format_filter_result
 from .premium_emoji import BUTTON_ICONS, pe
 from .signal_engine import (
@@ -476,24 +477,39 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if data == "menu_checker":
         # Ask first: MTG1 results or non-MTG (M1 only)? The choice is
-        # stored and used when the pasted list is checked.
-        check_date = _today_date_str() if config.DATA_MODE == "db" else SAMPLE_DATE
-        context.user_data["checker_date"] = check_date
+        # stored and used when the pasted list is checked. The date
+        # comes next (db mode asks for it, other modes use the sample).
         kb = [[InlineKeyboardButton("MTG1", callback_data="checker_mtg_1"),
                InlineKeyboardButton("Non-MTG", callback_data="checker_mtg_0")],
               [_btn("Back", "menu_main", icon="back")]]
         await query.edit_message_text(
-            f"{pe('search')}{pe('diamond')} Blue Fish Prime Check — Date: {check_date}\n{DIVIDER}\n\n"
+            f"{pe('search')}{pe('diamond')} Blue Fish Prime Check\n{DIVIDER}\n\n"
             "Do you want MTG1 results or non-MTG (M1 only)?",
             reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
         return
     if data in ("checker_mtg_1", "checker_mtg_0"):
         context.user_data["checker_mtg1"] = (data == "checker_mtg_1")
+        if config.DATA_MODE == "db":
+            # Ask for the date: the user types it, or taps Today.
+            context.user_data["flow"] = "checker_date"
+            kb = [[InlineKeyboardButton("Today", callback_data="checker_date_today")],
+                  [_btn("Back", "menu_main", icon="back")]]
+            await query.edit_message_text(
+                _checker_date_prompt(),
+                reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+        else:
+            context.user_data["checker_date"] = SAMPLE_DATE
+            context.user_data["flow"] = "checker_list"
+            await query.edit_message_text(
+                _checker_list_prompt(SAMPLE_DATE),
+                reply_markup=back_keyboard(), parse_mode="HTML")
+        return
+    if data == "checker_date_today":
+        today = _today_date_str()
+        context.user_data["checker_date"] = today
         context.user_data["flow"] = "checker_list"
         await query.edit_message_text(
-            f"{pe('search')}{pe('diamond')} Blue Fish Prime Check\n{DIVIDER}\n\n"
-            "Paste your signal list, e.g.:\n"
-            "USDMXN-OTC,09:02 M1 CALL\nUSDMXN-OTC,09:11 M1 CALL",
+            _checker_list_prompt(today),
             reply_markup=back_keyboard(), parse_mode="HTML")
         return
     if data == "menu_market":
@@ -940,6 +956,20 @@ async def _run_backtest(query):
         reply_markup=back_keyboard(), parse_mode="HTML")
 
 
+def _checker_list_prompt(date_str):
+    """Prompt text for pasting the signal list (after MTG + date)."""
+    return (f"{pe('search')}{pe('diamond')} Blue Fish Prime Check — Date: {date_str}\n{DIVIDER}\n\n"
+            "Paste your signal list, e.g.:\n"
+            "USDMXN-OTC,09:02 M1 CALL\nUSDMXN-OTC,09:11 M1 CALL")
+
+
+def _checker_date_prompt():
+    """Prompt text for typing the date to check."""
+    return (f"{pe('search')}{pe('diamond')} Blue Fish Prime Check\n{DIVIDER}\n\n"
+            "Which date do you want to check?\n"
+            "Send it like 2026-11-25, or tap Today.")
+
+
 async def _build_checker_lookup(lines, date_str):
     """Lookup {(asset, datetime): candle} for every asset in the
     pasted lines. DB first in db mode (today's candles included),
@@ -1004,6 +1034,36 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await _compute_futures_text(context, start, end)
         await working.edit_text(result, reply_markup=back_keyboard(),
                                 parse_mode=_html_mode(result))
+        return
+
+    if flow == "checker_date":
+        # The user typed the date to check (db mode only).
+        date_str = parse_checker_date(text)
+        if not date_str:
+            await update.message.reply_text(
+                "That date does not look right — send it like 2026-11-25.",
+                reply_markup=back_keyboard(), parse_mode="HTML")
+            return
+        if date_str > _today_date_str():
+            await update.message.reply_text(
+                "That date is in the future — send today or an earlier date.",
+                reply_markup=back_keyboard(), parse_mode="HTML")
+            return
+        try:
+            have_dates = candles_db.get_candle_db().get_dates()
+        except Exception:
+            have_dates = []
+        if have_dates and date_str not in have_dates:
+            await update.message.reply_text(
+                f"No candles for {date_str} in the database — "
+                "send another date.",
+                reply_markup=back_keyboard(), parse_mode="HTML")
+            return
+        context.user_data["checker_date"] = date_str
+        context.user_data["flow"] = "checker_list"
+        await update.message.reply_text(
+            _checker_list_prompt(date_str),
+            reply_markup=back_keyboard(), parse_mode="HTML")
         return
 
     if flow == "checker_list":

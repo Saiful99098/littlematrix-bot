@@ -68,6 +68,23 @@ def webhook_config():
             config.WEBHOOK_URL.rstrip("/") + "/webhook")
 
 
+def _collector_task_done(task):
+    """Log a dead collector task instead of losing it silently.
+
+    A task that raises only prints "Task exception was never retrieved"
+    when garbage-collected — easy to miss in Render logs — while the
+    bot keeps answering Telegram, so a dead collector just looks like
+    a frozen Bot Status. This makes the death loud.
+    """
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception("collector task died — Bot Status will freeze until restart")
+
+
+
 async def post_init(app):
     """Runs after the Application is built, before polling/webhook
     starts. Starts the background candle collector (db mode only).
@@ -76,6 +93,7 @@ async def post_init(app):
     if config.collector_active():
         logger.info("collector enabled (DATA_MODE=db) — starting background task")
         task = asyncio.create_task(collector.collector_loop())
+        task.add_done_callback(_collector_task_done)
         app.bot_data["collector_task"] = task
     else:
         logger.info("collector not active (DATA_MODE=%s, COLLECTOR_ENABLED=%s)",

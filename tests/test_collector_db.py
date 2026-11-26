@@ -382,6 +382,9 @@ async def _stop_sleep(_seconds):
 
 def test_backfill_reruns_after_window_change():
     db = _tmp_db()
+    # collector_loop uses collector.dhaka_now() internally (real clock),
+    # so a fixed fake "now" disagrees with it the day after the test
+    # was written (backfill dates shift). Freeze the clock instead.
     now = datetime(2026, 11, 25, 12, 0, tzinfo=DHAKA)
     # Simulate the OLD half-day state: backfill marked done today,
     # but no window version recorded (old code never set it).
@@ -389,12 +392,17 @@ def test_backfill_reruns_after_window_change():
     db.set_state("last_backfill", utc_iso(now))
     # collector_loop must NOT skip the backfill: the window changed,
     # so the missing afternoon halves must be collected.
+    _real_now = collector.dhaka_now
+    collector.dhaka_now = lambda: now
     try:
-        asyncio.run(collector.collector_loop(
-            db=db, session_factory=lambda: FakeSession(now=now),
-            sleep=_stop_sleep))
-    except _StopLoop:
-        pass
+        try:
+            asyncio.run(collector.collector_loop(
+                db=db, session_factory=lambda: FakeSession(now=now),
+                sleep=_stop_sleep))
+        except _StopLoop:
+            pass
+    finally:
+        collector.dhaka_now = _real_now
     assert db.count_total() == 2 * 7921, db.count_total()
     assert db.get_state("backfill_window") == "full-day"
     print("PASS f4) backfill re-runs after window change — old half-day "

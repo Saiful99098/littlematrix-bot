@@ -38,6 +38,21 @@ from .candles_db import DHAKA, utc_iso
 
 logger = logging.getLogger("littlematrix.collector")
 
+def _safe_set_state(db, key, value):
+    """Write one collector_state row; never raise.
+
+    A state write is bookkeeping, not the collection itself. Render's
+    Postgres closes idle connections, and if that write fails the
+    collector loop used to die silently from _one_run's finally block
+    while the bot kept answering Telegram — Bot Status then froze at
+    the last successful run. Swallow + log instead.
+    """
+    try:
+        db.set_state(key, value)
+    except Exception as exc:  # noqa: BLE001 - bookkeeping must not kill the loop
+        logger.warning("collector: could not save state %s: %s", key, exc)
+
+
 # Backfill window version, stored in collector_state. When the window
 # changes (e.g. 00:00-11:59 -> full day), the next startup re-runs the
 # backfill once so the missing half of every day gets collected,
@@ -315,12 +330,12 @@ async def run_backfill(db, session, days=None, now=None):
             logger.info("collector: backfill %s — %d candles in window, %d new in DB",
                         asset, n_rows, inserted)
 
-    db.set_state("last_backfill", utc_iso(now))
-    db.set_state("backfill_done", "true")
-    db.set_state("backfill_window", BACKFILL_WINDOW)
-    db.set_state("last_collection", utc_iso(now))
+    _safe_set_state(db, "last_backfill", utc_iso(now))
+    _safe_set_state(db, "backfill_done", "true")
+    _safe_set_state(db, "backfill_window", BACKFILL_WINDOW)
+    _safe_set_state(db, "last_collection", utc_iso(now))
     nxt = now + timedelta(seconds=config.COLLECTOR_INTERVAL_SECONDS)
-    db.set_state("next_collection", utc_iso(nxt))
+    _safe_set_state(db, "next_collection", utc_iso(nxt))
     logger.info("collector: backfill finished — %d assets, %d new candles, "
                 "next run at %s (Dhaka)", done, total, nxt.strftime("%H:%M"))
     return done, total
@@ -357,9 +372,9 @@ async def run_incremental(db, session, now=None):
             n_rows, inserted = _store_rows(db, asset, raw, start, end)
             total += inserted
             done += 1
-    db.set_state("last_collection", utc_iso(now))
+    _safe_set_state(db, "last_collection", utc_iso(now))
     nxt = now + timedelta(seconds=config.COLLECTOR_INTERVAL_SECONDS)
-    db.set_state("next_collection", utc_iso(nxt))
+    _safe_set_state(db, "next_collection", utc_iso(nxt))
     logger.info("collector: 2-hourly run finished — %d assets, %d new candles, "
                 "next run %s Dhaka",
                 done, total, nxt.strftime("%H:%M"))
@@ -436,19 +451,19 @@ async def collector_loop(db=None, session_factory=None, sleep=None):
         session = session_factory()
         try:
             await session.connect()
-            db.set_state("quotex_last_login", utc_iso(dhaka_now()))
-            db.set_state("quotex_session", "connected")
+            _safe_set_state(db, "quotex_last_login", utc_iso(dhaka_now()))
+            _safe_set_state(db, "quotex_session", "connected")
             if kind == "backfill":
                 await run_backfill(db, session)
             else:
                 await run_incremental(db, session)
             return True
         except quotex_client.QuotexRateLimited as exc:
-            db.set_state("quotex_session", f"rate limited (429): {exc}")
+            _safe_set_state(db, "quotex_session", f"rate limited (429): {exc}")
             logger.warning("collector: 429 — %s", exc)
             return "rate_limited"
         except Exception as exc:
-            db.set_state("quotex_session", f"error: {exc}")
+            _safe_set_state(db, "quotex_session", f"error: {exc}")
             logger.warning("collector: run failed: %s", exc)
             return False
         finally:
@@ -456,7 +471,7 @@ async def collector_loop(db=None, session_factory=None, sleep=None):
                 await session.close()
             except Exception:
                 pass
-            db.set_state("quotex_session", "disconnected (between runs)")
+            _safe_set_state(db, "quotex_session", "disconnected (between runs)")
 
     # --- backfill first (skip if already done today) ---
     # The backfill also re-runs when the window version changed
@@ -468,7 +483,11 @@ async def collector_loop(db=None, session_factory=None, sleep=None):
     if done and window_ok and last_bf and last_bf[:10] == dhaka_now().strftime("%Y-%m-%d"):
         logger.info("collector: backfill already done today (%s), skipping", last_bf)
     else:
-        result = await _one_run("backfill")
+        try:
+            result = await _one_run("backfill")
+        except Exception as exc:
+            logger.warning("collector: backfill run crashed: %s", exc)
+            result = False
         if result == "rate_limited":
             logger.info("collector: backfill hit 429, retrying in %d minutes",
                         config.COLLECTOR_429_RETRY_MINUTES)
@@ -483,9 +502,16 @@ async def collector_loop(db=None, session_factory=None, sleep=None):
     # --- then every 2 hours, forever ---
     while True:
         await sleep(interval)
-        result = await _one_run("incremental")
+        try:
+            result = await _one_run("incremental")
+        except Exception as exc:
+            logger.warning("collector: incremental run crashed: %s", exc)
+            continue
         if result == "rate_limited":
             logger.info("collector: incremental run hit 429, retrying in %d minutes",
                         config.COLLECTOR_429_RETRY_MINUTES)
             await sleep(retry_wait)
-            await _one_run("incremental")
+            try:
+                await _one_run("incremental")
+            except Exception as exc:
+                logger.warning("collector: incremental retry crashed: %s", exc)

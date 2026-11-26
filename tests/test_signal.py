@@ -9,6 +9,8 @@ Must pass:
 6) Checker MTG1 choice: with_mtg1 recovers 3 of 5 M1 losses
    (58.3% -> 83.3% MTG1 Accuracy); result lines have no arrow.
 7) Formatter flips the asset format: -OTC <-> _otc, per line.
+8) Checker date input parses YYYY-MM-DD, YYYY/MM/DD, DD-MM-YYYY,
+   DD/MM/YYYY (single digits OK); garbage returns None.
 """
 from __future__ import annotations
 
@@ -17,7 +19,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from bot.checker import build_lookup, check_signals, format_check_results
+from bot.checker import (build_lookup, check_signals, format_check_results,
+                         parse_checker_date)
 from bot.signal_engine import (
     generate_futures_signals,
     load_json_candles,
@@ -201,6 +204,21 @@ def test_formatter_flips_format():
     print("PASS 7) formatter flips format — -OTC <-> _otc, per line")
 
 
+def test_checker_date_parse():
+    assert parse_checker_date("2026-11-25") == "2026-11-25"
+    assert parse_checker_date("2026/11/25") == "2026-11-25"
+    assert parse_checker_date("25-11-2026") == "2026-11-25"
+    assert parse_checker_date("25/11/2026") == "2026-11-25"
+    assert parse_checker_date("2026-11-5") == "2026-11-05"
+    assert parse_checker_date(" 2026-11-25 ") == "2026-11-25"
+    assert parse_checker_date("hello") is None
+    assert parse_checker_date("2026-13-01") is None
+    assert parse_checker_date("2026-11-32") is None
+    assert parse_checker_date("") is None
+    print("PASS 8) checker date input parses YYYY-MM-DD / DD-MM-YYYY, "
+          "garbage returns None")
+
+
 def main():
     test_raw_118_filtered_13()
     test_checker_demo_7_of_10()
@@ -209,7 +227,8 @@ def main():
     test_no_data_renders_plain_question_mark()
     test_checker_mtg1_choice_no_arrow()
     test_formatter_flips_format()
-    print("ALL TESTS PASSED (7/7)")
+    test_checker_date_parse()
+    print("ALL TESTS PASSED (8/8)")
 
 
 if __name__ == "__main__":
