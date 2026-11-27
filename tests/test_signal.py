@@ -155,9 +155,13 @@ def test_no_data_renders_plain_question_mark():
                "no_data": 1, "win_pct": 0.0}
     text = format_check_results(results, summary)
     assert "6282525354242348869" not in text, text
-    assert "AUDNZD-OTC,01:00 M1 CALL ?" in text, text
+    # Signal text is monospace now (the owner's template, 2026-11-27);
+    # the plain "?" sits OUTSIDE the code tags.
+    assert "<code>AUDNZD-OTC,01:00 M1 CALL</code> ?" in text, text
     assert "→" not in text, text
     assert "? 1" in text, text
+    assert "Check Results" in text, text
+    assert "Accuracy: 0.0%" in text, text
     print("PASS 5) NO DATA renders as plain '?' (no misleading WIN? sticker)")
 
 
@@ -202,14 +206,15 @@ def test_checker_mtg1_choice_no_arrow():
     assert "Accuracy: 83.3%" in text, text
     assert "MTG1 Accuracy" not in text, text
     # No "(MTG1: ...)" suffix: an MTG1 win is the check sticker + dot,
-    # an MTG1 loss is just the loss sticker.
+    # an MTG1 loss is just the loss sticker. Lines are monospace now,
+    # so they start with <code> — match by content, not by start.
     assert "(MTG1:" not in text, text
     from bot.premium_emoji import pe
     mtg_win_line = [ln for ln in text.splitlines()
-                    if ln.startswith("BTCUSD-OTC,09:20")][0]
+                    if "BTCUSD-OTC,09:20" in ln][0]
     assert mtg_win_line.endswith(pe("check") + "."), mtg_win_line
     mtg_loss_line = [ln for ln in text.splitlines()
-                     if ln.startswith("BTCUSD-OTC,09:06")][0]
+                     if "BTCUSD-OTC,09:06" in ln][0]
     assert mtg_loss_line.endswith(pe("cross")), mtg_loss_line
     print("PASS 6) checker MTG1 choice — M1 58.3%, MTG1 wins count as wins "
           "(83.3%), no arrow, MTG1 win = check + dot, no (MTG1:) suffix, "

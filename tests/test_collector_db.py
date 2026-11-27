@@ -490,7 +490,14 @@ def test_post_init_starts_collector_only_when_active():
 
 def test_handlers_db_end_to_end():
     """Full handler path in db mode: futures (single + SELECT ALL),
-    fewer-days note, checker lookup, and the Bot Status summary."""
+    checker lookup, and the Bot Status summary.
+
+    The FS result is now the user's template (edit round 2026-11-27):
+    no 'Source: db' / 'Days:' / 'SELECT ALL' / fewer-days note lines.
+    The 7-min gap is gone, so 1-day voting (every signal 100%) lets
+    many more minutes through — 81 of the 120 in this synthetic
+    window pass the strength filter; 2-day voting (5 requested, 2 in
+    the DB) lets 45 through. SELECT ALL still caps at 12 per 2h."""
     import bot.candles_db as candles_db_mod
     import bot.handlers as handlers
 
@@ -508,33 +515,36 @@ def test_handlers_db_end_to_end():
 
         text = asyncio.run(
             handlers._compute_futures_text(Ctx(), "09:00", "10:59"))
-        assert "Source: db" in text, text
-        assert "Days: 1 (database)" in text, text
-        assert "USDMXN-OTC,09:00 M1 CALL" in text, text
-        # Header also contains "M1" once — count signal lines instead.
+        assert "FUTURE SIGNALS — OTC FS" in text, text
+        assert "MTG 1 STEP" in text, text
+        assert "Avoid Below 70%" in text, text
+        assert "Source: db" not in text, text
+        assert "Days:" not in text, text
+        assert "Generated:" not in text, text
+        assert "<code>USDMXN-OTC,09:00 M1 CALL</code>" in text, text
         sig_lines = [ln for ln in text.splitlines()
-                     if ln.startswith("USDMXN-OTC,")]
-        assert len(sig_lines) == 16, text
+                     if "<code>USDMXN-OTC," in ln]
+        assert len(sig_lines) == 81, text
 
-        # 5 days requested, only 2 in the DB: honest note, 2-day vote
-        # for 09:00-10:59 (both days have candles in that window).
+        # 5 days requested, only 2 in the DB: NO note any more (the
+        # template has no room for it); the vote is 2-day.
         Ctx.user_data["fs_days"] = 5
         text5 = asyncio.run(
             handlers._compute_futures_text(Ctx(), "09:00", "10:59"))
-        assert "has only 2 day(s)" in text5, text5
+        assert "has only 2 day(s)" not in text5, text5
+        assert "FUTURE SIGNALS — OTC FS" in text5, text5
         sig_lines5 = [ln for ln in text5.splitlines()
-                      if ln.startswith("USDMXN-OTC,")]
-        assert len(sig_lines5) == 14, text5
+                      if "<code>USDMXN-OTC," in ln]
+        assert len(sig_lines5) == 45, text5
 
         # SELECT ALL from the DB (no Quotex login anywhere).
         Ctx.user_data = {"fs_asset": "ALL", "fs_days": 1, "fs_mode": "OTC FS"}
         text_all = asyncio.run(
             handlers._compute_futures_text(Ctx(), "09:00", "10:59"))
-        assert "SELECT ALL (1 assets)" in text_all, text_all
-        # Cross-asset filter keeps 12 of the 16 (09:00 is dropped).
-        assert "USDMXN-OTC,09:07 M1 PUT" in text_all, text_all
+        assert "SELECT ALL" not in text_all, text_all
+        # Cross-asset filter still caps at 12 per 2h window.
         sig_all = [ln for ln in text_all.splitlines()
-                   if ln.startswith("USDMXN-OTC,")]
+                   if "<code>USDMXN-OTC," in ln]
         assert len(sig_all) == 12, text_all
 
         # Checker lookup from the DB for the synthetic date.
@@ -554,8 +564,8 @@ def test_handlers_db_end_to_end():
     finally:
         candles_db_mod.get_candle_db = real_get_db
         config.DATA_MODE = real_mode
-    print("PASS h) handlers db end-to-end — futures, SELECT ALL, "
-          "fewer-days note, checker, status summary")
+    print("PASS h) handlers db end-to-end — futures template, "
+          "SELECT ALL cap, checker, status summary")
 
 
 def main():

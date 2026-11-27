@@ -146,13 +146,13 @@ async def channel_member_update(update, context):
                                              "creator", "restricted"):
         user = member_update.new_chat_member.user
         try:
-            from bot.handlers import main_keyboard, pe as _pe
+            from bot.handlers import _is_admin, main_keyboard, pe as _pe
             await context.bot.send_message(
                 chat_id=user.id,
                 text=(f"{_pe('diamond')}{_pe('lightning')} Welcome to BLUE FISH PRIME! {_pe('fire')}\n"
                       "You joined the Blue Fish trading community — the tools are now unlocked.\n"
                       "Pick a tool below to start."),
-                reply_markup=main_keyboard(), parse_mode="HTML")
+                reply_markup=main_keyboard(admin=_is_admin(user.id)), parse_mode="HTML")
         except Exception:
             pass
 

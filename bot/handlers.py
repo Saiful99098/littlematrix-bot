@@ -32,8 +32,9 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from . import candles_db, collector, config, database, quotex_client
-from .checker import (build_lookup, check_signals, format_check_results,
-                      parse_checker_date, parse_signal_line)
+from .checker import (build_lookup, check_signals, dot_date,
+                      format_check_results, parse_checker_date,
+                      parse_signal_line)
 from .filters import filter_personal, format_filter_result
 from .news import events_for_dhaka_dates
 from .premium_emoji import BUTTON_ICONS, pe
@@ -47,6 +48,8 @@ from .signal_engine import (
     format_signals_list,
     generate_futures_signals,
     generate_futures_signals_from_db,
+    generate_prev_minute_signals,
+    generate_prev_minute_signals_from_db,
     load_days_from_db,
     load_json_candles,
     normalize_candle,
@@ -125,8 +128,95 @@ MAIN_MENU = [
 ]
 
 
-def main_keyboard():
-    return InlineKeyboardMarkup(MAIN_MENU)
+def main_keyboard(admin=False):
+    """The main menu. The Admin Dashboard row is appended ONLY for
+    the owner (the owner, 2026-11-27) — no other user, premium or
+    free, ever sees the option. `admin` is the caller's check
+    (user.id in config.ADMIN_USER_IDS)."""
+    rows = [list(r) for r in MAIN_MENU]
+    if admin:
+        rows.append([_btn("Admin Dashboard", "menu_admin", icon="admin")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _is_admin(user_id):
+    return user_id in config.ADMIN_USER_IDS
+
+
+# ---------------------------------------------------------------------------
+# Admin Dashboard (the owner, 2026-11-27)
+# ---------------------------------------------------------------------------
+# user_id -> {"task": asyncio.Task} for the live dashboard refresh.
+# The refresh loop edits the dashboard message every 10 seconds with
+# fresh counts; it stops after ~30 min, when the dashboard is closed
+# (Back), or when the message can no longer be edited.
+_ADMIN_DASH = {}
+_ADMIN_DASH_MAX_RUNS = 180  # 10s x 180 = ~30 min
+
+
+def _admin_dashboard_text(stats):
+    now = datetime.now(candles_db.DHAKA).strftime("%H:%M:%S")
+    return (f"{pe('diamond')}{pe('crown')} BLUE FISH PRIME • ADMIN DASHBOARD\n{DIVIDER}\n"
+            "User counts — auto-refreshes every 10 seconds.\n"
+            f"Updated: {now} (Dhaka)")
+
+
+def _admin_dashboard_keyboard(stats):
+    """The counts themselves are display-only buttons (like the
+    payouts grid): tapping one does nothing (admin_stat_noop)."""
+    return InlineKeyboardMarkup([
+        [_btn(f"Total Users: {stats['total']}", "admin_stat_noop", icon="info"),
+         _btn(f"Online Now: {stats['online']}", "admin_stat_noop", icon="green")],
+        [_btn(f"Premium: {stats['premium']}", "admin_stat_noop", icon="premium"),
+         _btn(f"Free: {stats['free']}", "admin_stat_noop", icon="status")],
+        [_btn("Back to Menu", "menu_main", icon="back")]])
+
+
+async def _admin_dash_loop(bot, chat_id, message_id, user_id):
+    """Re-read the user counts every 10s and edit the dashboard
+    message in place. The Updated clock changes on every edit, so
+    Telegram never answers 'Message is not modified'."""
+    try:
+        for _ in range(_ADMIN_DASH_MAX_RUNS):
+            await asyncio.sleep(10)
+            entry = _ADMIN_DASH.get(user_id)
+            if not entry or entry.get("task") is not asyncio.current_task():
+                return
+            stats = database.get_user_stats()
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id, message_id=message_id,
+                    text=_admin_dashboard_text(stats),
+                    reply_markup=_admin_dashboard_keyboard(stats),
+                    parse_mode="HTML")
+            except Exception as exc:
+                logger.info("admin dashboard refresh stopped: %s", exc)
+                return
+    except asyncio.CancelledError:
+        pass
+    finally:
+        entry = _ADMIN_DASH.get(user_id)
+        if entry and entry.get("task") is asyncio.current_task():
+            _ADMIN_DASH.pop(user_id, None)
+
+
+def _cancel_admin_dash(user_id):
+    entry = _ADMIN_DASH.pop(user_id, None)
+    if entry and entry.get("task"):
+        entry["task"].cancel()
+
+
+async def _run_admin_dashboard(query, context, user_id):
+    """Show the dashboard and start its 10-second refresh loop."""
+    _cancel_admin_dash(user_id)
+    stats = database.get_user_stats()
+    await query.edit_message_text(
+        _admin_dashboard_text(stats),
+        reply_markup=_admin_dashboard_keyboard(stats), parse_mode="HTML")
+    task = asyncio.create_task(_admin_dash_loop(
+        context.bot, query.message.chat_id, query.message.message_id,
+        user_id))
+    _ADMIN_DASH[user_id] = {"task": task}
 
 
 def back_keyboard():
@@ -550,6 +640,7 @@ def _db_recent_candles(asset, n):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    _cancel_admin_dash(user.id)
     database.get_or_create_user(user.id, user.username or "")
     if not await _is_channel_member(context.bot, user.id):
         text = _join_gate_text()
@@ -565,11 +656,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Pick a tool below to start. {pe('fire')}\n"
             f"{CONTACT_LINE}\n\n" + DISCLAIMER)
     if update.message:
-        await update.message.reply_text(text, reply_markup=main_keyboard(),
+        await update.message.reply_text(text, reply_markup=main_keyboard(admin=_is_admin(user.id)),
                                         parse_mode="HTML")
     elif update.callback_query:
         await update.callback_query.edit_message_text(
-            text, reply_markup=main_keyboard(), parse_mode="HTML")
+            text, reply_markup=main_keyboard(admin=_is_admin(user.id)), parse_mode="HTML")
 
 
 async def _rerender_fs_picker(query, context, warn=False):
@@ -613,6 +704,32 @@ async def _show_futures_days_question(query, context):
         "shows the 1-day result for now — multi-day voting needs "
         "the 20-day database (Render step).",
         reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+
+
+def _parse_fs_pct(text):
+    """User-typed win-rate % (70-100) for the FUTURES SIGNAL filter.
+    Returns the int, or None when it is not a whole number in range
+    (a trailing % sign is allowed: '80%')."""
+    s = (text or "").strip().rstrip("%").strip()
+    try:
+        n = int(s)
+    except ValueError:
+        return None
+    if 70 <= n <= 100:
+        return n
+    return None
+
+
+def _futures_time_keyboard():
+    return InlineKeyboardMarkup([
+        [_btn("09:00-10:59", "fs_time_09:00-10:59", icon="time"),
+         _btn("00:00-01:59", "fs_time_00:00-01:59", icon="time")],
+        [_btn("Custom Time", "fs_time_custom", icon="custom_time")],
+        [_btn("Back", "menu_main", icon="back")]])
+
+
+def _futures_time_text():
+    return f"{pe('pin')} Choose a time window (UTC+6) — or set your own:"
 
 
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -661,10 +778,15 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif tool == "market":
                 await _run_market(query, assets, context)
         elif spec[0] == "fs":
-            _, assets, days, mode, start, end = spec
+            if len(spec) == 7:
+                _, assets, days, mode, pct, start, end = spec
+            else:  # pre-% specs (cannot survive a restart, defensive)
+                _, assets, days, mode, start, end = spec
+                pct = 70
             context.user_data["fs_asset"] = assets
             context.user_data["fs_days"] = days
             context.user_data["fs_mode"] = mode
+            context.user_data["fs_pct"] = pct
             await _run_futures(query, context, start, end, animate=False)
         elif spec[0] == "botstatus":
             await _run_bot_status(query, context)
@@ -679,7 +801,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{pe('diamond')}{pe('lightning')} Welcome to BLUE FISH PRIME! {pe('fire')}\n"
                 "You joined the Blue Fish trading community — the tools are now unlocked.\n"
                 "Pick a tool below to start.",
-                reply_markup=main_keyboard(), parse_mode="HTML")
+                reply_markup=main_keyboard(admin=_is_admin(user.id)), parse_mode="HTML")
         else:
             await query.edit_message_text(
                 _join_gate_text() + "\n\nStill not a member — join the channel first, "
@@ -732,10 +854,32 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "menu_main":
+        # Back to the menu abandons any half-finished text flow
+        # (%, date, list, ...) and stops the dashboard refresh —
+        # otherwise the next typed message would be read as that
+        # flow's input, or the refresh would overwrite the menu.
+        _cancel_admin_dash(user.id)
+        context.user_data.pop("flow", None)
         await query.edit_message_text(
             f"{pe('diamond')}{pe('lightning')} BLUE FISH PRIME — Trading Terminal {pe('sparkle')}\n"
             f"Pick a tool below. {pe('fire')}",
-            reply_markup=main_keyboard(), parse_mode="HTML")
+            reply_markup=main_keyboard(admin=_is_admin(user.id)), parse_mode="HTML")
+        return
+
+    if data == "menu_admin":
+        # The button is hidden from everyone else, but a crafted
+        # callback could still reach this — check again here.
+        if not _is_admin(user.id):
+            await query.edit_message_text(
+                "Only the owner can open the Admin Dashboard.",
+                reply_markup=back_keyboard(), parse_mode="HTML")
+            return
+        await _run_admin_dashboard(query, context, user.id)
+        return
+
+    if data == "admin_stat_noop":
+        # Display-only stat button: tapping does nothing (the tap
+        # itself was already answered at the top of menu_callback).
         return
 
     if data == "menu_futures":
@@ -869,14 +1013,17 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("fs_days_"):
         context.user_data["fs_days"] = int(data[len("fs_days_"):])
-        context.user_data["flow"] = "futures_time"
-        kb = [[_btn("09:00-10:59", "fs_time_09:00-10:59", icon="time"),
-               _btn("00:00-01:59", "fs_time_00:00-01:59", icon="time")],
-              [_btn("Custom Time", "fs_time_custom", icon="custom_time")],
-              [_btn("Back", "menu_main", icon="back")]]
+        # Next step: the user TYPES the win-rate % (70-100) — the
+        # owner, 2026-11-27. The % replaces the 7-min gap filter.
+        context.user_data["flow"] = "futures_pct"
         await query.edit_message_text(
-            f"{pe('pin')} Choose a time window (UTC+6) — or set your own:",
-            reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+            f"{pe('diamond')} Win rate filter {pe('chart')}\n{DIVIDER}\n\n"
+            "Type the minimum win rate a signal must have — a whole number from 70 to 100.\n\n"
+            "Example: 80 means only signals with 80% win rate or higher are shown.\n"
+            "(With 1 day selected, every signal is 100%, so the filter changes nothing.)",
+            reply_markup=InlineKeyboardMarkup(
+                [[_btn("Back", "menu_main", icon="back")]]),
+            parse_mode="HTML")
         return
 
     if data == "fs_time_custom":
@@ -901,9 +1048,23 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _show_analysis_picker(query, context, "ai")
         return
     if data == "menu_checker":
-        # Ask first: MTG1 results or non-MTG (M1 only)? The choice is
-        # stored and used when the pasted list is checked. The date
-        # comes next (db mode asks for it, other modes use the sample).
+        # First: which checker? OTC / Real / Blackout / Whiteout
+        # (the owner, 2026-11-27). The MTG question comes next.
+        kb = [[_btn("OTC Checker", "checker_mode_OTC", icon="mode_otc"),
+               _btn("Real Market Checker", "checker_mode_REAL", icon="mode_real")],
+              [_btn("Blackout Checker", "checker_mode_BLACKOUT", icon="mode_blackout"),
+               _btn("Whiteout Checker", "checker_mode_WHITEOUT", icon="mode_whiteout")],
+              [_btn("Back", "menu_main", icon="back")]]
+        await query.edit_message_text(
+            f"{pe('search')}{pe('diamond')} Blue Fish Prime Check\n{DIVIDER}\n\n"
+            "Which checker do you want?",
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+        return
+    if data.startswith("checker_mode_"):
+        context.user_data["checker_mode"] = data[len("checker_mode_"):]
+        # Ask: MTG1 results or non-MTG (M1 only)? The choice is
+        # stored and used when the pasted list is checked — exactly
+        # as selected, in every checker mode (the owner, 2026-11-27).
         kb = [[_btn("MTG1", "checker_mtg_1", icon="mtg"),
                _btn("Non-MTG", "checker_mtg_0", icon="nomtg")],
               [_btn("Back", "menu_main", icon="back")]]
@@ -926,7 +1087,8 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["checker_date"] = _yesterday_date_str()
             context.user_data["flow"] = "checker_list"
             await query.edit_message_text(
-                _checker_list_prompt(_yesterday_date_str()),
+                _checker_list_prompt(_yesterday_date_str(),
+                                     context.user_data.get("checker_mode", "OTC")),
                 reply_markup=back_keyboard(), parse_mode="HTML")
         return
     if data == "checker_date_today":
@@ -934,7 +1096,8 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["checker_date"] = today
         context.user_data["flow"] = "checker_list"
         await query.edit_message_text(
-            _checker_list_prompt(today),
+            _checker_list_prompt(today,
+                                 context.user_data.get("checker_mode", "OTC")),
             reply_markup=back_keyboard(), parse_mode="HTML")
         return
     if data == "menu_market":
@@ -1115,6 +1278,70 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
+def _fs_mode_title(mode):
+    """Display title for a futures mode."""
+    return {"OTC FS": "OTC FS", "BLACKOUT FS": "BLACKOUT FS",
+            "WHITEOUT FS": "WHITEOUT FS",
+            "REAL": "REAL MARKET FS"}.get(mode, mode)
+
+
+def _fs_pairs_label(mode):
+    return "Real Market Pairs" if mode == "REAL" else "OTC Pairs"
+
+
+def _futures_template_head(mode, date_dot, pct):
+    """The owner's FUTURE SIGNALS template header (2026-11-27) —
+    premium emojis, no extra lines. The date is the day the signals
+    are FOR (today), in DD.MM.YYYY. The 'Avoid Below' % is the
+    user-typed threshold. The MARTINGALE line is replaced by
+    'MTG 1 STEP' (the owner, 2026-11-27). Where the owner's template
+    has a Unicode emoji with no premium match in the packs, it is
+    dropped, not kept as Unicode (premium-only rule): 🇧🇩 (no premium
+    flag), 🤪 (no zany face), ➕ (no plus sign)."""
+    return (f"{pe('diamond')}{pe('lightning')}• FUTURE SIGNALS — {_fs_mode_title(mode)} {pe('fire')}\n"
+            f"{DIVIDER}\n"
+            f"{pe('sparkle')}{date_dot}{pe('star')}\n"
+            f"{pe('hourglass')}TIMEZONE: UTC/GMT +6:00 [DHAKA, BANGLADESH]\n"
+            f"{pe('warning')}Filtered {_fs_pairs_label(mode)} — Avoid Below {pct}% &amp; Doji Candles\n"
+            f"{pe('red')} MTG 1 STEP\n"
+            f"{pe('next')}1 MINUTES:\n"
+            f" {pe('fire')} BLUE FISH PRIME {pe('fire')}")
+
+
+def _rules_footer(mode):
+    """Bengali 'Rules Of Signal' footer — blackout/whiteout lists
+    only (the owner, 2026-11-27). The owner's 👇 (point down) and
+    🖥 (computer) have no premium match in the packs, so they are
+    dropped, not kept as Unicode (premium-only rule)."""
+    if mode == "BLACKOUT FS":
+        return (f"\n\n{pe('bell')}Rules Of Signal\n"
+                f"আগের কেন্ডেল যেটা হবে তার Opposite Direction এ Entry নিবেন{pe('sparkle')}\n\n"
+                f"{pe('chart')}যেমন :- 14:50 এর ক্যান্ডেল যা হবে 14:51 এ তার বিপরীত DIRECTION এ Entry নিতে হবে {pe('check')}")
+    if mode == "WHITEOUT FS":
+        return (f"\n\n{pe('bell')}Rules Of Signal\n"
+                f"আগের কেন্ডেল যেটা হবে তার Same Direction এ Entry নিবেন{pe('sparkle')}\n\n"
+                f"{pe('chart')}যেমন :- 14:50 এর ক্যান্ডেল যা হবে 14:51 এ তার একই DIRECTION এ Entry নিতে হবে {pe('check')}")
+    return ""
+
+
+def _fit_futures_text(header, lines, footer, limit=3950):
+    """Join header + signal lines + footer, dropping whole lines
+    from the end when the Telegram 4096-char cap would cut a line
+    (or a <code> tag) in half. Dropped lines are counted, never
+    silently lost."""
+    body = header
+    kept = 0
+    for ln in lines:
+        if len(body) + 1 + len(ln) + len(footer) > limit:
+            break
+        body += "\n" + ln
+        kept += 1
+    dropped = len(lines) - kept
+    if dropped:
+        body += f"\n… +{dropped} more (narrow the window or raise the %)"
+    return body + footer
+
+
 async def _compute_futures_text_db(context, start, end):
     """FUTURES SIGNALS from the candle database (Render / db mode).
 
@@ -1122,8 +1349,13 @@ async def _compute_futures_text_db(context, start, end):
     from the DB (backfill + 2-hourly collector). Single asset:
     majority vote over the last N completed days with data.
     SELECT ALL: the same for every asset in the DB for this mode,
-    then the cross-asset filter (win rate + strength, >= 7 min gap
-    between any two kept signals, max 6/hour, max 12 total)."""
+    then the cross-asset filter (win rate + strength, max 6/hour,
+    max 12 total — NO 7-min gap; the owner replaced it with the
+    user-typed % threshold, 2026-11-27). Blackout/whiteout use the
+    T-1 engine (see signal_engine.generate_prev_minute_signals) and
+    print WITHOUT a direction. The result follows the owner's
+    template exactly: no Assets/Dates/Days line, no Time/Source
+    line, no Signals-count line, no disclaimer, no Generated line."""
     asset = context.user_data.get("fs_asset", "USDMXN_otc")
     if isinstance(asset, list) and len(asset) == 1:
         # One picked asset behaves exactly like the old single pick
@@ -1131,25 +1363,34 @@ async def _compute_futures_text_db(context, start, end):
         asset = asset[0]
     days = context.user_data.get("fs_days", 1)
     mode = context.user_data.get("fs_mode", "OTC FS")
+    pct = context.user_data.get("fs_pct", 70)
+    min_wr = pct / 100.0
     db = _db()
     today = _today_date_str()
-    note = ""
+    date_dot = dot_date(today)
+    is_bw = mode in ("BLACKOUT FS", "WHITEOUT FS")
+    bw_mode = {"BLACKOUT FS": "BLACKOUT",
+               "WHITEOUT FS": "WHITEOUT"}.get(mode)
+
+    def _gen(a, dates):
+        if is_bw:
+            return generate_prev_minute_signals_from_db(
+                db, a, dates, start, end, mode=bw_mode, min_win_rate=min_wr)
+        return generate_futures_signals_from_db(
+            db, a, dates, start, end, min_win_rate=min_wr, apply_gap=False)
 
     # Multi-asset selection: a list of assets, or "ALL" for every asset
     # in this mode. Both go through the cross-asset filter (win rate +
-    # strength, >= 7 min gap between any two kept signals, max 6/hour,
-    # max 12 total).
+    # strength, max 6/hour, max 12 total — no gap).
     if isinstance(asset, list) or asset == "ALL":
         if asset == "ALL":
             db_assets = _filter_assets_by_mode(db.get_assets(), mode)
-            label = f"SELECT ALL ({len(db_assets)} assets)"
         else:
             # Only the picked assets, in the user's pick order.
             all_mode = _filter_assets_by_mode(db.get_assets(), mode)
             order = {a: i for i, a in enumerate(asset)}
             db_assets = [a for a in all_mode if a in order]
             db_assets.sort(key=lambda a: order.get(a, 999))
-            label = f"{len(db_assets)} selected"
         if not db_assets:
             return (f"{pe('cross')} No candles for the selected assets in the database yet.\n"
                     "The backfill collects the last 5 days first. "
@@ -1157,54 +1398,45 @@ async def _compute_futures_text_db(context, start, end):
         all_dates = db.get_dates()
         completed = [d for d in all_dates if d < today] or all_dates
         dates = completed[-days:]
-        if len(dates) < days:
-            note = (f"\n\n{pe('info')} You picked {days} days, but the database "
-                    f"has only {len(dates)} day(s) so far — using {len(dates)} day(s).")
         all_signals = []
         for a in db_assets:
-            all_signals.extend(
-                generate_futures_signals_from_db(db, a, dates, start, end))
+            all_signals.extend(_gen(a, dates))
         if not all_signals:
             return (f"{pe('cross')} No signals found after the filter.\n"
-                    f"Dates: {', '.join(dates)} | Time: {start}-{end}\n"
                     "Try another window, or wait for the next collection run.")
-        kept = cross_asset_filter(all_signals)
-        lines = format_signals_list(kept)
-        header = (f"{pe('diamond')}{pe('lightning')} BLUE FISH PRIME • FUTURE SIGNALS — {mode} {pe('fire')}\n{DIVIDER}\n"
-                  f"Assets: {label} | Dates: {dates[0]} to {dates[-1]} | Days: {len(dates)} (database)\n"
-                  f"Time: {start}-{end} | UTC+6 | M1 | Quotex | Source: db\n"
-                  f"{pe('chart')} Signals: {len(lines)} (cross-asset, accuracy-first, min 7-min gap)\n\n")
-        body = "\n".join(lines) if lines else "No signals found after the filter."
-        return (header + body + f"\n\n{DISCLAIMER}" + note)[:4000]
+        kept = cross_asset_filter(all_signals, min_win_rate=min_wr,
+                                  apply_gap=False)
+        lines = [f"<code>{ln}</code>" for ln in
+                 format_signals_list(kept, show_direction=not is_bw)]
+        return _fit_futures_text(
+            _futures_template_head(mode, date_dot, pct), lines,
+            _rules_footer(mode))
 
     dates, _available = available_signal_dates(db, asset, days)
     if not dates:
         return (f"{pe('cross')} No candles for {display_asset(asset)} in the database yet.\n"
                 "The backfill collects the last 5 days first. "
                 "Press Bot Status to see the progress, then try again.")
-    if len(dates) < days:
-        note = (f"\n\n{pe('info')} You picked {days} days, but the database "
-                f"has only {len(dates)} day(s) for this asset — using {len(dates)} day(s).")
-    signals = generate_futures_signals_from_db(db, asset, dates, start, end)
-    lines = format_signals_list(signals)
-    diag_text = ""
+    signals = _gen(asset, dates)
+    lines = [f"<code>{ln}</code>" for ln in
+             format_signals_list(signals, show_direction=not is_bw)]
     if not lines:
-        try:
-            d = diagnose_window(load_days_from_db(db, asset, dates), asset, start, end)
-            diag_text = (f"\n\n{pe('search')} Diagnostics:\n"
-                         f"Candles: {d['total']} | Raw: {d['raw']} | {pe('minus')}: {d['doji']}\n"
-                         f"Median body: {d['median_body']:.5f} | Median range: {d['median_range']:.5f}\n"
-                         f"Median body/range: {d['median_ratio']:.2f} | Price: {d['median_price']:.4f}\n"
-                         f"Too few strong candles in this window, so the filter removed them all. "
-                         f"Try another window (e.g. 00:00-01:59), or wait for the next collection run.")
-        except Exception:
-            pass
-    header = (f"{pe('diamond')}{pe('lightning')} BLUE FISH PRIME • FUTURE SIGNALS — {mode} {pe('fire')}\n{DIVIDER}\n"
-              f"Asset: {display_asset(asset)} | Dates: {dates[0]} to {dates[-1]} | Days: {len(dates)} (database)\n"
-              f"Time: {start}-{end} | UTC+6 | M1 | Quotex | Source: db\n"
-              f"{pe('chart')} Signals: {len(lines)}\n\n")
-    body = "\n".join(lines) if lines else "No signals found after the filter." + diag_text
-    return (header + body + f"\n\n{DISCLAIMER}" + note)[:4000]
+        diag_text = ""
+        if not is_bw:
+            try:
+                d = diagnose_window(load_days_from_db(db, asset, dates), asset, start, end)
+                diag_text = (f"\n\n{pe('search')} Diagnostics:\n"
+                             f"Candles: {d['total']} | Raw: {d['raw']} | {pe('minus')}: {d['doji']}\n"
+                             f"Median body: {d['median_body']:.5f} | Median range: {d['median_range']:.5f}\n"
+                             f"Median body/range: {d['median_ratio']:.2f} | Price: {d['median_price']:.4f}\n"
+                             f"Too few strong candles in this window, so the filter removed them all. "
+                             f"Try another window (e.g. 00:00-01:59), or wait for the next collection run.")
+            except Exception:
+                pass
+        return f"{pe('cross')} No signals found after the filter." + diag_text
+    return _fit_futures_text(
+        _futures_template_head(mode, date_dot, pct), lines,
+        _rules_footer(mode))
 
 
 async def _compute_futures_text(context, start, end):
@@ -1212,7 +1444,10 @@ async def _compute_futures_text(context, start, end):
 
     Returns the full result text. Used by both the callback flow
     (_run_futures, which edits the tapped message) and the text flow
-    (custom time, which edits a 'Working...' message)."""
+    (custom time, which edits a 'Working...' message). The result
+    follows the owner's template exactly (see _futures_template_head):
+    no Assets/Dates/Days line, no Time/Source line, no Signals-count
+    line, no disclaimer, no Generated line."""
     asset = context.user_data.get("fs_asset", "USDMXN_otc")
     if isinstance(asset, list) and len(asset) == 1:
         # One picked asset behaves exactly like the old single pick
@@ -1220,35 +1455,38 @@ async def _compute_futures_text(context, start, end):
         asset = asset[0]
     days = context.user_data.get("fs_days", 1)
     mode = context.user_data.get("fs_mode", "OTC FS")
-    note = ""
+    pct = context.user_data.get("fs_pct", 70)
+    min_wr = pct / 100.0
     eff_date = _effective_date()
+    date_dot = dot_date(_today_date_str())
+    is_bw = mode in ("BLACKOUT FS", "WHITEOUT FS")
+    bw_mode = {"BLACKOUT FS": "BLACKOUT",
+               "WHITEOUT FS": "WHITEOUT"}.get(mode)
     # db mode: everything comes from the candle database (no login).
     if config.DATA_MODE == "db":
         return await _compute_futures_text_db(context, start, end)
+
+    def _gen_one(a, day_cs):
+        if is_bw:
+            return generate_prev_minute_signals(
+                [day_cs], a, start, end, mode=bw_mode, min_win_rate=min_wr)
+        return generate_futures_signals(
+            [day_cs], a, start, end, min_win_rate=min_wr, apply_gap=False)
+
     # SELECT ALL: fetch the open assets for this mode (live), 3-at-a-time,
-    # then the cross-asset filter (win rate + real strength + >= 7 min
-    # gap between ANY two kept signals, max 6/hour, max 12 total).
-    # Without a live login only USDMXN is shown.
+    # then the cross-asset filter (win rate + real strength, max 6/hour,
+    # max 12 total — no gap). Without a live login only USDMXN is shown.
     # A list (multi-asset selection) takes the same path, restricted
     # to the picked assets.
     if asset == "ALL" or isinstance(asset, list):
         if isinstance(asset, list):
             assets = list(asset)
-            label = f"{len(assets)} selected"
         else:
             assets = context.user_data.get("fs_assets") or config.SAMPLE_ASSETS
-            label = f"SELECT ALL ({len(assets)} assets)"
         if config.DATA_MODE != "live" or not config.has_quotex_login():
-            if isinstance(asset, list):
-                note = (f"\n\n{pe('info')} No live Quotex login here, so this shows only "
-                        f"{display_asset(assets[0])}. Full multi-asset needs "
-                        "the Render database (db mode).")
-                asset = assets[0]
-            else:
-                note = (f"\n\n{pe('info')} No live Quotex login here, so SELECT ALL "
-                        "shows only USDMXN. Full cross-asset SELECT ALL needs "
-                        "the Render database (db mode).")
-                asset = "USDMXN_otc"
+            # No live login: fall through to the single-asset path
+            # with the first picked asset.
+            asset = assets[0] if isinstance(asset, list) else "USDMXN_otc"
         else:
             all_signals = []
             failed = []
@@ -1267,7 +1505,7 @@ async def _compute_futures_text(context, start, end):
                 # Real strength (body/range) is set inside
                 # generate_futures_signals — do NOT overwrite it with
                 # win_rate (for 1-day signals win_rate is always 1.0).
-                return generate_futures_signals([day_cs], a, start, end)
+                return _gen_one(a, day_cs)
             try:
                 results = await quotex_client.fetch_batch_3_at_a_time_async(assets, _one)
             except quotex_client.QuotexRateLimited as exc:
@@ -1278,60 +1516,55 @@ async def _compute_futures_text(context, start, end):
                 detail = "; ".join(html.escape(str(f)) for f in failed[:3]) if failed else "No reason reported"
                 return (f"{pe('cross')} No data found for any asset.\n{detail}\n"
                         "Check the Quotex login / 429 and try again.")
-            kept = cross_asset_filter(all_signals)
-            lines = format_signals_list(kept)
-            header = (f"{pe('diamond')}{pe('lightning')} BLUE FISH PRIME • FUTURE SIGNALS — {mode} {pe('fire')}\n{DIVIDER}\n"
-                      f"Assets: {label} | Date: {eff_date} | Days: 1 (live)\n"
-                      f"Time: {start}-{end} | UTC+6 | M1 | Quotex | Source: live\n"
-                      f"{pe('chart')} Signals: {len(lines)} (cross-asset, accuracy-first, min 7-min gap)\n\n")
-            body = "\n".join(lines) if lines else "No signals found after the filter."
-            text = header + body + f"\n\n{DISCLAIMER}"
-            return text[:4000]
+            kept = cross_asset_filter(all_signals, min_win_rate=min_wr,
+                                      apply_gap=False)
+            lines = [f"<code>{ln}</code>" for ln in
+                     format_signals_list(kept, show_direction=not is_bw)]
+            return _fit_futures_text(
+                _futures_template_head(mode, date_dot, pct), lines,
+                _rules_footer(mode))
     candles, source = await get_candles_for(asset, eff_date)
     if candles is None:
         return (f"{pe('cross')} No data found: {html.escape(str(source))}\n"
                 "Check the Quotex login in live mode, or put yesterday's JSON file "
                 "for this asset in the data/ folder with collect_yesterday.py.\n"
                 "If it says 'login failed', check the email/password in .env.")
-    if days > 1:
-        note += (f"\n\n{pe('info')} You picked {days} days, but local test has only 1 day of "
-                 "data, so this is the 1-day result. "
-                 "Multi-day voting (2-0 / 3-0 / 2-1) needs the 20-day database in the Render step.")
     # Filter candles to the requested date + window for the engine input.
     day_candles = [c for c in candles
                    if c.get("datetime", "").startswith(eff_date)]
-    signals = generate_futures_signals([day_candles], asset, start, end)
-    lines = format_signals_list(signals)
+    signals = _gen_one(asset, day_candles)
+    lines = [f"<code>{ln}</code>" for ln in
+             format_signals_list(signals, show_direction=not is_bw)]
     # If still 0, show diagnostics so the user can see WHY (not just "0").
-    diag_text = ""
     if not lines:
-        try:
-            d = diagnose_window([day_candles], asset, start, end)
-            diag_text = (f"\n\n{pe('search')} Diagnostics:\n"
-                         f"Candles: {d['total']} | Raw: {d['raw']} | {pe('minus')}: {d['doji']}\n"
-                         f"Median body: {d['median_body']:.5f} | Median range: {d['median_range']:.5f}\n"
-                         f"Median body/range: {d['median_ratio']:.2f} | Price: {d['median_price']:.4f}\n"
-                         f"Too few strong candles in this window, so the filter removed them all. "
-                         f"Try another window (e.g. 00:00-01:59), or send "
-                         f"data/candles_{asset}_{eff_date}.json so I can check it.")
-        except Exception:
-            pass
-    header = (f"{pe('diamond')}{pe('lightning')} BLUE FISH PRIME • FUTURE SIGNALS — {mode} {pe('fire')}\n{DIVIDER}\n"
-              f"Asset: {display_asset(asset)} | Date: {eff_date} | Days: 1 (local)\n"
-              f"Time: {start}-{end} | UTC+6 | M1 | Quotex | Source: {source}\n"
-              f"{pe('chart')} Signals: {len(lines)}\n\n")
-    body = "\n".join(lines) if lines else "No signals found after the filter." + diag_text
-    text = header + body + f"\n\n{DISCLAIMER}" + note
-    return text[:4000]
+        diag_text = ""
+        if not is_bw:
+            try:
+                d = diagnose_window([day_candles], asset, start, end)
+                diag_text = (f"\n\n{pe('search')} Diagnostics:\n"
+                             f"Candles: {d['total']} | Raw: {d['raw']} | {pe('minus')}: {d['doji']}\n"
+                             f"Median body: {d['median_body']:.5f} | Median range: {d['median_range']:.5f}\n"
+                             f"Median body/range: {d['median_ratio']:.2f} | Price: {d['median_price']:.4f}\n"
+                             f"Too few strong candles in this window, so the filter removed them all. "
+                             f"Try another window (e.g. 00:00-01:59), or send "
+                             f"data/candles_{asset}_{eff_date}.json so I can check it.")
+            except Exception:
+                pass
+        return f"{pe('cross')} No signals found after the filter." + diag_text
+    return _fit_futures_text(
+        _futures_template_head(mode, date_dot, pct), lines,
+        _rules_footer(mode))
 
 
 async def _run_futures(query, context, start, end, animate=True):
     """Callback flow: animated progress, then the final result.
-    The result carries its build time (Generated: HH:MM:SS Dhaka) and
-    a Refresh button that re-runs exactly this selection."""
+    The result follows the owner's template exactly (no Generated
+    line — removed 2026-11-27); a Refresh button re-runs exactly
+    this selection."""
     asset = context.user_data.get("fs_asset", "USDMXN_otc")
     days = context.user_data.get("fs_days", 1)
     mode = context.user_data.get("fs_mode", "OTC FS")
+    pct = context.user_data.get("fs_pct", 70)
     label = _fs_asset_label(asset)
     step1 = ("Reading database..." if config.DATA_MODE == "db"
              else "Connecting to Quotex...")
@@ -1352,10 +1585,10 @@ async def _run_futures(query, context, start, end, animate=True):
         except Exception:
             pass  # progress edits are cosmetic; never block the result
     text = await _compute_futures_text(context, start, end)
-    text = text + f"\n\n{_generated_line()}"
     await query.edit_message_text(text, reply_markup=_refresh_keyboard(),
                                   parse_mode=_html_mode(text))
-    _store_result_spec(context, query, ("fs", asset, days, mode, start, end))
+    _store_result_spec(context, query,
+                       ("fs", asset, days, mode, pct, start, end))
 
 
 async def _run_market(query, assets=None, context=None):
@@ -1743,7 +1976,7 @@ async def _run_backtest(query):
         return
     lookup = build_lookup(db.get_candles(asset, yesterday), asset)
     results, summary = check_signals(lines, lookup, yesterday, with_mtg1=False)
-    text = format_check_results(results, summary)
+    text = format_check_results(results, summary, header=False)
     await query.edit_message_text(
         f"{pe('chart')}{pe('diamond')} BACKTEST LAB — {display_asset(asset)} {yesterday} 09:00-10:59\n"
         f"Signals built from {', '.join(train)} (majority vote), checked against {yesterday}.\n"
@@ -1751,11 +1984,22 @@ async def _run_backtest(query):
         reply_markup=back_keyboard(), parse_mode="HTML")
 
 
-def _checker_list_prompt(date_str):
-    """Prompt text for pasting the signal list (after MTG + date)."""
-    return (f"{pe('search')}{pe('diamond')} Blue Fish Prime Check — Date: {date_str}\n{DIVIDER}\n\n"
-            "Paste your signal list, e.g.:\n"
-            "USDMXN-OTC,09:02 M1 CALL\nUSDMXN-OTC,09:11 M1 CALL")
+def _checker_list_prompt(date_str, mode="OTC"):
+    """Prompt text for pasting the signal list (after mode + MTG +
+    date). Blackout/whiteout lines carry no direction — the example
+    shows that, and the hint says the checker reads the previous
+    minute's candle for the direction."""
+    mode_name = {"OTC": "OTC", "REAL": "Real Market",
+                 "BLACKOUT": "Blackout", "WHITEOUT": "Whiteout"}.get(mode, "OTC")
+    if mode in ("BLACKOUT", "WHITEOUT"):
+        example = "USDARS-OTC,09:07 M1\nUSDARS-OTC,09:11 M1"
+        hint = ("\nNo CALL/PUT needed — the checker reads the previous "
+                "minute's candle for the direction.")
+    else:
+        example = "USDMXN-OTC,09:02 M1 CALL\nUSDMXN-OTC,09:11 M1 CALL"
+        hint = ""
+    return (f"{pe('search')}{pe('diamond')} Blue Fish Prime Check — {mode_name} — Date: {date_str}\n{DIVIDER}\n\n"
+            "Paste your signal list, e.g.:\n" + example + hint)
 
 
 def _checker_date_prompt():
@@ -1796,6 +2040,26 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             _join_gate_text(), reply_markup=_join_keyboard(), parse_mode="HTML")
         return
+    # Every text message counts as activity for the Admin Dashboard's
+    # 'Online' count (last_seen is touched inside get_or_create_user).
+    database.get_or_create_user(user.id, user.username or "")
+
+    if flow == "futures_pct":
+        # The user typed the win-rate % (70-100) for the FUTURES
+        # SIGNAL filter. Invalid input asks again, keeping the flow.
+        pct = _parse_fs_pct(text)
+        if pct is None:
+            await update.message.reply_text(
+                f"{pe('warning')} That is not a win rate from 70 to 100. "
+                "Send a whole number like 80.",
+                reply_markup=back_keyboard(), parse_mode="HTML")
+            return  # keep the flow so the user can retry
+        context.user_data["fs_pct"] = pct
+        context.user_data["flow"] = "futures_time"
+        await update.message.reply_text(
+            _futures_time_text(),
+            reply_markup=_futures_time_keyboard(), parse_mode="HTML")
+        return
 
     if flow == "futures_custom_time":
         parsed = parse_custom_time(text)
@@ -1825,13 +2089,13 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         result = await _compute_futures_text(context, start, end)
-        result = result + f"\n\n{_generated_line()}"
         await working.edit_text(result, reply_markup=_refresh_keyboard(),
                                 parse_mode=_html_mode(result))
         _store_result_spec(context, working.message_id,
                            ("fs", context.user_data.get("fs_asset", "USDMXN_otc"),
                             context.user_data.get("fs_days", 1),
                             context.user_data.get("fs_mode", "OTC FS"),
+                            context.user_data.get("fs_pct", 70),
                             start, end))
         return
 
@@ -1861,7 +2125,8 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["checker_date"] = date_str
         context.user_data["flow"] = "checker_list"
         await update.message.reply_text(
-            _checker_list_prompt(date_str),
+            _checker_list_prompt(date_str,
+                                 context.user_data.get("checker_mode", "OTC")),
             reply_markup=back_keyboard(), parse_mode="HTML")
         return
 
@@ -1875,12 +2140,12 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines = [x for x in text.splitlines() if x.strip()]
         check_date = context.user_data.get("checker_date") or _today_date_str()
         with_mtg1 = context.user_data.get("checker_mtg1", False)
+        mode = context.user_data.get("checker_mode", "OTC")
         lookup = await _build_checker_lookup(lines, check_date)
         results, summary = check_signals(lines, lookup, check_date,
-                                         with_mtg1=with_mtg1)
+                                         with_mtg1=with_mtg1, mode=mode)
         await working.edit_text(
-            f"{pe('search')}{pe('diamond')} Check Results — {check_date}:\n{DIVIDER}\n\n"
-            + format_check_results(results, summary),
+            format_check_results(results, summary, date_str=check_date),
             reply_markup=back_keyboard(), parse_mode="HTML")
         context.user_data["flow"] = None
         return
@@ -1961,4 +2226,4 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # No active flow: show menu.
     await update.message.reply_text(
         f"Tap a button in the menu. {pe('diamond')}",
-        reply_markup=main_keyboard(), parse_mode="HTML")
+        reply_markup=main_keyboard(admin=_is_admin(user.id)), parse_mode="HTML")

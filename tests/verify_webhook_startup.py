@@ -93,7 +93,14 @@ from bot import collector as collector_mod  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from synthetic_data import make_day, to_raw  # noqa: E402
 
-SAMPLE = to_raw(make_day("USDMXN_otc", "2026-11-21", seed=8))
+# Sample day = YESTERDAY, always inside the 5-day backfill window.
+# (A fixed date drifts out of the window as days pass — that is why
+# this test failed on 2026-11-27 with the old 2026-11-21 sample:
+# the backfill filtered every candle out as too old.)
+from datetime import date as _date, timedelta as _tdelta  # noqa: E402
+
+SAMPLE_DATE = (_date.today() - _tdelta(days=1)).isoformat()
+SAMPLE = to_raw(make_day("USDMXN_otc", SAMPLE_DATE, seed=8))
 
 
 class FakeSession:

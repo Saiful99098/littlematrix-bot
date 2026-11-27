@@ -85,6 +85,10 @@ PREMIUM_EMOJI = {
     "info": ("5334544901428229844", "ℹ️"),
     # ➖ minus — marketment (CHECKER DOJI symbol)
     "minus": ("5789644639749281149", "➖"),
+    # ➡️ next arrow — same REAL ID as the "Next" button icon below
+    # (QUOTEX_VIP_SIGNAL1_by_TgEmodziBot). Used for the "1 MINUTES:"
+    # line in the futures/checker templates (the owner's 🔜).
+    "next": ("6336820492552377728", "➡️"),
     # ❓ question — ZEROX_660_by_TgEmodziBot — RETIRED, DO NOT USE:
     # renders as a gold "WIN?" sticker, misleading as CHECKER NO DATA.
     # Checker uses plain "?" instead (see bot/checker.py).
@@ -202,4 +206,10 @@ BUTTON_ICONS = {
     "check": "6267008582294705964",
     # 💰 payout buttons — same ID as pe("money")
     "money": "6267068789146260253",
+    # 👑 Admin Dashboard — same ID as pe("crown")
+    "admin": "6266995104687330978",
+    # ℹ️ info — same ID as pe("info") / the About button icon
+    "info": "5334544901428229844",
+    # 🟢 green circle — same ID as pe("green") / the Bot Status icon
+    "green": "5416081784641168838",
 }

@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS users (
     username TEXT,
     premium_until TEXT,
     auto_signals INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT
+    created_at TEXT,
+    last_seen TEXT
 );
 CREATE TABLE IF NOT EXISTS premium_requests (
     id SERIAL PRIMARY KEY,
@@ -46,7 +47,8 @@ CREATE TABLE IF NOT EXISTS users (
     username TEXT,
     premium_until TEXT,
     auto_signals INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT
+    created_at TEXT,
+    last_seen TEXT
 );
 CREATE TABLE IF NOT EXISTS premium_requests (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,6 +67,28 @@ def _backend():
 _CONN = None
 
 
+def _ensure_last_seen_column():
+    """Add the last_seen column to a users table created before it
+    existed (Render's Postgres already has the table). Postgres
+    supports ADD COLUMN IF NOT EXISTS; SQLite raises
+    'duplicate column name' when it already exists — both are fine."""
+    try:
+        if _backend() == "postgres":
+            _execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen TEXT")
+        else:
+            try:
+                _execute("ALTER TABLE users ADD COLUMN last_seen TEXT")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc):
+                    raise
+    except Exception:
+        # A users table that cannot be migrated must never break the
+        # bot — the dashboard simply reports what it can.
+        import logging
+        logging.getLogger("littlematrix.database").warning(
+            "last_seen column migration failed", exc_info=True)
+
+
 def _connect():
     global _CONN
     if _CONN is not None:
@@ -81,6 +105,7 @@ def _connect():
         _CONN.execute("PRAGMA journal_mode=WAL")
         _CONN.executescript(SCHEMA_USERS_SQLITE)
         _CONN.commit()
+    _ensure_last_seen_column()
     return _CONN
 
 
@@ -112,6 +137,18 @@ def connect():
     return _connect()
 
 
+def touch_last_seen(telegram_id):
+    """Mark a user as active right now. Called on every interaction
+    (via get_or_create_user) — the Admin Dashboard's 'Online' count
+    is users whose last_seen is within the last 10 minutes."""
+    try:
+        now = datetime.now().isoformat(timespec="seconds")
+        _execute("UPDATE users SET last_seen=? WHERE telegram_id=?",
+                 (now, telegram_id))
+    except Exception:
+        pass  # activity tracking must never break the bot
+
+
 def get_or_create_user(telegram_id, username=""):
     row = _execute(
         "SELECT telegram_id, username, premium_until, auto_signals "
@@ -119,12 +156,46 @@ def get_or_create_user(telegram_id, username=""):
     if row is None:
         now = datetime.now().isoformat(timespec="seconds")
         _execute(
-            "INSERT INTO users (telegram_id, username, premium_until, auto_signals, created_at) "
-            "VALUES (?, ?, NULL, 0, ?)", (telegram_id, username, now))
+            "INSERT INTO users (telegram_id, username, premium_until, auto_signals, created_at, last_seen) "
+            "VALUES (?, ?, NULL, 0, ?, ?)", (telegram_id, username, now, now))
         return {"telegram_id": telegram_id, "username": username,
                 "premium_until": None, "auto_signals": False}
+    touch_last_seen(telegram_id)
     return {"telegram_id": row[0], "username": row[1],
             "premium_until": row[2], "auto_signals": bool(row[3])}
+
+
+def get_user_stats():
+    """{total, premium, free, online} for the Admin Dashboard.
+
+    premium: premium_until in the future. free: total - premium.
+    online: last_seen within the last 10 minutes — Telegram gives
+    no presence, so 'online' means 'used the bot recently'
+    (the owner, 2026-11-27)."""
+    now = datetime.now()
+    try:
+        rows = _execute(
+            "SELECT premium_until, last_seen FROM users").fetchall()
+    except Exception:
+        return {"total": 0, "premium": 0, "free": 0, "online": 0}
+    total = len(rows)
+    premium = 0
+    online = 0
+    for until, last_seen in rows:
+        if until:
+            try:
+                if datetime.fromisoformat(until) > now:
+                    premium += 1
+            except ValueError:
+                pass
+        if last_seen:
+            try:
+                if (now - datetime.fromisoformat(last_seen)).total_seconds() <= 600:
+                    online += 1
+            except ValueError:
+                pass
+    return {"total": total, "premium": premium,
+            "free": total - premium, "online": online}
 
 
 def is_premium(telegram_id):

@@ -10,7 +10,9 @@ b) Futures picker: the same toggle + SELECT ALL + Next flow; a list
    of assets goes through the cross-asset filter like SELECT ALL.
 c) Time mechanism: every result carries "Generated: HH:MM:SS
    (Dhaka)" and a Refresh button that re-runs exactly the result
-   shown in that message (stored under its message id).
+   shown in that message (stored under its message id) — except
+   FUTURE SIGNALS, whose template (the owner, 2026-11-27) has no
+   Generated line; its Refresh button stays.
 """
 from __future__ import annotations
 
@@ -115,6 +117,37 @@ class FakeContext:
         self.bot = FakeBot()
 
 
+class FakeWorkingMessage:
+    """The 'Working...' message text_message edits in place."""
+    def __init__(self):
+        self.texts = []
+        self.markups = []
+
+    async def edit_text(self, text, reply_markup=None, parse_mode=None):
+        self.texts.append(text)
+        self.markups.append(reply_markup)
+        return None
+
+
+class FakeTextMessage:
+    def __init__(self, text):
+        self.text = text
+        self.texts = []  # reply_text calls on this message
+        self.markups = []
+        self.working = FakeWorkingMessage()
+
+    async def reply_text(self, text, reply_markup=None, parse_mode=None):
+        self.texts.append(text)
+        self.markups.append(reply_markup)
+        return self.working
+
+
+class FakeTextUpdate:
+    def __init__(self, text):
+        self.message = FakeTextMessage(text)
+        self.effective_user = FakeUser()
+
+
 def _drive(ctx, query, data):
     """Send one callback tap through menu_callback on the same
     message (same message_id) and return the query."""
@@ -122,6 +155,15 @@ def _drive(ctx, query, data):
     query.data = data
     asyncio.run(handlers.menu_callback(FakeUpdate(query), ctx))
     return query
+
+
+def _send_text(ctx, text):
+    """Send one typed message through text_message and return the
+    (fake) update, so the reply / edited texts can be asserted."""
+    import bot.handlers as handlers
+    upd = FakeTextUpdate(text)
+    asyncio.run(handlers.text_message(upd, ctx))
+    return upd
 
 
 def _last_buttons(query):
@@ -228,23 +270,33 @@ def test_futures_multiselect():
         assert _button(q, "fs_asset_BTCUSD_otc").icon_custom_emoji_id == CHECK_ICON
         _drive(ctx, q, "fs_asset_ETHUSD_otc")
         assert "Selected: 2" in q.texts[-1], q.texts[-1]
-        # Next -> days -> time -> result for the 2 selected assets.
+        # Next -> days -> % (typed) -> time -> result for the 2 assets.
         _drive(ctx, q, "fs_next")
         assert "How many days of history" in q.texts[-1], q.texts[-1]
         _drive(ctx, q, "fs_days_1")
-        assert "Choose a time window" in q.texts[-1], q.texts[-1]
+        assert "Win rate filter" in q.texts[-1], q.texts[-1]
+        upd = _send_text(ctx, "80")
+        assert "Choose a time window" in upd.message.texts[-1], upd.message.texts
         _drive(ctx, q, "fs_time_09:00-10:59")
         result = q.texts[-1]
         assert "FUTURE SIGNALS" in result, result
-        assert "2 selected" in result, result
-        assert "Generated:" in result, result
+        assert "FUTURE SIGNALS — OTC FS" in result, result
+        assert "MTG 1 STEP" in result, result
+        # The owner's template: no Assets/Dates/Days line, no
+        # Time/Source line, no Signals-count line, no disclaimer,
+        # no Generated line — and the Refresh button stays.
+        assert "Generated:" not in result, result
+        assert "2 selected" not in result, result
+        assert "Assets:" not in result, result
+        assert "No signal guarantees profit" not in result, result
         assert _button(q, "refresh") is not None, result
         sig_lines = [ln for ln in result.splitlines()
-                     if ln.startswith(("BTCUSD-OTC,", "ETHUSD-OTC,"))]
+                     if "<code>BTCUSD-OTC," in ln or "<code>ETHUSD-OTC," in ln]
         assert sig_lines, result
     finally:
         restore()
-    print("PASS c) futures picker: toggle + Next -> 2 selected, signals + Generated")
+    print("PASS c) futures picker: toggle + Next -> days -> typed % -> "
+          "time -> template result (no Generated/Assets lines), Refresh stays")
 
 
 def test_futures_list_matches_single_asset():
@@ -258,20 +310,20 @@ def test_futures_list_matches_single_asset():
     try:
         class Ctx:
             user_data = {"fs_asset": "BTCUSD_otc", "fs_days": 1,
-                         "fs_mode": "OTC FS"}
+                         "fs_mode": "OTC FS", "fs_pct": 70}
 
         single = asyncio.run(handlers._compute_futures_text(Ctx(), "09:00", "10:59"))
         single_lines = sorted(ln for ln in single.splitlines()
-                              if ln.startswith("BTCUSD-OTC,"))
+                              if "<code>BTCUSD-OTC," in ln)
         assert single_lines, single
         Ctx.user_data = {"fs_asset": ["BTCUSD_otc"], "fs_days": 1,
-                         "fs_mode": "OTC FS"}
+                         "fs_mode": "OTC FS", "fs_pct": 70}
         listed = asyncio.run(handlers._compute_futures_text(Ctx(), "09:00", "10:59"))
-        # A 1-element list behaves like the single pick: same header,
-        # same (unfiltered) signal lines.
-        assert "Asset: BTCUSD-OTC" in listed, listed
+        # A 1-element list behaves like the single pick: same template
+        # header, same (unfiltered) signal lines.
+        assert "FUTURE SIGNALS — OTC FS" in listed, listed
         listed_lines = sorted(ln for ln in listed.splitlines()
-                              if ln.startswith("BTCUSD-OTC,"))
+                              if "<code>BTCUSD-OTC," in ln)
         assert listed_lines == single_lines, (listed_lines, single_lines)
     finally:
         restore()

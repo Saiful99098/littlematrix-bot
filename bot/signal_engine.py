@@ -24,6 +24,15 @@ Decisions agreed with the owner (see blueprint.md):
   win rate first, then real strength (body/range). A kept signal
   must be >= 7 minutes from every other kept signal (any asset),
   max 6/hour, max 12 per 2h, below 70% dropped in cross-asset mode.
+  (2026-11-27: the FUTURES SIGNAL menu no longer applies the 7-min
+  gap — per-asset or cross-asset — and instead filters by a
+  user-typed win-rate % (70-100). Auto Live Signal keeps the gap.)
+- BLACKOUT / WHITEOUT (2026-11-27): signal(T) comes from the T-1
+  minute's candle on each selected day — BLACKOUT flips it, WHITEOUT
+  keeps it — majority vote across days. The printed line carries NO
+  direction ("USDMXN-OTC,09:02 M1"); the trader decides it live
+  from the T-1 candle. T=00:00 never produces a signal (its T-1
+  belongs to the previous day).
 - The personal filter (Aston/Newexe) is NOT here. See filters.py.
 """
 from __future__ import annotations
@@ -255,13 +264,17 @@ def rsi(closes, period=14):
 
 def generate_futures_signals(days_data, asset, start="00:00", end="23:59",
                               min_win_rate=MIN_WIN_RATE,
-                              apply_trend=False):
+                              apply_trend=False, apply_gap=True):
     """Build FUTURES signals from N days of candles.
 
     days_data: list of lists of candles (raw dicts, one list per day).
     Each list must already be for one date; candles carry 'datetime'.
     Returns list of signal dicts sorted by hhmm:
     {asset, hhmm, direction, win_rate, calls, puts, days}
+    apply_gap: the >= 7 min per-asset gap filter. True keeps the
+    original behaviour (verified sample + Auto Live Signal); the
+    FUTURES SIGNAL menu passes False — the owner (2026-11-27)
+    replaced the gap with a user-typed win-rate % threshold there.
     """
     n_days = len(days_data)
     # Group directions + representative candle (last day) by HH:MM.
@@ -300,45 +313,7 @@ def generate_futures_signals(days_data, asset, start="00:00", end="23:59",
             "_candle": slot["candle"],
         })
 
-    # Strength filter (per-asset) — strict first (preserves the verified
-    # USDMXN 118 -> 13 result). If strict gives 0 but raw signals exist,
-    # relax step by step so other assets (different price scale, e.g.
-    # USDPKR ~280, EURUSD ~1.08) do not return 0 signals:
-    # 1) adaptive body (price-scaled) + ratio 0.5
-    # 2) ratio 0.4 only, no body threshold
-    # 3) ratio 0.3 only, no body threshold
-    # 4) strongest by body/range with gap, up to 10 signals
-    strict = [s for s in signals if is_strong(s["_candle"])]
-    if strict:
-        signals = strict
-    else:
-        adaptive = [s for s in signals if is_strong_adaptive(s["_candle"])]
-        if adaptive:
-            signals = adaptive
-        else:
-            def _ratio_only(min_ratio):
-                out = []
-                for s in signals:
-                    c = s["_candle"]
-                    rng = c["high"] - c["low"]
-                    if rng > 0 and abs(c["close"] - c["open"]) / rng >= min_ratio:
-                        out.append(s)
-                return out
-            relaxed = _ratio_only(0.4)
-            if relaxed:
-                signals = relaxed
-            else:
-                relaxed = _ratio_only(0.3)
-                if relaxed:
-                    signals = relaxed
-                else:
-                    # Last resort: strongest by ratio, gap-filtered.
-                    def _ratio(c):
-                        rng = c["high"] - c["low"]
-                        if rng <= 0:
-                            return 0.0
-                        return abs(c["close"] - c["open"]) / rng
-                    signals = sorted(signals, key=lambda s: -_ratio(s["_candle"]))
+    signals = _apply_strength_cascade(signals)
 
     # Optional strict trend filter (off by default, see docstring).
     if apply_trend:
@@ -363,13 +338,62 @@ def generate_futures_signals(days_data, asset, start="00:00", end="23:59",
                 kept.append(s)
         signals = kept
 
-    # Gap filter (>= 7 min per asset).
-    signals = apply_gap_filter(signals, MIN_GAP_MINUTES)
+    # Gap filter (>= 7 min per asset) — only when apply_gap is True.
+    if apply_gap:
+        signals = apply_gap_filter(signals, MIN_GAP_MINUTES)
 
-    # Real strength: body/range ratio of the representative candle
-    # (0.0-1.0). Used by the cross-asset filter for ranking.
-    # (Do NOT use win_rate as strength: for 1-day signals win_rate is
-    # always 1.0, so it ranks nothing.)
+    return _annotate_strength(signals)
+
+
+def _apply_strength_cascade(signals):
+    """Strength filter (per-asset) — strict first (preserves the verified
+    USDMXN 118 -> 13 result). If strict gives 0 but raw signals exist,
+    relax step by step so other assets (different price scale, e.g.
+    USDPKR ~280, EURUSD ~1.08) do not return 0 signals:
+    1) adaptive body (price-scaled) + ratio 0.5
+    2) ratio 0.4 only, no body threshold
+    3) ratio 0.3 only, no body threshold
+    4) strongest by body/range with gap, up to 10 signals
+    Shared by generate_futures_signals() and the blackout/whiteout
+    generator — both filter on the representative candle's strength.
+    Signals keep their "_candle" key here; _annotate_strength() pops it.
+    """
+    strict = [s for s in signals if is_strong(s["_candle"])]
+    if strict:
+        return strict
+    adaptive = [s for s in signals if is_strong_adaptive(s["_candle"])]
+    if adaptive:
+        return adaptive
+
+    def _ratio_only(min_ratio):
+        out = []
+        for s in signals:
+            c = s["_candle"]
+            rng = c["high"] - c["low"]
+            if rng > 0 and abs(c["close"] - c["open"]) / rng >= min_ratio:
+                out.append(s)
+        return out
+    relaxed = _ratio_only(0.4)
+    if relaxed:
+        return relaxed
+    relaxed = _ratio_only(0.3)
+    if relaxed:
+        return relaxed
+    # Last resort: strongest by ratio (the gap filter, when applied
+    # by the caller, re-sorts by hhmm afterwards).
+    def _ratio(c):
+        rng = c["high"] - c["low"]
+        if rng <= 0:
+            return 0.0
+        return abs(c["close"] - c["open"]) / rng
+    return sorted(signals, key=lambda s: -_ratio(s["_candle"]))
+
+
+def _annotate_strength(signals):
+    """Set real strength (body/range ratio of the representative
+    candle, 0.0-1.0) and drop the internal "_candle" key.
+    (Do NOT use win_rate as strength: for 1-day signals win_rate is
+    always 1.0, so it ranks nothing.)"""
     for s in signals:
         c = s.get("_candle")
         if c:
@@ -379,6 +403,94 @@ def generate_futures_signals(days_data, asset, start="00:00", end="23:59",
             s["strength"] = 0.0
         s.pop("_candle", None)
     return signals
+
+
+def _prev_hhmm(hhmm):
+    """One minute earlier, or None for 00:00 (its previous minute
+    belongs to the previous day, which is not in the selected days)."""
+    h, m = map(int, hhmm.split(":"))
+    if h == 0 and m == 0:
+        return None
+    m -= 1
+    if m < 0:
+        h -= 1
+        m = 59
+    return f"{h:02d}:{m:02d}"
+
+
+def generate_prev_minute_signals(days_data, asset, start="00:00",
+                                 end="23:59", mode="BLACKOUT",
+                                 min_win_rate=MIN_WIN_RATE):
+    """BLACKOUT / WHITEOUT signals from N days of candles.
+
+    For a signal at time T, look at the T-1 minute's candle on each
+    selected day D (the owner, 2026-11-27):
+    - BLACKOUT: signal(T) = OPPOSITE of candle(T-1) direction.
+    - WHITEOUT: signal(T) = SAME direction as candle(T-1).
+    Majority vote across days decides signal(T); a DOJI or missing
+    T-1 candle skips that day's vote. T=00:00 has no T-1 inside the
+    selected days, so it never produces a signal.
+    The returned direction is the voted direction (used for the
+    win-rate / % filter); the bot prints these signals WITHOUT a
+    direction — the trader decides it live from the T-1 candle.
+    No gap filter here (the owner removed it from the FUTURES
+    SIGNAL generators, 2026-11-27); the strength cascade and the
+    win-rate filter are the same as generate_futures_signals().
+    Returns list of signal dicts sorted by hhmm.
+    """
+    n_days = len(days_data)
+    mode = (mode or "BLACKOUT").upper()
+    if mode not in ("BLACKOUT", "WHITEOUT"):
+        raise ValueError(f"unknown prev-minute mode: {mode!r}")
+    # Per-day lookup: hhmm -> normalized candle.
+    by_day = []
+    for day in days_data:
+        lookup = {}
+        for raw in day:
+            c = normalize_candle(raw)
+            if c["hhmm"]:
+                lookup[c["hhmm"]] = c
+        by_day.append(lookup)
+
+    signals = []
+    start_m = hhmm_to_minutes(start)
+    end_m = hhmm_to_minutes(end)
+    for mins in range(start_m, end_m + 1):
+        hhmm = f"{mins // 60:02d}:{mins % 60:02d}"
+        prev = _prev_hhmm(hhmm)
+        if prev is None:
+            continue
+        votes = []
+        rep = None
+        for lookup in by_day:
+            c = lookup.get(prev)
+            if c is None:
+                continue
+            d = candle_direction(c)
+            if d == "DOJI":
+                continue
+            if mode == "BLACKOUT":
+                d = "PUT" if d == "CALL" else "CALL"
+            votes.append(d)
+            rep = c  # representative candle = last day's T-1 candle
+        direction, win_rate, calls, puts = majority_vote(votes)
+        if direction is None:
+            continue  # tie or only DOJI/missing T-1
+        if n_days >= 2 and win_rate < min_win_rate:
+            continue
+        signals.append({
+            "asset": asset,
+            "hhmm": hhmm,
+            "direction": direction,
+            "win_rate": win_rate,
+            "calls": calls,
+            "puts": puts,
+            "days": n_days,
+            "_candle": rep,
+        })
+
+    signals = _apply_strength_cascade(signals)
+    return _annotate_strength(signals)
 
 
 def display_asset(asset):
@@ -398,16 +510,23 @@ def display_asset(asset):
     return a
 
 
-def format_signal(asset, hhmm, direction):
-    return f"{display_asset(asset)},{hhmm} M1 {direction}"
+def format_signal(asset, hhmm, direction=None):
+    """One signal line. Blackout/whiteout lines carry NO direction
+    (the owner, 2026-11-27): "USDMXN-OTC,09:02 M1". Pass
+    direction=None for those; OTC/real lines keep CALL/PUT."""
+    if direction:
+        return f"{display_asset(asset)},{hhmm} M1 {direction}"
+    return f"{display_asset(asset)},{hhmm} M1"
 
 
-def format_signals_list(signals, asset=None):
-    return [format_signal(s["asset"], s["hhmm"], s["direction"]) for s in signals]
+def format_signals_list(signals, asset=None, show_direction=True):
+    return [format_signal(s["asset"], s["hhmm"],
+                          s["direction"] if show_direction else None)
+            for s in signals]
 
 
 def cross_asset_filter(all_signals, max_per_hour=6, max_total=12,
-                       min_win_rate=MIN_WIN_RATE):
+                       min_win_rate=MIN_WIN_RATE, apply_gap=True):
     """Accuracy-first filter across many assets.
 
     all_signals: list of signal dicts with asset/hhmm/direction/win_rate
@@ -415,10 +534,14 @@ def cross_asset_filter(all_signals, max_per_hour=6, max_total=12,
     generate_futures_signals).
     Rules: drop win_rate < min_win_rate; rank win_rate desc, then
     strength desc; keep a signal ONLY if it is >= 7 minutes from
-    EVERY already-kept signal (any asset, not just the same minute);
-    max 1 per same HH:MM (implied by the 7-min gap); max
-    max_per_hour per hour; max max_total overall. Fewer,
-    high-accuracy signals win.
+    EVERY already-kept signal (any asset, not just the same minute)
+    — when apply_gap is True; max 1 per same HH:MM (implied by the
+    7-min gap); max max_per_hour per hour; max max_total overall.
+    Fewer, high-accuracy signals win.
+    apply_gap: True keeps the original behaviour (Auto Live Signal
+    uses the default); the FUTURES SIGNAL menu passes False — the
+    owner (2026-11-27) replaced the gap with a user-typed win-rate
+    % threshold there. The per-hour / total caps stay either way.
     """
     pool = [s for s in all_signals if s.get("win_rate", 0.0) >= min_win_rate]
     pool.sort(key=lambda s: (-s.get("win_rate", 0.0),
@@ -430,7 +553,7 @@ def cross_asset_filter(all_signals, max_per_hour=6, max_total=12,
     for s in pool:
         mins = hhmm_to_minutes(s["hhmm"])
         # Cross-asset gap: >= 7 minutes from every kept signal.
-        if any(abs(mins - k) < MIN_GAP_MINUTES for k in kept_minutes):
+        if apply_gap and any(abs(mins - k) < MIN_GAP_MINUTES for k in kept_minutes):
             continue
         hour = s["hhmm"][:2]
         if per_hour.get(hour, 0) >= max_per_hour:
@@ -478,7 +601,7 @@ def available_signal_dates(db, asset, n_days, now=None):
 
 def generate_futures_signals_from_db(db, asset, dates, start="00:00",
                                      end="23:59", min_win_rate=MIN_WIN_RATE,
-                                     apply_trend=False):
+                                     apply_trend=False, apply_gap=True):
     """FUTURES signals from DB candles — same engine, same 4-layer
     filter, same output format as generate_futures_signals().
 
@@ -486,4 +609,16 @@ def generate_futures_signals_from_db(db, asset, dates, start="00:00",
     days_data = load_days_from_db(db, asset, dates)
     return generate_futures_signals(days_data, asset, start, end,
                                     min_win_rate=min_win_rate,
-                                    apply_trend=apply_trend)
+                                    apply_trend=apply_trend,
+                                    apply_gap=apply_gap)
+
+
+def generate_prev_minute_signals_from_db(db, asset, dates, start="00:00",
+                                         end="23:59", mode="BLACKOUT",
+                                         min_win_rate=MIN_WIN_RATE):
+    """BLACKOUT / WHITEOUT signals from DB candles — the T-1 engine
+    (see generate_prev_minute_signals). dates: past days."""
+    days_data = load_days_from_db(db, asset, dates)
+    return generate_prev_minute_signals(days_data, asset, start, end,
+                                        mode=mode,
+                                        min_win_rate=min_win_rate)
