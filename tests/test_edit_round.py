@@ -21,12 +21,14 @@ from bot import candles_db as candles_db_mod  # noqa: E402
 from bot import config, database, handlers  # noqa: E402
 from bot.candles_db import CandleDB, DHAKA  # noqa: E402
 from bot.checker import (build_lookup, check_signals, dot_date,  # noqa: E402
-                         format_check_results, parse_signal_line)
+                         format_check_results, parse_signal_line,
+                         split_message)
 from bot.collector import rows_from_raw  # noqa: E402
 from bot.signal_engine import (cross_asset_filter,  # noqa: E402
                                generate_futures_signals,
                                generate_prev_minute_signals)
 from bot.premium_emoji import pe  # noqa: E402
+from bot.quotex_client import QuotexRateLimited  # noqa: E402
 
 
 def _mk_candle(date, hhmm, direction):
@@ -195,35 +197,43 @@ def test_checker_template():
     # DATE line carries premium emojis around the date (same pair as
     # the FS date line, the owner, 2026-11-27).
     assert f"DATE: {pe('sparkle')}27.11.2026{pe('star')}" in text, text
-    assert "<code>USDPKR-OTC,02:39 M1 PUT</code>" in text, text
+    # The PUT line is one char shorter than the CALL line, so it is
+    # padded with one space inside the <code> tag — that is what
+    # lines the stickers up in one column (the owner, 2026-11-27).
+    assert "<code>USDPKR-OTC,02:39 M1 PUT </code>" in text, text
     assert "Total: 2" in text, text
     assert "Accuracy: 50.0%" in text, text
     # A blank line sits between the HEADER lines (the owner,
     # 2026-11-27) — the DATE line follows the divider after one.
     assert "\n\nDATE:" in text, text
     # ...and one blank line after BLUE FISH PRIME, then packed signals.
-    assert "\n\n<code>USDPKR-OTC,02:39 M1 PUT</code>" in text, text
+    assert "\n\n<code>USDPKR-OTC,02:39 M1 PUT </code>" in text, text
     assert "\n<code>USDPKR-OTC,02:40 M1 CALL</code>" in text, text
     assert "\n\n<code>USDPKR-OTC,02:40" not in text, text
     # The header names the mode that was checked.
     w_text = format_check_results(results, summary, date_str="2026-11-27",
                                   mode="WHITEOUT")
     assert "WHITEOUT SIGNAL Check Results" in w_text, w_text
-    # A very long list is cut to whole lines under the Telegram cap,
-    # with a note — the footer still counts the whole list.
+    # A very long list is NEVER cut (the owner, 2026-11-27: the full
+    # list must be shown) — the whole 100 lines come back, and the
+    # caller splits them into Telegram-sized chunks instead.
     many = [{"asset": "USDPKR_otc", "hhmm": f"{h:02d}:{m:02d}",
              "direction": "CALL", "result": "WIN", "actual": "CALL"}
             for h in range(10) for m in range(10)]
     many_sum = {"total": 100, "win": 100, "loss": 0, "doji": 0,
                 "no_data": 0, "win_pct": 100.0}
     long_text = format_check_results(many, many_sum, date_str="2026-11-27")
-    assert len(long_text) <= 4000, len(long_text)
-    assert "more lines" in long_text, long_text
+    assert "more lines" not in long_text, long_text
+    assert long_text.count("<code>") == 100, long_text.count("<code>")
     assert "Total: 100" in long_text, long_text
+    parts = split_message(long_text)
+    assert len(parts) > 1, parts
+    assert all(len(p) <= 4000 for p in parts), [len(p) for p in parts]
+    assert "\n".join(parts) == long_text
     # No header for Backtest Lab.
     plain = format_check_results(results, summary, header=False)
     assert "Check Results" not in plain, plain
-    assert "<code>USDPKR-OTC,02:39 M1 PUT</code>" in plain, plain
+    assert "<code>USDPKR-OTC,02:39 M1 PUT </code>" in plain, plain
     assert "Accuracy: 50.0%" in plain, plain
     # Directionless lines print without CALL/PUT.
     bw_results = [{"asset": "USDARS_otc", "hhmm": "09:07", "direction": None,
@@ -416,6 +426,14 @@ class RecordingBot(FakeBot):
 
     def __init__(self):
         self.edits = []  # (chat_id, message_id, text)
+        self.sends = []  # (chat_id, text)
+        self._next_mid = 1000
+
+    async def send_message(self, chat_id=None, text=None,
+                           reply_markup=None, parse_mode=None, **kwargs):
+        self.sends.append((chat_id, text))
+        self._next_mid += 1
+        return FakeMessage(self._next_mid)
 
     async def edit_message_text(self, chat_id=None, message_id=None,
                                 text=None, reply_markup=None,
@@ -624,6 +642,347 @@ def test_admin_dashboard_stops_when_leaving():
           "(stat taps keep it alive)")
 
 
+# ---------------------------------------------------------------------------
+# 10) Admin Fill Gaps button (the owner, 2026-11-27: the gap-fill only
+# ran from his PC — he asked for it on Render/Telegram instead)
+# ---------------------------------------------------------------------------
+def _seed_day_with_hole(db, asset, date_str, hole_start_min, hole_end_min,
+                        base=1.08):
+    """One full Dhaka day of candles for `asset` except the minutes
+    [hole_start_min, hole_end_min). (Same shape as the collector-db
+    gap tests: USDPHP 02:41-08:32 is minutes 161-512.)"""
+    day = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=DHAKA)
+    rows = []
+    for minute in range(1440):
+        if hole_start_min <= minute < hole_end_min:
+            continue
+        ts = day + timedelta(minutes=minute)
+        o = base + (minute % 10) * 0.001
+        c = o + 0.001 if minute % 2 == 0 else o - 0.001
+        rows.append({"ts": ts, "open": o, "high": max(o, c) + 0.001,
+                     "low": min(o, c) - 0.001, "close": c})
+    return db.insert_candles(asset, rows, on_conflict="nothing")
+
+
+class FakeGapSession:
+    """Fake Quotex session for the gap-fill job: deterministic
+    1-min candles (the same minute always gets the same candle, like
+    the real server), so the job can be tested offline."""
+
+    def __init__(self, now=None, raise_429=False):
+        self.now = now or datetime.now(DHAKA)
+        self.raise_429 = raise_429
+        self.connects = 0
+        self.connected = False
+
+    async def connect(self):
+        self.connects += 1
+        self.connected = True
+        return True
+
+    async def fetch_asset_span(self, asset, seconds_back):
+        if self.raise_429:
+            raise QuotexRateLimited("Quotex temporarily blocked us (429).")
+        now = self.now
+        start = now - timedelta(seconds=int(seconds_back))
+        out = []
+        t = start.replace(second=0, microsecond=0)
+        while t <= now:
+            base = 1.08
+            i = int(t.timestamp()) // 60
+            o = base + (i % 10) * 0.001
+            c = o + 0.001 if i % 2 == 0 else o - 0.001
+            out.append({"time": int(t.timestamp()), "open": o,
+                        "high": max(o, c) + 0.001, "low": min(o, c) - 0.001,
+                        "close": c})
+            t += timedelta(minutes=1)
+        return out
+
+    async def close(self):
+        self.connected = False
+
+
+def test_admin_fill_gaps_job():
+    # a) The dashboard keyboard carries the Fill Gaps button.
+    stats = {"total": 5, "premium": 1, "free": 4, "online": 2}
+    kb = handlers._admin_dashboard_keyboard(stats)
+    callbacks = [b.callback_data for row in kb.inline_keyboard
+                 for b in row]
+    assert "admin_fill_gaps" in callbacks, callbacks
+    assert any(b.text == "Fill Gaps" for row in kb.inline_keyboard
+               for b in row), callbacks
+    # b) The job fills a real hole and reports the counts.
+    db, tmp = _tmp_db()
+    date = "2026-11-27"
+    now = datetime(2026, 11, 27, 19, 30, tzinfo=DHAKA)
+    _seed_day_with_hole(db, "USDPHP_otc", date, 161, 513)
+    assert db.count_candles("USDPHP_otc", date) == 1088
+    session = FakeGapSession(now=now)
+    bot = RecordingBot()
+    result = asyncio.run(handlers._gap_fill_job(
+        bot, 999, db=db, session_factory=lambda: session, now=now))
+    assert result == (1, 1, 352), result
+    assert db.count_candles("USDPHP_otc", date) == 1440
+    assert session.connects == 1, session.connects
+    assert any("Gap-fill started" in (t or "") for _, t in bot.sends), bot.sends
+    assert any("1 asset(s), 1 gap(s), 352 new candles" in (t or "")
+               for _, _, t in bot.edits), bot.edits
+    # c) No gaps -> no Quotex login at all.
+    db2, tmp2 = _tmp_db()
+    _seed_day_with_hole(db2, "EURUSD_otc", date, 1440, 1440)  # full day
+    session2 = FakeGapSession(now=now)
+    bot2 = RecordingBot()
+    result2 = asyncio.run(handlers._gap_fill_job(
+        bot2, 999, db=db2, session_factory=lambda: session2, now=now))
+    assert result2 == (0, 0, 0), result2
+    assert session2.connects == 0, session2.connects
+    assert any("no gaps found" in (t or "") for _, _, t in bot2.edits), bot2.edits
+    # d) A 429 on the first pass waits and retries once.
+    db3, tmp3 = _tmp_db()
+    _seed_day_with_hole(db3, "USDPHP_otc", date, 161, 513)
+    session3 = FakeGapSession(now=now, raise_429=True)
+    bot3 = RecordingBot()
+    sleeps = []
+
+    async def no_sleep(seconds):
+        sleeps.append(seconds)
+
+    async def scenario429():
+        calls = {"n": 0}
+
+        def factory():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return session3
+            return FakeGapSession(now=now)
+
+        return await handlers._gap_fill_job(
+            bot3, 999, db=db3, session_factory=factory, sleep=no_sleep,
+            now=now)
+
+    result3 = asyncio.run(scenario429())
+    assert result3 == (1, 1, 352), result3
+    assert sleeps == [config.COLLECTOR_429_RETRY_MINUTES * 60], sleeps
+    assert db3.count_candles("USDPHP_otc", date) == 1440
+    print("PASS 10a) admin Fill Gaps job fills the hole, skips login "
+          "when complete, retries once on 429")
+
+
+def test_admin_fill_gaps_button_wiring():
+    old_stats = handlers.database.get_user_stats
+    old_user = handlers.database.get_or_create_user
+    old_admins = config.ADMIN_USER_IDS
+    old_job = handlers._gap_fill_job
+    try:
+        handlers.database.get_user_stats = lambda: {
+            "total": 5, "premium": 1, "free": 4, "online": 2}
+        handlers.database.get_or_create_user = lambda *a, **k: None
+        config.ADMIN_USER_IDS = {999}
+        calls = []
+
+        async def fake_job(bot, chat_id, **kwargs):
+            calls.append((bot, chat_id))
+            return (0, 0, 0)
+
+        handlers._gap_fill_job = fake_job
+
+        async def scenario():
+            ctx = FakeContext()
+            bot = RecordingBot()
+            ctx.bot = bot
+            # A non-admin is refused (the button is hidden from
+            # everyone else, but a crafted callback must not work).
+            config.ADMIN_USER_IDS = {123}
+            q_denied = FakeQuery("admin_fill_gaps")
+            await handlers.menu_callback(FakeUpdate(q_denied), ctx)
+            assert "Only the owner can run a gap-fill." in q_denied.texts[-1]
+            config.ADMIN_USER_IDS = {999}
+            # First tap starts the job; the guard is popped when the
+            # task finishes. (create_task only schedules the job, so
+            # the call lands after a loop tick, not inside the tap.)
+            q = FakeQuery("admin_fill_gaps")
+            await handlers.menu_callback(FakeUpdate(q), ctx)
+            assert 999 in handlers._FILL_GAPS_TASK
+            await asyncio.sleep(0.05)
+            assert len(calls) == 1, calls
+            assert calls[0][1] == 999
+            assert 999 not in handlers._FILL_GAPS_TASK
+            # A second tap while one is running is refused.
+            handlers._FILL_GAPS_TASK[999] = {"task": object()}
+            q2 = FakeQuery("admin_fill_gaps")
+            await handlers.menu_callback(FakeUpdate(q2), ctx)
+            assert len(calls) == 1, calls
+            assert any("already running" in (t or "")
+                       for _, t in bot.sends), bot.sends
+
+        asyncio.run(scenario())
+    finally:
+        handlers.database.get_user_stats = old_stats
+        handlers.database.get_or_create_user = old_user
+        config.ADMIN_USER_IDS = old_admins
+        handlers._gap_fill_job = old_job
+        handlers._FILL_GAPS_TASK.clear()
+        handlers._ADMIN_DASH.clear()
+    print("PASS 10b) admin Fill Gaps button: owner-only, one run at a time")
+
+
+# ---------------------------------------------------------------------------
+# 11) Checker stickers aligned + channel posts ignored (the owner,
+# 2026-11-27: stickers after the monospace text sat ragged, and every
+# channel post crashed text_message with AttributeError)
+# ---------------------------------------------------------------------------
+def test_checker_stickers_aligned():
+    # Lines of different lengths put the stickers at different
+    # columns. Every sticker must start at the same column — one
+    # straight column, one below the other.
+    results = [
+        {"asset": "USDZD_otc", "hhmm": "00:19", "direction": "PUT",
+         "result": "LOSS", "mtg1": None},
+        {"asset": "CADCHF_otc", "hhmm": "00:32", "direction": "CALL",
+         "result": "WIN", "mtg1": None},
+        {"asset": "XRPUSD_otc", "hhmm": "00:48", "direction": "CALL",
+         "result": "WIN", "mtg1": None},
+        {"asset": "AUDNZD_otc", "hhmm": "01:52", "direction": "CALL",
+         "result": "WIN", "mtg1": None},
+        {"asset": "BRLUSD_otc", "hhmm": "02:30", "direction": "PUT",
+         "result": "WIN", "mtg1": "WIN"},  # MTG1 win -> check + dot
+        {"asset": "USDPKR_otc", "hhmm": "02:35", "direction": "CALL",
+         "result": "NO DATA", "mtg1": None},
+    ]
+    summary = {"total": 6, "win": 3, "loss": 1, "doji": 0, "no_data": 1,
+               "win_pct": 75.0}
+    text = format_check_results(results, summary, date_str="2026-11-27",
+                                mode="OTC")
+    lines = [ln for ln in text.split("\n") if ln.startswith("<code>")]
+    assert len(lines) == 6, lines
+    # Every <code>...</code> holds the same number of characters.
+    insides = [ln.split("</code>")[0][len("<code>"):] for ln in lines]
+    assert len({len(s) for s in insides}) == 1, insides
+    # ...so every sticker starts at the same column.
+    starts = [ln.index("</code>") for ln in lines]
+    assert len(set(starts)) == 1, starts
+    # The MTG1 dot is still there, after its sticker.
+    assert any(ln.endswith(pe("check") + ".") for ln in lines), lines
+    # The shortest line was padded (USDZD-OTC is shorter than the rest).
+    assert insides[0].endswith(" "), insides
+    print("PASS 11a) checker stickers aligned — one straight column")
+
+
+class FakeChannelPost:
+    def __init__(self, text="signal post"):
+        self.text = text
+
+
+class FakeChannelUpdate:
+    """A channel post: no sender user, no update.message — exactly
+    what the bot receives for every post in its channel."""
+
+    def __init__(self):
+        self.message = None
+        self.channel_post = FakeChannelPost()
+        self.effective_user = None
+
+
+def test_channel_post_ignored():
+    old_user = handlers.database.get_or_create_user
+    try:
+        handlers.database.get_or_create_user = lambda *a, **k: None
+        # A channel post must be ignored silently — before this fix
+        # it crashed with AttributeError ('NoneType' has no 'get')
+        # on context.user_data, once per post.
+        bot = RecordingBot()
+        ctx = FakeContext()
+        ctx.bot = bot
+        asyncio.run(handlers.text_message(FakeChannelUpdate(), ctx))
+        assert bot.sends == [] and bot.edits == [], (bot.sends, bot.edits)
+        # A normal user message still works (no flow -> menu hint).
+        upd = FakeTextUpdate("hello")
+        asyncio.run(handlers.text_message(upd, ctx))
+        assert any("Tap a button in the menu" in t
+                   for t in upd.message.texts), upd.message.texts
+    finally:
+        handlers.database.get_or_create_user = old_user
+    print("PASS 11b) channel post ignored (no crash), normal text still works")
+
+
+# ---------------------------------------------------------------------------
+# 12) Long checker lists are split, never cut (the owner, 2026-11-27:
+# a 42-signal list came back as "… +5 more lines" — the full list
+# must be shown, as several Telegram messages when needed)
+# ---------------------------------------------------------------------------
+def test_split_message():
+    # Short text comes back untouched, one part.
+    assert split_message("hello") == ["hello"]
+    assert split_message("a" * 4000) == ["a" * 4000]
+    # Splits at line boundaries; no line is ever broken, and the
+    # parts rejoin to the original text exactly.
+    text = "\n".join(f"line {i:03d}" for i in range(200))
+    parts = split_message(text, limit=100)
+    assert len(parts) > 1, parts
+    assert all(len(p) <= 100 for p in parts), [len(p) for p in parts]
+    assert "\n".join(parts) == text
+    for p in parts:
+        for ln in p.split("\n"):
+            assert ln.startswith("line "), ln
+    # A single over-long line is hard-split, never dropped.
+    long_line = "x" * 250
+    parts2 = split_message(long_line, limit=100)
+    assert all(len(p) <= 100 for p in parts2), [len(p) for p in parts2]
+    assert "".join(parts2) == long_line
+    # A 42-signal checker result (the owner's screenshot): all 42
+    # lines survive across the parts, no "more lines" note.
+    results = [{"asset": "USDPKR_otc", "hhmm": f"{h:02d}:{m:02d}",
+                "direction": "CALL" if (h + m) % 2 == 0 else "PUT",
+                "result": "WIN" if (h + m) % 3 else "LOSS", "mtg1": None}
+               for h in range(7) for m in range(6)]
+    summary = {"total": 42, "win": 24, "loss": 6, "doji": 0, "no_data": 12,
+               "win_pct": 80.0}
+    full = format_check_results(results, summary, date_str="2026-11-27",
+                                mode="OTC")
+    assert "more lines" not in full, full
+    assert full.count("<code>") == 42, full.count("<code>")
+    parts3 = split_message(full)
+    assert all(len(p) <= 4000 for p in parts3), [len(p) for p in parts3]
+    assert "\n".join(parts3) == full
+    assert sum(p.count("<code>") for p in parts3) == 42
+    print("PASS 12) long lists split into Telegram-sized parts, full "
+          "list kept")
+
+
+def test_checker_long_list_sent_in_parts():
+    # End-to-end: a 42-line pasted list goes through text_message and
+    # comes out as several Telegram messages — the working message
+    # holds part 1, the rest are replies — with all 42 lines present
+    # and the Back button on the last part only.
+    db, tmp = _tmp_db()
+    day = make_day("USDPKR_otc", "2026-11-25", seed=7)
+    db.insert_candles("USDPKR_otc", rows_from_raw(to_raw(day)))
+    restore = _setup(db)
+    try:
+        ctx = FakeContext()
+        ctx.user_data.update({"flow": "checker_list",
+                              "checker_date": "2026-11-25",
+                              "checker_mtg1": False,
+                              "checker_mode": "OTC"})
+        lines = [f"USDPKR-OTC,{h:02d}:{m:02d} M1 CALL"
+                 for h in range(7) for m in range(0, 60, 10)]
+        assert len(lines) == 42, len(lines)
+        upd = _send_text(ctx, "\n".join(lines))
+        sent = upd.message.working.texts + upd.message.texts[1:]
+        joined = "\n".join(sent)
+        assert "more lines" not in joined, joined
+        assert joined.count("<code>") == 42, joined.count("<code>")
+        assert len(sent) > 1, sent  # it did not fit in one message
+        # Back button on the last part only, not the first.
+        assert upd.message.markups[-1] is not None, upd.message.markups
+        assert upd.message.working.markups[-1] is None, \
+            upd.message.working.markups
+    finally:
+        restore()
+    print("PASS 13) checker long list sent in parts — all 42 lines, "
+          "Back on the last part")
+
+
 def main():
     test_prev_minute_engine()
     test_gap_removed_in_fs_generators()
@@ -634,7 +993,13 @@ def main():
     test_admin_stats_and_keyboard()
     test_checker_four_mode_flow()
     test_admin_dashboard_stops_when_leaving()
-    print("ALL EDIT-ROUND TESTS PASSED (9/9)")
+    test_admin_fill_gaps_job()
+    test_admin_fill_gaps_button_wiring()
+    test_checker_stickers_aligned()
+    test_channel_post_ignored()
+    test_split_message()
+    test_checker_long_list_sent_in_parts()
+    print("ALL EDIT-ROUND TESTS PASSED (13/13)")
 
 
 if __name__ == "__main__":

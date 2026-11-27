@@ -288,10 +288,10 @@ def format_check_results(results, summary, date_str=None, header=True,
     as the FS date line). A blank line sits between the HEADER lines
     (the owner, 2026-11-27: the packed header looked cramped), and
     one blank line sits between BLUE FISH PRIME and the first
-    signal; signal lines stay packed after that, one per line. A
-    long list is cut to whole lines under Telegram's 4096-char cap
-    with a "… +N more lines" note — the Total / Accuracy footer
-    still counts the whole list.
+    signal; signal lines stay packed after that, one per line. The
+    FULL list is always returned — never cut with "… +N more lines"
+    (the owner, 2026-11-27): a list longer than one Telegram
+    message is split by the caller with split_message() instead.
     """
     _sym = {"WIN": pe("check"), "LOSS": pe("cross"),
             "DOJI": pe("minus"), "NO DATA": "?"}
@@ -305,7 +305,7 @@ def format_check_results(results, summary, date_str=None, header=True,
             head.append(f"DATE: {pe('sparkle')}{dot_date(date_str)}{pe('star')}")
         head.append(f"{pe('next')}1 MINUTES:")
         head.append(f"    {pe('fire')} BLUE FISH PRIME {pe('fire')}")
-    sig_lines = []
+    sigs = []
     for r in results:
         asset = r['asset'].upper().replace("_OTC", "-OTC")
         if r.get("mtg1"):
@@ -327,26 +327,54 @@ def format_check_results(results, summary, date_str=None, header=True,
         sig = f"{asset},{r['hhmm']} M1"
         if r.get("direction"):
             sig += f" {r['direction']}"
-        sig_lines.append(f"<code>{sig}</code> {emoji}")
+        sigs.append((sig, emoji))
+    # The result stickers sit after the monospace text, so lines of
+    # different lengths put them at different columns — ragged (the
+    # owner, 2026-11-27). Pad every line to the longest one INSIDE
+    # the <code> tag, so every sticker starts at the same column:
+    # one straight column, one below the other. The padding is part
+    # of the line, so the 4000-char fit below counts it.
+    width = max((len(sig) for sig, _ in sigs), default=0)
+    sig_lines = [f"<code>{sig.ljust(width)}</code> {emoji}"
+                 for sig, emoji in sigs]
     foot = (f"{pe('chart')} Total: {summary['total']} | {pe('check')} {summary['win']} | "
             f"{pe('cross')} {summary['loss']} | {pe('minus')} {summary['doji']} | "
             f"? {summary['no_data']}\n"
             f"{pe('crown')} Accuracy: {summary['win_pct']}% {pe('fire')}")
     text = "\n\n".join(head)
-    kept = 0
-    for ln in sig_lines:
+    for i, ln in enumerate(sig_lines):
         # One blank line between BLUE FISH PRIME and the first
         # signal (the owner, 2026-11-27); signals stay packed
         # after that.
-        sep = "\n\n" if kept == 0 else "\n"
-        add = sep + ln
-        # Reserve room for the footer (plus its leading blank line).
-        if len(text) + len(add) + 2 + len(foot) > 4000:
-            break
-        text += add
-        kept += 1
-    dropped = len(sig_lines) - kept
-    if dropped:
-        text += f"\n… +{dropped} more lines"
+        sep = "\n\n" if i == 0 else "\n"
+        text += sep + ln
     text += "\n\n" + foot
     return text
+
+
+def split_message(text, limit=4000):
+    """Split a long result into Telegram-sized chunks (the owner,
+    2026-11-27: the full list must be shown, never cut with
+    "… +N more lines"). Splits at line boundaries so no signal line
+    — and no <code> / <tg-emoji> tag — is ever broken; a single
+    over-long line is hard-split. Every chunk is at most `limit`
+    characters, and "\\n".join(the chunks) is the original text."""
+    if len(text) <= limit:
+        return [text]
+    parts = []
+    current = ""
+    for line in text.split("\n"):
+        piece = line if not current else "\n" + line
+        while len(current) + len(piece) > limit:
+            if not current:
+                # A single line longer than the limit: hard-split it.
+                parts.append(piece[:limit])
+                piece = piece[limit:]
+            else:
+                parts.append(current)
+                current = ""
+                piece = line
+        current += piece
+    if current:
+        parts.append(current)
+    return parts

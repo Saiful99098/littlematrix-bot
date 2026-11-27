@@ -34,7 +34,7 @@ from telegram.ext import ContextTypes
 from . import candles_db, collector, config, database, quotex_client, referral
 from .checker import (build_lookup, check_signals, dot_date,
                       format_check_results, parse_checker_date,
-                      parse_signal_line)
+                      parse_signal_line, split_message)
 from .filters import filter_personal, format_filter_result
 from .news import events_for_dhaka_dates
 from .premium_emoji import BUTTON_ICONS, pe
@@ -155,6 +155,11 @@ _ADMIN_DASH = {}
 _ADMIN_DASH_MAX_RUNS = 180  # 10s x 180 = ~30 min
 _ADMIN_DASH_INTERVAL_SECONDS = 10  # patched to ~0.05 in tests
 
+# user_id -> {"task": asyncio.Task} for a running admin gap-fill.
+# Only one gap-fill runs per owner at a time (a second tap is
+# refused) so the bot never logs into Quotex twice for one job.
+_FILL_GAPS_TASK = {}
+
 
 def _admin_dashboard_text(stats):
     now = datetime.now(candles_db.DHAKA).strftime("%H:%M:%S")
@@ -171,6 +176,7 @@ def _admin_dashboard_keyboard(stats):
          _btn(f"Online Now: {stats['online']}", "admin_stat_noop", icon="green")],
         [_btn(f"Premium: {stats['premium']}", "admin_stat_noop", icon="premium"),
          _btn(f"Free: {stats['free']}", "admin_stat_noop", icon="status")],
+        [_btn("Fill Gaps", "admin_fill_gaps", icon="refresh")],
         [_btn("Back to Menu", "menu_main", icon="back")]])
 
 
@@ -219,6 +225,120 @@ async def _run_admin_dashboard(query, context, user_id):
         context.bot, query.message.chat_id, query.message.message_id,
         user_id))
     _ADMIN_DASH[user_id] = {"task": task}
+
+
+async def _gap_fill_once(db, date_str, session_factory, assets=None,
+                         now=None):
+    """One gap-fill pass. Returns the fill_gaps() tuple,
+    "rate_limited" on a Quotex 429, or None on any other failure."""
+    session = session_factory()
+    try:
+        await session.connect()
+        return await collector.fill_gaps(db, session, date_str=date_str,
+                                         assets=assets, now=now)
+    except quotex_client.QuotexRateLimited as exc:
+        logger.warning("admin gap-fill: 429 — %s", exc)
+        return "rate_limited"
+    except Exception as exc:
+        logger.warning("admin gap-fill: run failed: %s", exc)
+        return None
+    finally:
+        try:
+            await session.close()
+        except Exception:
+            pass
+
+
+async def _gap_fill_job(bot, chat_id, db=None, session_factory=None,
+                        sleep=None, now=None):
+    """Fill today's middle-of-day candle holes, in the background.
+
+    Same login pattern as a collector run: one SharedQuotexSession
+    login, fill_gaps() (3 assets at a time), logout. On 429 it waits
+    10 minutes and retries once, like every other run. First it
+    scans the DB (no login) — if there are no gaps it says so
+    without logging in at all. Sends a progress message, then edits
+    it with the result, so the owner taps Fill Gaps on the dashboard
+    and gets the answer here without leaving Telegram. Returns the
+    fill_gaps() tuple, or None when the run failed. Never raises.
+    """
+    db = db or _db()
+    session_factory = session_factory or collector.SharedQuotexSession
+    sleep = sleep or asyncio.sleep
+    now = now or collector.dhaka_now()
+    date_str = now.strftime("%Y-%m-%d")
+    msg = None
+    try:
+        msg = await bot.send_message(
+            chat_id=chat_id,
+            text=f"{pe('refresh')} Gap-fill started for {date_str} — "
+                 "scanning for missing candles…",
+            parse_mode="HTML")
+    except Exception:
+        pass
+    # Scan first (DB reads only, no Quotex login): if nothing is
+    # missing there is no reason to log in.
+    try:
+        wanted = [asset for asset in db.get_assets()
+                  if collector.find_gaps(db, asset, date_str, now=now)]
+    except Exception as exc:
+        logger.warning("admin gap-fill: scan failed: %s", exc)
+        wanted = None
+    if wanted == []:
+        text = (f"{pe('check')} Gap-fill for {date_str}: no gaps found — "
+                "all candles are already complete.")
+        result = (0, 0, 0)
+    else:
+        result = await _gap_fill_once(db, date_str, session_factory,
+                                      assets=wanted, now=now)
+        if result == "rate_limited":
+            if msg is not None:
+                try:
+                    await bot.edit_message_text(
+                        chat_id=chat_id, message_id=msg.message_id,
+                        text=f"{pe('warning')} Gap-fill hit a Quotex 429 — "
+                             f"retrying once in "
+                             f"{config.COLLECTOR_429_RETRY_MINUTES} minutes…",
+                        parse_mode="HTML")
+                except Exception:
+                    pass
+            await sleep(config.COLLECTOR_429_RETRY_MINUTES * 60)
+            result = await _gap_fill_once(db, date_str, session_factory,
+                                          assets=wanted, now=now)
+        if result is None or result == "rate_limited":
+            text = (f"{pe('cross')} Gap-fill for {date_str} failed — "
+                    "please try again later.")
+        elif result == (0, 0, 0):
+            # Gaps were found by the scan but the fetches stored
+            # nothing — say so honestly instead of "no gaps".
+            n_gaps = sum(len(collector.find_gaps(db, a, date_str, now=now))
+                         for a in wanted)
+            text = (f"{pe('warning')} Gap-fill for {date_str} found "
+                    f"{n_gaps} missing minute(s) but could not fetch "
+                    "them — please try again later.")
+        else:
+            assets, gaps, candles = result
+            text = (f"{pe('check')} Gap-fill for {date_str} done: "
+                    f"{assets} asset(s), {gaps} gap(s), "
+                    f"{candles} new candles.")
+    if msg is not None:
+        try:
+            await bot.edit_message_text(chat_id=chat_id,
+                                        message_id=msg.message_id,
+                                        text=text, parse_mode="HTML")
+        except Exception:
+            try:
+                await bot.send_message(chat_id=chat_id, text=text,
+                                       parse_mode="HTML")
+            except Exception:
+                pass
+    else:
+        try:
+            await bot.send_message(chat_id=chat_id, text=text,
+                                   parse_mode="HTML")
+        except Exception:
+            pass
+    return result if isinstance(result, tuple) else None
 
 
 def back_keyboard():
@@ -749,11 +869,12 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # navigated away, so stop the loop here — otherwise it keeps
     # editing that message back into the dashboard every 10 seconds.
     # The dashboard's own buttons are exempt: a stat tap
-    # (admin_stat_noop) means he is still on the dashboard, and
-    # menu_admin re-opens it (which restarts the loop itself). This
-    # runs before the channel gate, so even a gate-blocked tap
-    # stops the loop.
-    if data not in ("menu_admin", "admin_stat_noop"):
+    # (admin_stat_noop) means he is still on the dashboard,
+    # admin_fill_gaps reports in a separate message (the dashboard
+    # stays open), and menu_admin re-opens it (which restarts the
+    # loop itself). This runs before the channel gate, so even a
+    # gate-blocked tap stops the loop.
+    if data not in ("menu_admin", "admin_stat_noop", "admin_fill_gaps"):
         _cancel_admin_dash(user.id)
     database.get_or_create_user(user.id, user.username or "")
 
@@ -897,6 +1018,31 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "admin_stat_noop":
         # Display-only stat button: tapping does nothing (the tap
         # itself was already answered at the top of menu_callback).
+        return
+
+    if data == "admin_fill_gaps":
+        # The button lives on the owner-only dashboard, but a
+        # crafted callback could still reach this — check again here.
+        if not _is_admin(user.id):
+            await query.edit_message_text(
+                "Only the owner can run a gap-fill.",
+                reply_markup=back_keyboard(), parse_mode="HTML")
+            return
+        if user.id in _FILL_GAPS_TASK:
+            # The tap was already answered at the top of
+            # menu_callback, so a second answer() is not safe — the
+            # job's own message is the feedback channel.
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=f"{pe('warning')} A gap-fill is already running — "
+                     "please wait for it to finish.",
+                parse_mode="HTML")
+            return
+        task = asyncio.create_task(_gap_fill_job(
+            context.bot, query.message.chat_id))
+        _FILL_GAPS_TASK[user.id] = {"task": task}
+        task.add_done_callback(
+            lambda _t: _FILL_GAPS_TASK.pop(user.id, None))
         return
 
     if data == "menu_futures":
@@ -2042,11 +2188,24 @@ async def _run_backtest(query):
     lookup = build_lookup(db.get_candles(asset, yesterday), asset)
     results, summary = check_signals(lines, lookup, yesterday, with_mtg1=False)
     text = format_check_results(results, summary, header=False)
+    full = (f"{pe('chart')}{pe('diamond')} BACKTEST LAB — {display_asset(asset)} {yesterday} 09:00-10:59\n"
+            f"Signals built from {', '.join(train)} (majority vote), checked against {yesterday}.\n"
+            f"{DIVIDER}\n{text}")
+    # The full list is always shown (the owner, 2026-11-27) — split
+    # instead of cut. In practice the backtest caps at ~12 signals,
+    # so this stays one message; the split is a safety net.
+    parts = split_message(full)
     await query.edit_message_text(
-        f"{pe('chart')}{pe('diamond')} BACKTEST LAB — {display_asset(asset)} {yesterday} 09:00-10:59\n"
-        f"Signals built from {', '.join(train)} (majority vote), checked against {yesterday}.\n"
-        f"{DIVIDER}\n{text}",
-        reply_markup=back_keyboard(), parse_mode="HTML")
+        parts[0],
+        reply_markup=back_keyboard() if len(parts) == 1 else None,
+        parse_mode="HTML")
+    if len(parts) > 1 and query.message is not None:
+        for i, part in enumerate(parts[1:], start=1):
+            await query.message.reply_text(
+                part,
+                reply_markup=(back_keyboard()
+                              if i == len(parts) - 1 else None),
+                parse_mode="HTML")
 
 
 def _checker_list_prompt(date_str, mode="OTC"):
@@ -2096,7 +2255,15 @@ async def _build_checker_lookup(lines, date_str):
 
 
 async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    flow = context.user_data.get("flow")
+    # Channel posts (the bot is an admin in the channel) carry no
+    # user — context.user_data is None and update.message is None —
+    # and they are not a user typing to the bot. Ignore them, or the
+    # handler crashes on every channel post (the owner, 2026-11-27:
+    # AttributeError 'NoneType' object has no attribute 'get', again
+    # and again in the Render log).
+    if update.effective_user is None or update.message is None:
+        return
+    flow = (context.user_data or {}).get("flow")
     text = update.message.text or ""
     user = update.effective_user
     # A typed message means the owner is not looking at the dashboard
@@ -2212,10 +2379,22 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lookup = await _build_checker_lookup(lines, check_date)
         results, summary = check_signals(lines, lookup, check_date,
                                          with_mtg1=with_mtg1, mode=mode)
-        await working.edit_text(
+        # The full list is always shown (the owner, 2026-11-27) — a
+        # list longer than one Telegram message is sent as several
+        # messages, never cut. The Back button sits on the last part.
+        parts = split_message(
             format_check_results(results, summary, date_str=check_date,
-                                 mode=mode),
-            reply_markup=back_keyboard(), parse_mode="HTML")
+                                 mode=mode))
+        await working.edit_text(
+            parts[0],
+            reply_markup=back_keyboard() if len(parts) == 1 else None,
+            parse_mode="HTML")
+        for i, part in enumerate(parts[1:], start=1):
+            await update.message.reply_text(
+                part,
+                reply_markup=(back_keyboard()
+                              if i == len(parts) - 1 else None),
+                parse_mode="HTML")
         context.user_data["flow"] = None
         return
 
