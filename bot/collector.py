@@ -533,9 +533,28 @@ async def run_incremental(db, session, now=None):
 
     total = 0
     done = 0
+    failed = []
     for i in range(0, len(assets), 3):
         batch = assets[i:i + 3]
         raw_by_asset = await _fetch_assets_3_at_a_time(session, batch, seconds_back)
+        for asset, raw in raw_by_asset.items():
+            if not raw:
+                failed.append(asset)
+                continue
+            n_rows, inserted = _store_rows(db, asset, raw, start, end)
+            total += inserted
+            done += 1
+    # One retry for the assets whose fetch failed (the owner,
+    # 2026-11-27: EURUSD-OTC stopped at 10:44 and the 12:00 run
+    # never filled it — a single fetch timeout left a 2-hour hole
+    # until the next run). Only the failed assets are re-fetched,
+    # after a short wait; a 429 still propagates to the caller.
+    if failed:
+        logger.warning("collector: 2-hourly run retrying %d failed "
+                       "asset(s): %s", len(failed), ", ".join(failed))
+        await asyncio.sleep(config.COLLECTOR_FAILED_ASSET_RETRY_SECONDS)
+        raw_by_asset = await _fetch_assets_3_at_a_time(
+            session, failed, seconds_back)
         for asset, raw in raw_by_asset.items():
             if not raw:
                 continue

@@ -112,6 +112,11 @@ COLLECTOR_INTERVAL_SECONDS = int(os.getenv("COLLECTOR_INTERVAL_SECONDS", "7200")
 COLLECTOR_OVERLAP_MINUTES = int(os.getenv("COLLECTOR_OVERLAP_MINUTES", "10"))
 # Minutes to wait and retry after a Quotex 429 inside the collector.
 COLLECTOR_429_RETRY_MINUTES = int(os.getenv("COLLECTOR_429_RETRY_MINUTES", "10"))
+# Seconds to wait before re-fetching, once, the assets whose fetch
+# failed inside one 2-hourly run (a single timeout used to leave a
+# 2-hour hole in that asset — the owner, 2026-11-27).
+COLLECTOR_FAILED_ASSET_RETRY_SECONDS = int(os.getenv(
+    "COLLECTOR_FAILED_ASSET_RETRY_SECONDS", "30") or 30)
 # Live candle stream (hybrid): one persistent Quotex WebSocket that
 # writes each closed 1-minute candle for every open asset into the DB
 # as it arrives. The 2-hourly batch collector stays the backbone

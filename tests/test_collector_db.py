@@ -568,6 +568,44 @@ def test_handlers_db_end_to_end():
           "SELECT ALL cap, checker, status summary")
 
 
+class FailOnceSession(FakeSession):
+    """EURUSD's first fetch times out (like the 12:00 run on
+    2026-11-27) — the retry inside the same run must still
+    collect it, instead of leaving a 2-hour hole."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.calls = {}
+
+    async def fetch_asset_span(self, asset, seconds_back):
+        self.calls[asset] = self.calls.get(asset, 0) + 1
+        if asset == "EURUSD_otc" and self.calls[asset] == 1:
+            raise TimeoutError("fetch timed out")
+        return await super().fetch_asset_span(asset, seconds_back)
+
+
+def test_incremental_retries_failed_assets():
+    import bot.config as config_mod
+
+    db = _tmp_db()
+    morning = datetime(2026, 11, 25, 9, 0, tzinfo=DHAKA)
+    session = FailOnceSession(now=morning)
+    old_retry = config_mod.COLLECTOR_FAILED_ASSET_RETRY_SECONDS
+    config_mod.COLLECTOR_FAILED_ASSET_RETRY_SECONDS = 0
+    try:
+        done, total = asyncio.run(
+            run_incremental(db, session, now=morning))
+    finally:
+        config_mod.COLLECTOR_FAILED_ASSET_RETRY_SECONDS = old_retry
+    # Both assets collected in the SAME run (2 x 130 minutes),
+    # EURUSD fetched twice (failed once, retried once).
+    assert done == 2, done
+    assert total == 2 * 130, total
+    assert session.calls["EURUSD_otc"] == 2, session.calls
+    assert len(db.get_candles("EURUSD_otc", "2026-11-25")) == 130
+    print("PASS i) incremental run retries a failed asset in the same run")
+
+
 def main():
     test_window_math()
     test_db_roundtrip()
@@ -582,7 +620,8 @@ def main():
     test_collector_429_stops_run()
     test_post_init_starts_collector_only_when_active()
     test_handlers_db_end_to_end()
-    print("ALL TESTS PASSED (13/13)")
+    test_incremental_retries_failed_assets()
+    print("ALL TESTS PASSED (14/14)")
 
 
 if __name__ == "__main__":

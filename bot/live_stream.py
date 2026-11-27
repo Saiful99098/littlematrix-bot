@@ -245,6 +245,7 @@ async def _poll_loop(db, session, sleep, n_assets=0):
     # minute per asset so late ticks never rebuild it.
     tick_buckets = {}
     built_until = {}
+    last_tick = {}  # asset -> newest tick unix-seconds seen in THIS run
     while True:
         await sleep(poll)
         if not await session.is_connected():
@@ -298,19 +299,32 @@ async def _poll_loop(db, session, sleep, n_assets=0):
         tick_inserted = 0
         tick_assets = 0
         tick_age = None
+        now_s = int(time.time())
         try:
             ticks = session.generated_ticks() or {}
         except Exception:
             ticks = {}
+        # Per-asset liveness (the owner, 2026-11-27): remember the
+        # newest tick seen for each asset in THIS run — the
+        # per-asset silence check at the end of the poll uses it.
+        for asset, tick_list in (ticks or {}).items():
+            for t in tick_list or []:
+                try:
+                    ts = float(t["time"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if ts > 1e11:  # milliseconds — normalize to seconds
+                    ts /= 1000.0
+                if asset not in last_tick or ts > last_tick[asset]:
+                    last_tick[asset] = ts
         try:
             tick_inserted, tick_assets, newest_ts = _store_tick_candles(
-                db, ticks, period, tick_buckets, built_until,
-                int(time.time()))
+                db, ticks, period, tick_buckets, built_until, now_s)
         except Exception as exc:
             logger.warning("live stream: tick build failed: %s", exc)
             tick_inserted, tick_assets, newest_ts = 0, 0, None
         if newest_ts is not None:
-            tick_age = max(0, int(time.time() - newest_ts))
+            tick_age = max(0, now_s - int(newest_ts))
         if inserted or tick_inserted:
             last_any = time.monotonic()
             quiet_polls = 0
@@ -365,6 +379,29 @@ async def _poll_loop(db, session, sleep, n_assets=0):
             logger.warning("live stream: stale — no new candle for %d "
                            "minutes, reconnecting",
                            config.LIVE_STREAM_STALE_MINUTES)
+            return
+        # Per-asset silence (the owner, 2026-11-27): EURUSD-OTC and
+        # USDJPY-OTC stopped at 10:44 and BTCUSD-OTC at 12:13 while
+        # USDPKR-OTC kept ticking — the GLOBAL check above never
+        # fired, because last_any resets on ANY asset's candle, so
+        # the loop sat "connected" for hours with most assets dead.
+        # An asset that ticked during THIS run and then goes quiet
+        # for the whole stale window while others still tick has a
+        # broken subscription — reconnect (the tail-fill on
+        # reconnect closes its gap). Assets that never ticked in
+        # this run (closed market) never trigger this.
+        fresh = [a for a, ts in last_tick.items()
+                 if now_s - ts <= stale_after]
+        silent = [a for a, ts in last_tick.items()
+                  if now_s - ts > stale_after]
+        if silent and fresh:
+            shown = ", ".join(sorted(silent)[:10])
+            extra = (f" +{len(silent) - 10} more"
+                     if len(silent) > 10 else "")
+            logger.warning(
+                "live stream: %d asset(s) silent for %d minutes while "
+                "others still tick (%s%s) — reconnecting",
+                len(silent), config.LIVE_STREAM_STALE_MINUTES, shown, extra)
             return
 
 

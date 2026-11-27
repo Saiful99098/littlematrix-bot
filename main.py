@@ -17,6 +17,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 
 from bot import collector, config
 
@@ -68,34 +69,55 @@ def webhook_config():
             config.WEBHOOK_URL.rstrip("/") + "/webhook")
 
 
-def _collector_task_done(task):
-    """Log a dead collector task instead of losing it silently.
+_TASK_RESTART_DELAY_SECONDS = 60  # patched to ~0.05 in tests
+_TASK_RESTART_LIMIT = 5  # max restarts within the window below
+_TASK_RESTART_WINDOW_SECONDS = 600  # 10 minutes
 
-    A task that raises only prints "Task exception was never retrieved"
-    when garbage-collected — easy to miss in Render logs — while the
-    bot keeps answering Telegram, so a dead collector just looks like
-    a frozen Bot Status. This makes the death loud.
+
+def _restart_task(app, key, start_fn, label):
+    """(Re)start a background task, re-attaching the death callback
+    so it is supervised for the life of the bot."""
+    task = asyncio.create_task(start_fn())
+    task.add_done_callback(
+        lambda t: _background_task_done(t, app, key, start_fn, label))
+    app.bot_data[key] = task
+
+
+def _background_task_done(task, app, key, start_fn, label):
+    """A background task ended: log it loudly and restart it.
+
+    The collector and the live stream are forever-loops that never
+    raise by design — but if one ever does die (a bug, a bad
+    deploy), the bot would keep answering Telegram while silently
+    collecting nothing, and only the next deploy would revive it
+    (the owner, 2026-11-27: candles stopped at 12:13 while the
+    market stayed open). So a dead task restarts itself after a
+    minute. A restart budget (5 deaths in 10 minutes) stops a
+    tight crash loop: after that the task stays dead and the log
+    says the bot needs a restart from Render.
     """
     try:
         task.result()
     except asyncio.CancelledError:
-        pass
+        return  # shutting down — do not restart
     except Exception:
-        logger.exception("collector task died — Bot Status will freeze until restart")
-
-
-def _live_stream_task_done(task):
-    """Log a dead live-stream task instead of losing it silently.
-
-    A dead stream only makes data staler (the 2-hourly batch keeps
-    filling gaps), so it is easy to miss — log it loudly.
-    """
-    try:
-        task.result()
-    except asyncio.CancelledError:
-        pass
-    except Exception:
-        logger.exception("live stream task died — data stays 2-hourly until restart")
+        logger.exception("%s task died — restarting in %d seconds",
+                         label, _TASK_RESTART_DELAY_SECONDS)
+    else:
+        logger.warning("%s task ended — restarting in %d seconds",
+                       label, _TASK_RESTART_DELAY_SECONDS)
+    restarts = app.bot_data.setdefault(key + "_restarts", [])
+    now = time.monotonic()
+    restarts[:] = [t for t in restarts
+                   if now - t < _TASK_RESTART_WINDOW_SECONDS]
+    if len(restarts) >= _TASK_RESTART_LIMIT:
+        logger.error("%s task died %d times in 10 minutes — NOT "
+                     "restarting, restart the bot from Render",
+                     label, len(restarts) + 1)
+        return
+    restarts.append(now)
+    asyncio.get_event_loop().call_later(
+        _TASK_RESTART_DELAY_SECONDS, _restart_task, app, key, start_fn, label)
 
 
 async def post_init(app):
@@ -105,18 +127,16 @@ async def post_init(app):
     the bot from answering Telegram."""
     if config.collector_active():
         logger.info("collector enabled (DATA_MODE=db) — starting background task")
-        task = asyncio.create_task(collector.collector_loop(bot=app.bot))
-        task.add_done_callback(_collector_task_done)
-        app.bot_data["collector_task"] = task
+        _restart_task(app, "collector_task",
+                      lambda: collector.collector_loop(bot=app.bot), "collector")
     else:
         logger.info("collector not active (DATA_MODE=%s, COLLECTOR_ENABLED=%s)",
                     config.DATA_MODE, config.COLLECTOR_ENABLED)
     if config.live_stream_active():
         from bot import live_stream
         logger.info("live stream enabled — starting background task")
-        task = asyncio.create_task(live_stream.live_stream_loop())
-        task.add_done_callback(_live_stream_task_done)
-        app.bot_data["live_stream_task"] = task
+        _restart_task(app, "live_stream_task",
+                      live_stream.live_stream_loop, "live stream")
     else:
         logger.info("live stream not active (DATA_MODE=%s, COLLECTOR_ENABLED=%s, "
                     "LIVE_STREAM_ENABLED=%s)",

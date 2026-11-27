@@ -601,6 +601,144 @@ def test_batch_corrects_tick_rows_but_not_vice_versa():
     print("PASS n) batch corrects tick rows; ticks never overwrite truth")
 
 
+class _FakeClock:
+    """Controllable clock for the stream tests: time() and
+    monotonic() both read the same fake 'now'."""
+
+    def __init__(self, start):
+        self.now = float(start)
+
+    def time(self):
+        return self.now
+
+    def monotonic(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+class _ClockSleep:
+    """Fake sleep that advances the fake clock instead of waiting —
+    and raises _StopLoop after max_calls, like _CountingSleep."""
+
+    def __init__(self, clock, max_calls):
+        self.clock = clock
+        self.calls = 0
+        self.max_calls = max_calls
+
+    async def __call__(self, seconds):
+        self.calls += 1
+        if self.calls > self.max_calls:
+            raise _StopLoop
+        self.clock.advance(seconds)
+
+
+class _TickScriptSession(FakeSession):
+    """Ticks for BTCUSD always; ticks for ETHUSD only while the
+    fake clock is before `eth_stop` — then the asset goes silent
+    mid-run, like EURUSD-OTC did on 2026-11-27."""
+
+    def __init__(self, clock, eth_stop):
+        super().__init__(event_from_poll=999, tail_candles=[])
+        self.clock = clock
+        self.eth_stop = eth_stop
+
+    def generated_ticks(self):
+        now = int(self.clock.time())
+        cur_min = now - (now % 60)
+        ticks = {"BTCUSD_otc": [{"time": cur_min + 5, "price": 100.0}]}
+        if now < self.eth_stop:
+            ticks["ETHUSD_otc"] = [{"time": cur_min + 5, "price": 200.0}]
+        return ticks
+
+
+def test_stream_reconnects_when_one_asset_goes_silent():
+    """o) The owner, 2026-11-27: EURUSD-OTC and USDJPY-OTC stopped
+    at 10:44 and BTCUSD-OTC at 12:13 while USDPKR-OTC kept ticking
+    — the old GLOBAL-only staleness check never fired, because
+    last_any resets on ANY asset's candle. The loop must reconnect
+    when an asset that ticked in this run goes quiet for the whole
+    stale window while others still tick."""
+    db, tmp = _tmp_db()
+    clock = _FakeClock(1_700_000_000)
+    session = _TickScriptSession(clock, eth_stop=1_700_000_000 + 180)
+    real_time = live_stream.time
+    live_stream.time = clock
+    cap = _CaptureHandler()
+    logger = logging.getLogger("littlematrix.live_stream")
+    logger.addHandler(cap)
+    try:
+        asyncio.run(live_stream.live_stream_loop(
+            db=db, session_factory=lambda: session,
+            sleep=_ClockSleep(clock, max_calls=300)))
+    except _StopLoop:
+        pass
+    finally:
+        live_stream.time = real_time
+        logger.removeHandler(cap)
+    # The loop reconnected: the per-asset check fired while BTCUSD
+    # kept ticking (the old global-only check never would).
+    assert session.connects >= 2, session.connects
+    hit = [m for m in cap.records if "silent for 10 minutes" in m]
+    assert hit, cap.records
+    assert "ETHUSD_otc" in hit[0], hit
+    print("PASS o) stream reconnects when one asset goes silent "
+          "while others still tick")
+
+
+def test_stream_ignores_never_ticked_asset():
+    """p) An asset that NEVER ticked in this run (closed market)
+    must NOT trigger a reconnect, or the loop would flap forever
+    every 10 minutes."""
+    db, tmp = _tmp_db()
+    clock = _FakeClock(1_700_000_000)
+    # eth_stop == start: ETH never ticks at all.
+    session = _TickScriptSession(clock, eth_stop=1_700_000_000)
+    real_time = live_stream.time
+    live_stream.time = clock
+    try:
+        asyncio.run(live_stream.live_stream_loop(
+            db=db, session_factory=lambda: session,
+            sleep=_ClockSleep(clock, max_calls=100)))
+    except _StopLoop:
+        pass
+    finally:
+        live_stream.time = real_time
+    assert session.connects == 1, session.connects
+    print("PASS p) stream does not reconnect for an asset that never ticked")
+
+
+def test_dead_background_task_restarts():
+    """q) A background task that dies (collector / live stream)
+    restarts itself after a short delay — the bot must not sit
+    silent until the next deploy. The restart budget (5 in 10
+    minutes) stops a tight crash loop."""
+    import main as main_mod
+    from types import SimpleNamespace
+
+    app = SimpleNamespace(bot_data={})
+    started = []
+
+    async def _dying():
+        started.append(1)
+        raise RuntimeError("boom")
+
+    old_delay = main_mod._TASK_RESTART_DELAY_SECONDS
+    main_mod._TASK_RESTART_DELAY_SECONDS = 0.05
+    try:
+        async def _scenario():
+            main_mod._restart_task(app, "test_task", _dying, "test")
+            await asyncio.sleep(0.5)
+
+        asyncio.run(_scenario())
+    finally:
+        main_mod._TASK_RESTART_DELAY_SECONDS = old_delay
+    # 1 original start + 5 budgeted restarts, then it stops.
+    assert len(started) == 6, started
+    print("PASS q) a dead background task restarts itself (budget 5 in 10 min)")
+
+
 if __name__ == "__main__":
     test_stream_stores_generated_candles()
     test_stream_reconnects_and_tail_fills()
@@ -616,4 +754,7 @@ if __name__ == "__main__":
     test_ws_logs_unknown_control_events()
     test_stream_builds_candles_from_ticks()
     test_batch_corrects_tick_rows_but_not_vice_versa()
+    test_stream_reconnects_when_one_asset_goes_silent()
+    test_stream_ignores_never_ticked_asset()
+    test_dead_background_task_restarts()
     print("ALL LIVE-STREAM TESTS PASSED")
