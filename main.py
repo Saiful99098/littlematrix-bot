@@ -175,6 +175,28 @@ async def channel_member_update(update, context):
                 reply_markup=main_keyboard(admin=_is_admin(user.id)), parse_mode="HTML")
         except Exception:
             pass
+        # MATRIX referral (the owner, 2026-11-27, Option B): when the
+        # join came through a referral invite link, pay the link's
+        # owner 5 coins — once per invited user, never for self-joins
+        # or re-joins (enforced in database.record_referral). A
+        # failure here must never break the welcome above.
+        try:
+            invite = getattr(member_update, "invite_link", None)
+            link = getattr(invite, "invite_link", None) if invite else None
+            if link:
+                from bot import referral
+                status, coins, referrer_id, balance = referral.attribute_join(
+                    user.id, link)
+                if status == "awarded" and referrer_id:
+                    from bot.handlers import pe as _pe2
+                    await context.bot.send_message(
+                        chat_id=referrer_id,
+                        text=(f"{_pe2('diamond')} A new member joined through your "
+                              f"referral link — +{coins} MATRIX coins! "
+                              f"Balance: {balance} coins."),
+                        parse_mode="HTML")
+        except Exception:
+            pass
 
 
 async def my_chat_member_update(update, context):

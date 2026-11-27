@@ -9,8 +9,8 @@ Modes (DATA_MODE):
           (Postgres on Render when DATABASE_URL is set, SQLite file
           locally). A background collector fills the DB: on startup
           it backfills the last 5 completed days (Asia/Dhaka
-          00:00-23:59 each day) + today 00:00-now, then every 2 hours
-          it collects the last 2 hours (+10 min overlap) into the DB.
+          00:00-23:59 each day) + today 00:00-now, then every 30 minutes
+          it collects the last 30 minutes (+10 min overlap) into the DB.
           Signals and CHECKER never log in to Quotex in db mode —
           that is the anti-429 design.
 - live:   fetch yesterday's candles live from Quotex (local PC test).
@@ -104,25 +104,26 @@ BACKFILL_DAYS = int(os.getenv("BACKFILL_DAYS", "5"))
 # Only candles inside this window are stored (720 per asset per day).
 COLLECTION_START = os.getenv("COLLECTION_START", "00:00")
 COLLECTION_END = os.getenv("COLLECTION_END", "11:59")
-# Repeating collection interval, seconds (2 hours = 7200).
-COLLECTOR_INTERVAL_SECONDS = int(os.getenv("COLLECTOR_INTERVAL_SECONDS", "7200"))
-# Minutes of overlap on each 2-hourly run (re-fetch the last 10 min
+# Repeating collection interval, seconds (30 minutes = 1800 — the
+# owner, 2026-11-27: 2 hours left gaps open too long).
+COLLECTOR_INTERVAL_SECONDS = int(os.getenv("COLLECTOR_INTERVAL_SECONDS", "1800"))
+# Minutes of overlap on each run (re-fetch the last 10 min
 # so a slow/failed run cannot leave a gap; duplicates are ignored
 # by the UNIQUE(asset, ts) index).
 COLLECTOR_OVERLAP_MINUTES = int(os.getenv("COLLECTOR_OVERLAP_MINUTES", "10"))
 # Minutes to wait and retry after a Quotex 429 inside the collector.
 COLLECTOR_429_RETRY_MINUTES = int(os.getenv("COLLECTOR_429_RETRY_MINUTES", "10"))
 # Seconds to wait before re-fetching, once, the assets whose fetch
-# failed inside one 2-hourly run (a single timeout used to leave a
-# 2-hour hole in that asset — the owner, 2026-11-27).
+# failed inside one run (a single timeout used to leave a hole in
+# that asset — the owner, 2026-11-27).
 COLLECTOR_FAILED_ASSET_RETRY_SECONDS = int(os.getenv(
     "COLLECTOR_FAILED_ASSET_RETRY_SECONDS", "30") or 30)
 # Live candle stream (hybrid): one persistent Quotex WebSocket that
 # writes each closed 1-minute candle for every open asset into the DB
-# as it arrives. The 2-hourly batch collector stays the backbone
+# as it arrives. The batch collector stays the backbone
 # (gap-filling source of truth); the stream only makes data fresher.
 # Set LIVE_STREAM_ENABLED=false to turn the stream off — the bot then
-# works exactly as before, from the 2-hourly batch alone.
+# works exactly as before, from the batch collector alone.
 LIVE_STREAM_ENABLED = os.getenv("LIVE_STREAM_ENABLED", "true").strip().lower() in (
     "1", "true", "yes", "on")
 # Candle period the stream subscribes to (60 = 1-minute candles).

@@ -39,6 +39,22 @@ CREATE TABLE IF NOT EXISTS premium_requests (
     created_at TEXT,
     status TEXT DEFAULT 'pending'
 );
+-- MATRIX referral (the owner, 2026-11-27, Option B pricing):
+-- one invite link per referrer; one invited user counts once, ever
+-- (invited_id UNIQUE), so leave-and-rejoin cannot farm coins.
+CREATE TABLE IF NOT EXISTS referral_links (
+    referrer_id BIGINT PRIMARY KEY,
+    invite_link TEXT NOT NULL,
+    created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS referrals (
+    id SERIAL PRIMARY KEY,
+    referrer_id BIGINT NOT NULL,
+    invited_id BIGINT NOT NULL UNIQUE,
+    invite_link TEXT,
+    joined_at TEXT,
+    coins_awarded INTEGER NOT NULL DEFAULT 5
+);
 """
 
 SCHEMA_USERS_SQLITE = """
@@ -56,6 +72,19 @@ CREATE TABLE IF NOT EXISTS premium_requests (
     txn_hash TEXT,
     created_at TEXT,
     status TEXT DEFAULT 'pending'
+);
+CREATE TABLE IF NOT EXISTS referral_links (
+    referrer_id INTEGER PRIMARY KEY,
+    invite_link TEXT NOT NULL,
+    created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS referrals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    referrer_id INTEGER NOT NULL,
+    invited_id INTEGER NOT NULL UNIQUE,
+    invite_link TEXT,
+    joined_at TEXT,
+    coins_awarded INTEGER NOT NULL DEFAULT 5
 );
 """
 
@@ -89,6 +118,25 @@ def _ensure_last_seen_column():
             "last_seen column migration failed", exc_info=True)
 
 
+def _ensure_matrix_coins_column():
+    """Add the MATRIX coin balance column to a users table created
+    before referrals existed. Same tolerant pattern as last_seen:
+    a migration failure must never break the bot."""
+    try:
+        if _backend() == "postgres":
+            _execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS matrix_coins INTEGER NOT NULL DEFAULT 0")
+        else:
+            try:
+                _execute("ALTER TABLE users ADD COLUMN matrix_coins INTEGER NOT NULL DEFAULT 0")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc):
+                    raise
+    except Exception:
+        import logging
+        logging.getLogger("littlematrix.database").warning(
+            "matrix_coins column migration failed", exc_info=True)
+
+
 def _connect():
     global _CONN
     if _CONN is not None:
@@ -106,6 +154,7 @@ def _connect():
         _CONN.executescript(SCHEMA_USERS_SQLITE)
         _CONN.commit()
     _ensure_last_seen_column()
+    _ensure_matrix_coins_column()
     return _CONN
 
 
@@ -270,3 +319,125 @@ def get_auto_subscribers():
     cur = _execute(
         "SELECT telegram_id FROM users WHERE auto_signals=1")
     return [r[0] for r in cur.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# MATRIX referral (the owner, 2026-11-27, Option B pricing)
+# ---------------------------------------------------------------------------
+# Anti-abuse rules, enforced here in the database, not in the UI:
+# - one invited user counts once, ever (invited_id UNIQUE) — a
+#   leave-and-rejoin, or being invited by a second referrer, pays 0.
+# - a user inviting themself pays 0.
+# - coins can only be spent down to 0, never below, and never
+#   transferred to another user.
+# A person with many separate Telegram accounts can still look like
+# many new members — Telegram gives the bot only a user id, no
+# device/IP — so this is a real limit, not a bug in these rules.
+
+def get_coin_balance(telegram_id):
+    """MATRIX coin balance (0 for a user who never earned any)."""
+    get_or_create_user(telegram_id)
+    try:
+        row = _execute("SELECT matrix_coins FROM users WHERE telegram_id=?",
+                       (telegram_id,)).fetchone()
+    except Exception:
+        return 0
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def add_coins(telegram_id, amount):
+    """Add coins; returns the new balance."""
+    get_or_create_user(telegram_id)
+    _execute("UPDATE users SET matrix_coins = COALESCE(matrix_coins, 0) + ? "
+             "WHERE telegram_id=?", (amount, telegram_id))
+    return get_coin_balance(telegram_id)
+
+
+def spend_coins(telegram_id, amount):
+    """Deduct `amount` coins if the balance covers it.
+    Returns (True, new_balance) or (False, current_balance)."""
+    balance = get_coin_balance(telegram_id)
+    if balance < amount:
+        return False, balance
+    _execute("UPDATE users SET matrix_coins = COALESCE(matrix_coins, 0) - ? "
+             "WHERE telegram_id=?", (amount, telegram_id))
+    return True, get_coin_balance(telegram_id)
+
+
+def extend_premium(telegram_id, days):
+    """Premium for `days`, counted from the current expiry when the
+    user is already premium (so paid days are never lost), else now.
+    Returns the new premium_until ISO string."""
+    user = get_or_create_user(telegram_id)
+    start = datetime.now()
+    if user.get("premium_until"):
+        try:
+            current = datetime.fromisoformat(user["premium_until"])
+            if current > start:
+                start = current
+        except ValueError:
+            pass
+    until = (start + timedelta(days=days)).isoformat(timespec="seconds")
+    set_premium_until(telegram_id, until)
+    return until
+
+
+def get_referral_link(telegram_id):
+    row = _execute("SELECT invite_link FROM referral_links WHERE referrer_id=?",
+                   (telegram_id,)).fetchone()
+    return row[0] if row else None
+
+
+def save_referral_link(telegram_id, invite_link):
+    now = datetime.now().isoformat(timespec="seconds")
+    if _backend() == "postgres":
+        _execute("INSERT INTO referral_links (referrer_id, invite_link, created_at) "
+                 "VALUES (?, ?, ?) ON CONFLICT (referrer_id) DO UPDATE "
+                 "SET invite_link=EXCLUDED.invite_link, created_at=EXCLUDED.created_at",
+                 (telegram_id, invite_link, now))
+    else:
+        _execute("INSERT OR REPLACE INTO referral_links "
+                 "(referrer_id, invite_link, created_at) VALUES (?, ?, ?)",
+                 (telegram_id, invite_link, now))
+
+
+def get_referrer_for_link(invite_link):
+    row = _execute("SELECT referrer_id FROM referral_links WHERE invite_link=?",
+                   (invite_link,)).fetchone()
+    return int(row[0]) if row else None
+
+
+def record_referral(referrer_id, invited_id, invite_link, coins=5):
+    """Record a channel join via a referral link.
+
+    Returns (status, coins_awarded, new_balance):
+    - ("awarded", 5, balance): first-ever join of this user — coins paid.
+    - ("duplicate", 0, balance): this user already counted once.
+    - ("self", 0, balance): the referrer joined via their own link.
+    """
+    if referrer_id == invited_id:
+        return "self", 0, get_coin_balance(referrer_id)
+    existing = _execute("SELECT referrer_id FROM referrals WHERE invited_id=?",
+                        (invited_id,)).fetchone()
+    if existing:
+        return "duplicate", 0, get_coin_balance(referrer_id)
+    now = datetime.now().isoformat(timespec="seconds")
+    try:
+        _execute("INSERT INTO referrals (referrer_id, invited_id, invite_link, "
+                 "joined_at, coins_awarded) VALUES (?, ?, ?, ?, ?)",
+                 (referrer_id, invited_id, invite_link, now, coins))
+    except Exception:
+        # Lost a race with a second join event for the same user:
+        # the UNIQUE(invited_id) row already exists — pay nothing.
+        return "duplicate", 0, get_coin_balance(referrer_id)
+    return "awarded", coins, add_coins(referrer_id, coins)
+
+
+def get_referral_stats(telegram_id):
+    """{balance, joins, coins_earned} for one referrer."""
+    joins = _execute("SELECT COUNT(*), COALESCE(SUM(coins_awarded), 0) "
+                     "FROM referrals WHERE referrer_id=?",
+                     (telegram_id,)).fetchone()
+    return {"balance": get_coin_balance(telegram_id),
+            "joins": int(joins[0]) if joins else 0,
+            "coins_earned": int(joins[1]) if joins else 0}

@@ -218,7 +218,7 @@ class CandleDB:
         Duplicates (same asset+ts) are ignored by the UNIQUE index.
         Returns the number of NEW rows inserted.
         on_conflict="update" (batch/event truth only): a later insert
-        OVERWRITES the row — the 2-hourly batch and the server's own
+        OVERWRITES the row — the batch collector and the server's own
         closed-candle events correct tick-built rows (the tick builder
         inserts with "nothing" and can never overwrite truth)."""
         asset = normalize_asset_name(asset)

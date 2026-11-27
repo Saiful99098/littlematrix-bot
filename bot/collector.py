@@ -12,7 +12,7 @@ Anti-429 design (agreed with the owner):
   (1440 one-minute candles per asset per day). Only candles inside
   the window are stored.
 - Resumable: UNIQUE(asset, ts) ignores candles already in the DB,
-  and every 2-hourly run re-fetches the last 10 minutes as overlap.
+  and every run re-fetches the last 10 minutes as overlap.
   The backfill saves progress per batch: each batch of 3 assets is
   fetched AND stored immediately, and assets whose backfill span is
   already complete are skipped — so a Render sleep/restart resumes
@@ -24,8 +24,9 @@ Runs:
   plus today 00:00-now — so CHECKER can verify today's signals.
   One get_historical_candles() call per asset covers the whole
   5-day span; days are split locally.
-- Incremental (every 2 hours): the last 2 hours + 10 min overlap
-  for all open assets.
+- Incremental (every COLLECTOR_INTERVAL_SECONDS, 30 min since
+  2026-11-27): the last interval + 10 min overlap for all open
+  assets.
 """
 from __future__ import annotations
 
@@ -38,7 +39,7 @@ from .candles_db import DHAKA, utc_iso
 
 logger = logging.getLogger("littlematrix.collector")
 
-# One Quotex login at a time, across the whole process: the 2-hourly
+# One Quotex login at a time, across the whole process: the batch
 # collector runs and the live stream's reconnects share this lock, so
 # they can never log in simultaneously (two logins at once is what
 # trips Quotex 429). Only the login call itself is locked, never a
@@ -104,8 +105,15 @@ def today_window_utc(now=None):
     return start, min(now_utc, end)
 
 
-def recent_window_utc(now=None, hours=2, overlap_minutes=None):
-    """UTC range for one incremental run: last `hours` + overlap."""
+def recent_window_utc(now=None, hours=None, overlap_minutes=None):
+    """UTC range for one incremental run: last interval + overlap.
+
+    `hours` defaults to COLLECTOR_INTERVAL_SECONDS, so the window
+    follows the collection cadence (30 min + 10 min overlap now,
+    not the old 2h + 10 min). Pass `hours` explicitly to override
+    (tests do)."""
+    if hours is None:
+        hours = config.COLLECTOR_INTERVAL_SECONDS / 3600
     overlap = (overlap_minutes if overlap_minutes is not None
                else config.COLLECTOR_OVERLAP_MINUTES)
     now = now or dhaka_now()
@@ -267,7 +275,7 @@ class SharedQuotexSession:
         One subscribe per asset, with a small delay between them —
         sending 90 subscribes at once risks a ban/rate-limit (see the
         pyquotex README warning). A failed subscribe is logged and
-        skipped; the 2-hourly batch still collects that asset.
+        skipped; the batch collector still collects that asset.
         """
         # 2026-11-26: the name-based subscribe alone never delivered
         # a single 'candle-generated' event (live diagnostic: "no
@@ -512,7 +520,7 @@ async def run_backfill(db, session, days=None, now=None):
 
 
 async def run_incremental(db, session, now=None):
-    """Collect the last 2 hours (+10 min overlap) for all open assets.
+    """Collect the last interval (+10 min overlap) for all open assets.
 
     Each batch of 3 assets is fetched and stored immediately, so a
     restart keeps what was already collected.
@@ -521,13 +529,14 @@ async def run_incremental(db, session, now=None):
     now = now or dhaka_now()
     start, end = recent_window_utc(now)
     seconds_back = fetch_seconds_back(start, now)
+    mins = config.COLLECTOR_INTERVAL_SECONDS // 60
 
     assets = await session.get_open_assets()
     if not assets:
         logger.warning("collector: no open assets from Quotex, using sample list")
         assets = list(config.SAMPLE_ASSETS)
-    logger.info("collector: 2-hourly run starting — %d assets, window %s..%s Dhaka",
-                len(assets),
+    logger.info("collector: %d-minutely run starting — %d assets, window %s..%s Dhaka",
+                mins, len(assets),
                 start.astimezone(DHAKA).strftime("%H:%M"),
                 end.astimezone(DHAKA).strftime("%H:%M"))
 
@@ -546,12 +555,13 @@ async def run_incremental(db, session, now=None):
             done += 1
     # One retry for the assets whose fetch failed (the owner,
     # 2026-11-27: EURUSD-OTC stopped at 10:44 and the 12:00 run
-    # never filled it — a single fetch timeout left a 2-hour hole
-    # until the next run). Only the failed assets are re-fetched,
-    # after a short wait; a 429 still propagates to the caller.
+    # never filled it — a single fetch timeout left a hole in that
+    # asset until the next run). Only the failed assets are
+    # re-fetched, after a short wait; a 429 still propagates to the
+    # caller.
     if failed:
-        logger.warning("collector: 2-hourly run retrying %d failed "
-                       "asset(s): %s", len(failed), ", ".join(failed))
+        logger.warning("collector: %d-minutely run retrying %d failed "
+                       "asset(s): %s", mins, len(failed), ", ".join(failed))
         await asyncio.sleep(config.COLLECTOR_FAILED_ASSET_RETRY_SECONDS)
         raw_by_asset = await _fetch_assets_3_at_a_time(
             session, failed, seconds_back)
@@ -564,9 +574,9 @@ async def run_incremental(db, session, now=None):
     _safe_set_state(db, "last_collection", utc_iso(now))
     nxt = now + timedelta(seconds=config.COLLECTOR_INTERVAL_SECONDS)
     _safe_set_state(db, "next_collection", utc_iso(nxt))
-    logger.info("collector: 2-hourly run finished — %d assets, %d new candles, "
+    logger.info("collector: %d-minutely run finished — %d assets, %d new candles, "
                 "next run %s Dhaka",
-                done, total, nxt.strftime("%H:%M"))
+                mins, done, total, nxt.strftime("%H:%M"))
     return done, total
 
 
@@ -596,7 +606,7 @@ def get_status_summary(db, now=None):
     Times are Dhaka (the stored values are UTC). The live stream's
     own status is included too — the 'Quotex session' line only
     covers the collector, which is deliberately disconnected between
-    its 2-hourly runs.
+    its runs.
     """
     now = now or dhaka_now()
     total = db.count_total()
@@ -645,9 +655,14 @@ def log_status_summary(db, prefix="collector status"):
 # Background loop (started from main.py post_init)
 # ---------------------------------------------------------------------------
 async def _send_auto_signals(bot, db):
-    """After a 2-hourly collection, send the next window's top signals
+    """After a collection, send the next window's top signals
     to Auto Signal subscribers. Best-effort: failures are logged,
-    never raised — the collector loop must keep running."""
+    never raised — the collector loop must keep running.
+
+    One window is sent only once: the collector now runs every
+    30 minutes, so two runs in the same hour would otherwise send
+    the same next-hour window twice. The sent window key (date +
+    start-end) is stored in the DB state and checked first."""
     if bot is None:
         return
     try:
@@ -666,6 +681,9 @@ async def _send_auto_signals(bot, db):
         start_dt = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
         end_dt = start_dt + timedelta(hours=1, minutes=59)
         start, end = start_dt.strftime("%H:%M"), end_dt.strftime("%H:%M")
+        window_key = start_dt.strftime("%Y-%m-%d") + f" {start}-{end}"
+        if db.get_state("auto_signal_window") == window_key:
+            return  # this window was already sent by an earlier run
         today = now.strftime("%Y-%m-%d")
         all_dates = db.get_dates()
         completed = [d for d in all_dates if d < today] or all_dates
@@ -688,12 +706,13 @@ async def _send_auto_signals(bot, db):
                 await asyncio.sleep(0.1)
             except Exception as exc:
                 logger.warning("collector: auto signal to %s failed: %s", uid, exc)
+        _safe_set_state(db, "auto_signal_window", window_key)
     except Exception as exc:
         logger.warning("collector: auto signal send failed: %s", exc)
 
 
 async def collector_loop(db=None, session_factory=None, sleep=None, bot=None):
-    """Backfill once, then an incremental run every 2 hours, forever.
+    """Backfill once, then an incremental run every COLLECTOR_INTERVAL_SECONDS, forever.
 
     session_factory: callable returning a SharedQuotexSession
     (tests inject a fake one). sleep: awaitable seconds (tests inject
@@ -762,11 +781,11 @@ async def collector_loop(db=None, session_factory=None, sleep=None, bot=None):
             result = await _one_run("backfill")
             if result == "rate_limited":
                 logger.warning("collector: backfill hit 429 again, "
-                               "will retry on the next 2-hour cycle")
+                               "will retry on the next cycle")
         if result is True:
             log_status_summary(db, "collector: backfill done")
 
-    # --- then every 2 hours, forever ---
+    # --- then every COLLECTOR_INTERVAL_SECONDS, forever ---
     while True:
         await sleep(interval)
         try:

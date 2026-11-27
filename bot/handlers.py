@@ -5,7 +5,7 @@ Data source:
 - DATA_MODE=db (Render): signals + CHECKER + every analysis tool read
   ONLY from the candle database (Postgres on Render, SQLite locally).
   A background collector fills the DB (5-day backfill on startup,
-  then every 2 hours). No Quotex login happens for signals, CHECKER
+  then every 30 minutes). No Quotex login happens for signals, CHECKER
   or any menu button — that is the anti-429 design, and what lets
   many members use the bot at once.
 - DATA_MODE=live + Quotex login in .env: fetch yesterday's 1-day
@@ -31,7 +31,7 @@ logger = logging.getLogger("littlematrix.handlers")
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
-from . import candles_db, collector, config, database, quotex_client
+from . import candles_db, collector, config, database, quotex_client, referral
 from .checker import (build_lookup, check_signals, dot_date,
                       format_check_results, parse_checker_date,
                       parse_signal_line)
@@ -122,6 +122,7 @@ MAIN_MENU = [
      _btn("My Status", "menu_status", icon="status")],
     [_btn("About", "menu_about", icon="about"),
      _btn("Auto Signals", "menu_autolive", icon="autolive")],
+    [_btn("Referral — Earn Coins", "menu_referral", icon="premium")],
     [_btn("Premium — 5 USDT", "menu_premium", icon="premium", style="primary")],
     [_url_btn("Contact Owner", "https://t.me/LittleMatrix", icon="contact")],
 ]
@@ -1242,10 +1243,45 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         u = database.get_or_create_user(user.id, user.username or "")
         premium = f"{pe('diamond')}{pe('crown')} Premium" if database.is_premium(user.id) else "Free"
         until = u.get("premium_until") or "—"
+        coins = database.get_coin_balance(user.id)
         await query.edit_message_text(
             f"{pe('crown')}{pe('diamond')} My Status\n{DIVIDER}\nID: {user.id}\nStatus: {premium}\n"
-            f"Premium until: {until}",
+            f"Premium until: {until}\nMATRIX coins: {coins}",
             reply_markup=back_keyboard(), parse_mode="HTML")
+        return
+    if data == "menu_referral" or data.startswith("referral_spend_"):
+        # MATRIX referral (Option B, the owner, 2026-11-27):
+        # 1 join = 5 coins; 10 coins = 1 day Premium, 50 = 30 days.
+        if data.startswith("referral_spend_"):
+            try:
+                coins = int(data.rsplit("_", 1)[1])
+            except ValueError:
+                coins = 0
+            ok, days, result = referral.spend_reward(user.id, coins)
+            if ok:
+                await query.edit_message_text(
+                    f"{pe('diamond')}{pe('crown')} Premium activated for {days} day(s)! "
+                    f"Valid until {result}.",
+                    reply_markup=back_keyboard(), parse_mode="HTML")
+            else:
+                await query.edit_message_text(
+                    f"{pe('warning')} Not enough MATRIX coins — you have {result}, "
+                    f"and this costs {coins}. Invite more members to earn coins.",
+                    reply_markup=back_keyboard(), parse_mode="HTML")
+            return
+        link, err = await referral.get_my_invite_link(context.bot, user.id)
+        if link is None:
+            await query.edit_message_text(
+                f"{pe('warning')} {err}",
+                reply_markup=back_keyboard(), parse_mode="HTML")
+            return
+        stats = database.get_referral_stats(user.id)
+        kb = [[_btn("10 coins — 1 day Premium", "referral_spend_10", icon="premium"),
+               _btn("50 coins — 30 days Premium", "referral_spend_50", icon="premium")],
+              [_btn("Back", "menu_main", icon="back")]]
+        await query.edit_message_text(
+            referral.referral_text(stats, link),
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
         return
     if data == "menu_about":
         await query.edit_message_text(
@@ -1375,7 +1411,7 @@ async def _compute_futures_text_db(context, start, end):
     """FUTURES SIGNALS from the candle database (Render / db mode).
 
     No Quotex login anywhere in this function — every candle comes
-    from the DB (backfill + 2-hourly collector). Single asset:
+    from the DB (backfill + batch collector). Single asset:
     majority vote over the last N completed days with data.
     SELECT ALL: the same for every asset in the DB for this mode,
     then the cross-asset filter (win rate + strength, max 6/hour,
@@ -1624,7 +1660,7 @@ async def _run_market(query, assets=None, context=None):
     """Market Live detail for each picked market: last candle (Dhaka
     time, close, direction, and how old it is), today's high/low and
     candle count, EMA trend + RSI. DB only — the live stream keeps
-    the last candle at most ~1 minute old, the 2-hourly collector
+    the last candle at most ~1 minute old, the batch collector
     fills any gap. `assets` comes from the picker (str, list or None);
     None keeps the old default-asset behaviour."""
     assets = _resolve_analysis_assets(assets)

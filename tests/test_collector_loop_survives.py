@@ -72,7 +72,7 @@ def test_loop_survives_db_write_failure():
     db = FlakyDB(real)
     now = datetime(2026, 11, 25, 17, 12, tzinfo=DHAKA)
     # Backfill already done today (per the stored state), so the loop
-    # runs its pass and must reach the 2h sleep even though the
+    # runs its pass and must reach the interval sleep even though the
     # "disconnected" state write fails — that is the regression.
     real.set_state("backfill_done", "true")
     real.set_state("backfill_window", "full-day")
@@ -85,7 +85,7 @@ def test_loop_survives_db_write_failure():
     else:
         raise AssertionError("loop ended without reaching its sleep")
     print("PASS h) collector loop survives a failed state write — "
-          "next 2h cycle still scheduled")
+          "next cycle still scheduled")
 
 
 if __name__ == "__main__":

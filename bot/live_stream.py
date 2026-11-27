@@ -2,14 +2,14 @@
 writes each closed 1-minute candle for every open asset into the DB
 as it arrives.
 
-The 2-hourly batch collector stays the backbone (gap-filling source
+The batch collector stays the backbone (gap-filling source
 of truth); the stream only makes data fresher — AI Signal, Market
 Live, Trend Scan and Candle Scan then read candles at most ~1 minute
-old instead of up to 2 hours old, and the CHECKER finds the recent
+old instead of up to 30 minutes old, and the CHECKER finds the recent
 candles it needs right after a signal window ends.
 
 Safety, in order:
-- The batch collector still runs every 2 hours and fills any gap,
+- The batch collector still runs every 30 minutes and fills any gap,
   so a dead stream can never lose data permanently.
 - Inserts are idempotent (UNIQUE(asset, ts) — ON CONFLICT DO NOTHING),
   so a candle arriving via both stream and batch is stored once.
@@ -23,7 +23,7 @@ Safety, in order:
   logged loudly and retried, like the collector loop.
 
 Set LIVE_STREAM_ENABLED=false to turn the stream off; the bot then
-works exactly as before, from the 2-hourly batch alone.
+works exactly as before, from the batch collector alone.
 """
 from __future__ import annotations
 
@@ -66,7 +66,7 @@ def _row_from_event(asset, ev, prev_ts, prev_close):
     low, close. If open is missing, it is the previous candle's close
     — but only when the previous candle ends exactly where this one
     starts (continuous 1-min candles); otherwise the row is skipped
-    and the 2-hourly batch fills it with the true values. A guessed
+    and the batch collector fills it with the true values. A guessed
     open must never overwrite the batch's true candle (inserts are
     ON CONFLICT DO NOTHING).
     """
@@ -162,9 +162,9 @@ def _store_tick_candles(db, ticks, period, buckets, built_until, now_s):
     feed it through the vendored process_tick (open = first tick of
     the minute, close = latest, high/low = extremes). Closed minutes
     are inserted with on_conflict="nothing", so a tick-built row
-    never overwrites a batch/event row — the 2-hourly batch
+    never overwrites a batch/event row — the batch collector
     (on_conflict="update") corrects it with the server's true candle
-    within 2 hours. Returns (n_inserted, n_assets_with_ticks,
+    within 30 minutes. Returns (n_inserted, n_assets_with_ticks,
     newest_tick_ts|None)."""
     from pyquotex.utils.processor import process_tick
 
@@ -229,7 +229,7 @@ async def _poll_loop(db, session, sleep, assets=(), never_cool=None):
     channel never delivers at all — so closed minutes are ALSO
     built from live price ticks (_store_tick_candles), and the
     diagnostic says which channel is alive. The tail-fill and the
-    2-hourly batch keep the DB fed meanwhile, so silence is a
+    batch collector keep the DB fed meanwhile, so silence is a
     warning, never a crash.
     """
     period = config.LIVE_STREAM_PERIOD

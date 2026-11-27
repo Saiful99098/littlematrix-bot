@@ -102,14 +102,17 @@ def test_window_math():
     afternoon = datetime(2026, 11, 25, 15, 0, tzinfo=DHAKA)
     s, e = today_window_utc(afternoon)
     assert e == afternoon.astimezone(timezone.utc), (e, afternoon)
-    # recent window: last 2h + 10 min overlap.
+    # recent window: last interval (30 min) + 10 min overlap.
     s, e = recent_window_utc(now)
+    assert (e - s) == timedelta(minutes=40), (e - s)
+    # explicit hours still override the interval default.
+    s, e = recent_window_utc(now, hours=2)
     assert (e - s) == timedelta(hours=2, minutes=10), (e - s)
     # fetch seconds: from now back to the oldest backfill day 00:00 Dhaka.
     oldest_start, _ = day_window_utc(dates[-1])
     secs = fetch_seconds_back(oldest_start, now)
     assert secs > 5 * 24 * 3600 and secs < 6 * 24 * 3600, secs
-    print("PASS a) window math — 5 backfill days, 1440 min/day, 2h+10m window")
+    print("PASS a) window math — 5 backfill days, 1440 min/day, 30m+10m window")
 
 
 def test_db_roundtrip():
@@ -287,16 +290,20 @@ class FakeSession:
         start = now - timedelta(seconds=int(seconds_back))
         out = []
         t = start.replace(second=0, microsecond=0)
-        i = 0
         while t <= now:
             base = 19.90 if asset == "USDMXN_otc" else 1.08
+            # Minute index since the epoch: the same minute always
+            # gets the same candle, whatever span was fetched (like
+            # the real server). A running counter made values depend
+            # on the span start, so a 30-min re-fetch of already
+            # stored minutes wrongly counted as new rows.
+            i = int(t.timestamp()) // 60
             o = base + (i % 10) * 0.001
             c = o + 0.001 if i % 2 == 0 else o - 0.001
             out.append({"time": int(t.timestamp()), "open": o,
                         "high": max(o, c) + 0.001, "low": min(o, c) - 0.001,
                         "close": c})
             t += timedelta(minutes=1)
-            i += 1
         return out
 
     async def close(self):
@@ -346,17 +353,17 @@ def test_collector_backfill_fake():
     # The backfill stamps its window version, so a later restart with
     # the same window skips it instead of re-collecting.
     assert db.get_state("backfill_window") == "full-day"
-    # Incremental run at 12:00: last 2h+10m = 09:50-12:00, all already
+    # Incremental run at 12:00: last 30m+10m = 11:20-12:00, all already
     # stored -> 0 new.
     done3, total3 = asyncio.run(
         run_incremental(db, FakeSession(now=now), now=now))
     assert total3 == 0, total3
-    # Incremental run at 09:00 with an empty DB: 06:50-09:00 = 130 min.
+    # Incremental run at 09:00 with an empty DB: 08:20-09:00 = 40 min.
     db2 = _tmp_db()
     morning = datetime(2026, 11, 25, 9, 0, tzinfo=DHAKA)
     _, total4 = asyncio.run(
         run_incremental(db2, FakeSession(now=morning), now=morning))
-    assert total4 == 2 * 130, total4
+    assert total4 == 2 * 40, total4
     print("PASS f) collector backfill (fake session) — 1440/day/asset, "
           "re-run inserts 0, incremental window correct")
 
@@ -597,13 +604,66 @@ def test_incremental_retries_failed_assets():
             run_incremental(db, session, now=morning))
     finally:
         config_mod.COLLECTOR_FAILED_ASSET_RETRY_SECONDS = old_retry
-    # Both assets collected in the SAME run (2 x 130 minutes),
+    # Both assets collected in the SAME run (2 x 40 minutes),
     # EURUSD fetched twice (failed once, retried once).
     assert done == 2, done
-    assert total == 2 * 130, total
+    assert total == 2 * 40, total
     assert session.calls["EURUSD_otc"] == 2, session.calls
-    assert len(db.get_candles("EURUSD_otc", "2026-11-25")) == 130
+    assert len(db.get_candles("EURUSD_otc", "2026-11-25")) == 40
     print("PASS i) incremental run retries a failed asset in the same run")
+
+
+class _FakeBot:
+    """Records telegram send_message calls (auto-signal test)."""
+
+    def __init__(self):
+        self.sent = []
+
+    async def send_message(self, chat_id, text, parse_mode=None):
+        self.sent.append((chat_id, text))
+
+
+def test_auto_signals_sent_once_per_window():
+    """j) The owner, 2026-11-27: the collector now runs every 30 min,
+    so two runs in one hour would send the same next-hour window
+    twice. One window is sent only once — the second call for the
+    same window sends nothing. Three synthetic days feed the
+    generator; strong CALLs are forced at the next hour's :00/:07/:14
+    on every day so the window always has signals."""
+    from bot.collector import _send_auto_signals, dhaka_now
+    import bot.database as users_db
+    from synthetic_data import force_candle, make_day, to_raw
+
+    db = _tmp_db()
+    now = dhaka_now()
+    start_dt = (now + timedelta(hours=1)).replace(
+        minute=0, second=0, microsecond=0)
+    hh = start_dt.strftime("%H")
+    today = now.date()
+    dates = [(today - timedelta(days=i)).strftime("%Y-%m-%d")
+             for i in (3, 2, 1)]
+    for k, d in enumerate(dates):
+        day = make_day("USDMXN_otc", d, seed=7 + k)
+        for mm in ("00", "07", "14"):
+            force_candle(day, f"{hh}:{mm}", "CALL")
+        rows = rows_from_raw(to_raw(day))
+        db.insert_candles("USDMXN_otc", rows)
+    bot = _FakeBot()
+    old = users_db.get_auto_subscribers
+    users_db.get_auto_subscribers = lambda: [123]
+    try:
+        asyncio.run(_send_auto_signals(bot, db))
+        assert len(bot.sent) == 1, bot.sent
+        assert "AUTO SIGNALS" in bot.sent[0][1], bot.sent[0][1][:80]
+        end_hh = (start_dt + timedelta(hours=1)).strftime("%H")
+        key = db.get_state("auto_signal_window")
+        assert key == (start_dt.strftime("%Y-%m-%d")
+                       + f" {hh}:00-{end_hh}:59"), key
+        asyncio.run(_send_auto_signals(bot, db))
+        assert len(bot.sent) == 1, "second call re-sent the same window"
+    finally:
+        users_db.get_auto_subscribers = old
+    print("PASS j) auto signals sent once per window (30-min runs)")
 
 
 def main():
@@ -621,7 +681,8 @@ def main():
     test_post_init_starts_collector_only_when_active()
     test_handlers_db_end_to_end()
     test_incremental_retries_failed_assets()
-    print("ALL TESTS PASSED (14/14)")
+    test_auto_signals_sent_once_per_window()
+    print("ALL TESTS PASSED (15/15)")
 
 
 if __name__ == "__main__":
