@@ -120,13 +120,32 @@ def _candles_for(db, asset, date_str):
     return db.get_candles(asset, date_str)
 
 
+class _RealSleep:
+    """Counting sleep that also yields real time, so a background
+    task (the tail-fill) gets to run and finish before the loop
+    stops — the plain _CountingSleep never yields, so the background
+    task would be cancelled before it stores anything. Used only by
+    the tests that assert a tail-fill candle reached the DB."""
+
+    def __init__(self, max_calls, delay=1.0):
+        self.calls = 0
+        self.max_calls = max_calls
+        self.delay = delay
+
+    async def __call__(self, seconds):
+        self.calls += 1
+        if self.calls > self.max_calls:
+            raise _StopLoop
+        await asyncio.sleep(self.delay)
+
+
 def test_stream_stores_generated_candles():
     db, tmp = _tmp_db()
     session = FakeSession(event_from_poll=2)
     try:
         asyncio.run(live_stream.live_stream_loop(
             db=db, session_factory=lambda: session,
-            sleep=_CountingSleep(max_calls=5)))
+            sleep=_RealSleep(max_calls=5)))
     except _StopLoop:
         pass
     else:
@@ -154,7 +173,7 @@ def test_stream_reconnects_and_tail_fills():
     try:
         asyncio.run(live_stream.live_stream_loop(
             db=db, session_factory=lambda: session,
-            sleep=_CountingSleep(max_calls=6)))
+            sleep=_RealSleep(max_calls=6)))
     except _StopLoop:
         pass
     else:
@@ -860,6 +879,87 @@ def test_stream_assets_includes_missing_recent_otc():
           "from the open list")
 
 
+def test_tail_fill_skips_current_assets():
+    """v) The owner, 2026-11-27: the tail-fill fetched every asset's
+    full 10-min floor span even when the asset was current — 90
+    assets in batches of 3 is what froze the stream for ~10 min at
+    startup (the 20:41 freeze). It must skip assets whose last
+    candle is within the skip window and fetch only the stale ones."""
+    db, tmp = _tmp_db()
+    now = datetime(2026, 11, 27, 20, 40, tzinfo=DHAKA)
+    for asset, age in (("BTCUSD_otc", 60), ("ETHUSD_otc", 1800)):
+        db.insert_candles(asset, [{
+            "ts": now.astimezone(timezone.utc) - timedelta(seconds=age),
+            "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5}])
+    fetched = []
+
+    class _RecSession(FakeSession):
+        async def fetch_asset_span(self, asset, seconds_back):
+            fetched.append(asset)
+            return []
+
+    session = _RecSession(tail_candles=[])
+    asyncio.run(live_stream._tail_fill(
+        db, session, ["BTCUSD_otc", "ETHUSD_otc"], now=now))
+    assert fetched == ["ETHUSD_otc"], fetched
+    print("PASS v) tail-fill skips current assets, fetches only stale ones")
+
+
+class _YieldingClockSleep(_ClockSleep):
+    """Like _ClockSleep, but yields to the event loop once, so a
+    background task (the tail-fill) gets to start before the poll
+    loop's fake clock runs it to the stop signal."""
+
+    def __init__(self, clock, max_calls):
+        super().__init__(clock, max_calls)
+        self.yielded = False
+
+    async def __call__(self, seconds):
+        if not self.yielded:
+            self.yielded = True
+            await asyncio.sleep(0)
+        return await super().__call__(seconds)
+
+
+def test_poll_loop_runs_while_tail_fill_is_slow():
+    """w) The owner, 2026-11-27: the 20:41 freeze — the tail-fill ran
+    BEFORE the poll loop, so a slow tail-fill (timed-out fetches)
+    froze the stream for ~10 min and the staleness trigger could not
+    fire. Now the tail-fill runs in the background: the poll loop
+    must store live tick candles even while the tail-fill is still
+    fetching."""
+    db, tmp = _tmp_db()
+    start = int(datetime(2026, 11, 27, 12, 0, tzinfo=timezone.utc).timestamp())
+    clock = _FakeClock(start)
+    fetched = []
+
+    class _SlowTailSession(_TickScriptSession):
+        async def fetch_asset_span(self, asset, seconds_back):
+            fetched.append(asset)
+            # A slow history fetch (real time) — the old code would
+            # have blocked the poll loop on this for seconds.
+            await asyncio.sleep(2)
+            return []
+
+    session = _SlowTailSession(clock, eth_stop=start + 10000)
+    real_time = live_stream.time
+    live_stream.time = clock
+    try:
+        asyncio.run(live_stream.live_stream_loop(
+            db=db, session_factory=lambda: session,
+            sleep=_YieldingClockSleep(clock, max_calls=30)))
+    except _StopLoop:
+        pass
+    finally:
+        live_stream.time = real_time
+    # The tail-fill started (it is slow, not skipped)...
+    assert fetched, fetched
+    # ...and the poll loop still stored live tick candles while it ran.
+    rows = db.get_candles("BTCUSD_otc", "2026-11-27")
+    assert rows, rows
+    print("PASS w) poll loop stores live ticks while the tail-fill is slow")
+
+
 if __name__ == "__main__":
     test_stream_stores_generated_candles()
     test_stream_reconnects_and_tail_fills()
@@ -882,4 +982,6 @@ if __name__ == "__main__":
     test_stream_ignores_never_ticked_asset_with_old_candle()
     test_never_ticked_cooldown_bounds_reconnects()
     test_stream_assets_includes_missing_recent_otc()
+    test_tail_fill_skips_current_assets()
+    test_poll_loop_runs_while_tail_fill_is_slow()
     print("ALL LIVE-STREAM TESTS PASSED")

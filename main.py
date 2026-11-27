@@ -27,6 +27,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger("littlematrix")
 
+# Update types the bot actually handles (the owner, 2026-11-27):
+# Telegram's default when allowed_updates is omitted EXCLUDES
+# chat_member (and message_reaction), so the channel-join handler
+# never fired and referral coins were never credited — joins came
+# and went with no coin and no welcome DM, and nothing logged it.
+# List every type the bot has a handler for, so a missing type is
+# a visible choice here, not a silent Telegram default.
+ALLOWED_UPDATES = ["message", "callback_query", "chat_member",
+                   "my_chat_member", "channel_post"]
+
 
 def _ensure_event_loop():
     """Create + set an event loop in the main thread, BEFORE any
@@ -187,6 +197,13 @@ async def channel_member_update(update, context):
                 from bot import referral
                 status, coins, referrer_id, balance = referral.attribute_join(
                     user.id, link)
+                # Log every attribution (the owner, 2026-11-27): before
+                # this the referral block swallowed all outcomes, so a
+                # join that earned no coin left no trace at all.
+                logger.info(
+                    "referral: join %s via %s -> %s (coins=%s, "
+                    "referrer=%s, balance=%s)",
+                    user.id, link, status, coins, referrer_id, balance)
                 if status == "awarded" and referrer_id:
                     from bot.handlers import pe as _pe2
                     await context.bot.send_message(
@@ -293,10 +310,11 @@ def main():
         logger.info("Blue Fish Prime bot starting (webhook, Render) — "
                     "listening %s:%d, webhook %s", listen, port, webhook_url)
         app.run_webhook(listen=listen, port=port, url_path=url_path,
-                        webhook_url=webhook_url)
+                        webhook_url=webhook_url,
+                        allowed_updates=ALLOWED_UPDATES)
     else:
         logger.info("Blue Fish Prime bot starting (polling, local test)...")
-        app.run_polling()
+        app.run_polling(allowed_updates=ALLOWED_UPDATES)
     return 0
 
 

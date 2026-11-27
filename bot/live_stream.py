@@ -58,6 +58,30 @@ _NEVER_TICKED_RECENT_SECONDS = 86400
 # asset within this long (2h) — bounds reconnect flapping when a
 # subscription stays broken.
 _NEVER_TICKED_COOLDOWN_SECONDS = 7200
+# Tail-fill skip window (the owner, 2026-11-27): an asset whose last
+# stored candle is this fresh has no gap worth fetching — the fetch
+# floor is 10 min, so fetching it would only re-store minutes the DB
+# already has. Skipping current assets is what keeps the tail-fill
+# cheap in the normal case.
+_TAIL_FILL_SKIP_SECONDS = 120
+
+
+def _tail_is_stale(db, asset, now):
+    """True when the asset's last DB candle is older than the skip
+    window (or missing/unreadable) — it has a real gap worth fetching."""
+    try:
+        last = db.last_candle_time(asset)
+    except Exception:
+        return True
+    if not last:
+        return True
+    try:
+        last_dt = datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=timezone.utc)
+    except ValueError:
+        return True
+    return ((now.astimezone(timezone.utc) - last_dt).total_seconds()
+            > _TAIL_FILL_SKIP_SECONDS)
 
 
 def _row_from_event(asset, ev, prev_ts, prev_close):
@@ -141,14 +165,24 @@ def _pick_stream_assets(assets, test_asset):
 async def _tail_fill(db, session, assets, now=None):
     """Fetch only each asset's missing tail (last stored candle ->
     now) and store it — closes the gap a disconnect left behind.
-    Reuses the collector's tail machinery; never raises."""
+    Reuses the collector's tail machinery; never raises.
+
+    Assets already current (last candle within _TAIL_FILL_SKIP_SECONDS)
+    are skipped: fetching them would only re-store minutes the DB
+    already has (the fetch floor is 10 min), and skipping them is
+    what keeps the tail-fill cheap in the normal case — a restart a
+    minute after the old instance stopped has almost nothing to fetch.
+    """
     now = now or dhaka_now()
     try:
         dates = backfill_dates(config.BACKFILL_DAYS, now)
         oldest_start, _ = day_window_utc(dates[-1])
+        todo = [a for a in assets if _tail_is_stale(db, a, now)]
+        if not todo:
+            return
         spans = {a: _tail_seconds_back(db, a, oldest_start, now)
-                 for a in assets}
-        results = await _fetch_assets_3_at_a_time(session, assets, spans)
+                 for a in todo}
+        results = await _fetch_assets_3_at_a_time(session, todo, spans)
         total = 0
         for asset, raw in results.items():
             if not raw:
@@ -501,6 +535,7 @@ async def live_stream_loop(db=None, session_factory=None, sleep=None):
                 config.LIVE_STREAM_PERIOD)
     while True:
         session = None
+        tail_task = None
         try:
             session = session_factory()
             await session.connect()
@@ -510,7 +545,18 @@ async def live_stream_loop(db=None, session_factory=None, sleep=None):
             assets = _pick_stream_assets(assets, config.LIVE_STREAM_TEST_ASSET)
             logger.info("live stream: subscribed to %d assets", len(assets))
             await session.start_asset_streams(assets, config.LIVE_STREAM_PERIOD)
-            await _tail_fill(db, session, assets)
+            # PERMANENT delay fix (the owner, 2026-11-27): the tail-fill
+            # used to run BEFORE the poll loop, so a slow tail-fill
+            # (timed-out history fetches) froze the stream for ~10 min
+            # — no live tick was stored and the staleness trigger could
+            # not fire either, which is exactly the 20:41 freeze on
+            # 2026-11-27. Now the poll loop starts at once and the
+            # tail-fill runs in the background: live ticks flow from
+            # the first second, the gaps fill behind them. The
+            # tail-fill shares this session's history-fetch channel
+            # while the poll loop only reads local tick buffers, so
+            # they do not interfere; and the tail-fill never raises.
+            tail_task = asyncio.create_task(_tail_fill(db, session, assets))
             _safe_set_state(db, "live_stream_status", "connected")
             run_started = time.monotonic()
             await _poll_loop(db, session, sleep, assets, never_cool)
@@ -528,6 +574,17 @@ async def live_stream_loop(db=None, session_factory=None, sleep=None):
             logger.warning("live stream: %s", exc)
         finally:
             _safe_set_state(db, "live_stream_status", "reconnecting")
+            # Stop the background tail-fill before closing the session
+            # it fetches through — otherwise it would keep fetching
+            # against a closed session and log failures.
+            if tail_task is not None and not tail_task.done():
+                tail_task.cancel()
+                try:
+                    await asyncio.wait_for(tail_task, timeout=5)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+                except Exception:
+                    pass
             if session is not None:
                 try:
                     await session.close()
