@@ -258,7 +258,13 @@ def dot_date(date_str):
     return f"{d}.{m}.{y}"
 
 
-def format_check_results(results, summary, date_str=None, header=True):
+_MODE_LABEL = {"OTC": "OTC SIGNAL", "REAL": "REAL MARKET SIGNAL",
+               "BLACKOUT": "BLACKOUT SIGNAL",
+               "WHITEOUT": "WHITEOUT SIGNAL"}
+
+
+def format_check_results(results, summary, date_str=None, header=True,
+                         mode="OTC"):
     """Format checker output for Telegram — the owner's template
     (2026-11-27), premium emojis, signal text in monospace.
 
@@ -275,18 +281,29 @@ def format_check_results(results, summary, date_str=None, header=True):
     One Accuracy line only: in MTG mode the win/loss counts above
     already count MTG1 wins as wins, so there is no separate
     "MTG1 Accuracy" line (the owner, 2026-11-26).
+    mode (the owner, 2026-11-27): the header names which signal was
+    checked — "OTC SIGNAL Check Results", "WHITEOUT SIGNAL Check
+    Results", and so on — so a pasted result is never ambiguous.
+    The DATE line carries premium emojis around the date (same pair
+    as the FS date line). Signal lines are separated by a blank line
+    (the owner, 2026-11-27: packed lines looked cramped), and a
+    long list is cut to whole lines under Telegram's 4096-char cap
+    with a "… +N more lines" note — the Total / Accuracy footer
+    still counts the whole list.
     """
     _sym = {"WIN": pe("check"), "LOSS": pe("cross"),
             "DOJI": pe("minus"), "NO DATA": "?"}
-    out = []
+    head = []
     if header:
-        out.append(f"{pe('search')}{pe('diamond')} Check Results"
-                   f"{pe('search')}{pe('diamond')}")
-        out.append(DIVIDER)
+        label = _MODE_LABEL.get(mode, "OTC SIGNAL")
+        head.append(f"{pe('search')}{pe('diamond')} {label} Check Results"
+                    f"{pe('search')}{pe('diamond')}")
+        head.append(DIVIDER)
         if date_str:
-            out.append(f"DATE: {dot_date(date_str)}")
-        out.append(f"{pe('next')}1 MINUTES:")
-        out.append(f"    {pe('fire')} BLUE FISH PRIME {pe('fire')}")
+            head.append(f"DATE: {pe('sparkle')}{dot_date(date_str)}{pe('star')}")
+        head.append(f"{pe('next')}1 MINUTES:")
+        head.append(f"    {pe('fire')} BLUE FISH PRIME {pe('fire')}")
+    sig_lines = []
     for r in results:
         asset = r['asset'].upper().replace("_OTC", "-OTC")
         if r.get("mtg1"):
@@ -308,10 +325,22 @@ def format_check_results(results, summary, date_str=None, header=True):
         sig = f"{asset},{r['hhmm']} M1"
         if r.get("direction"):
             sig += f" {r['direction']}"
-        out.append(f"<code>{sig}</code> {emoji}")
-    out.append("")
-    out.append(f"{pe('chart')} Total: {summary['total']} | {pe('check')} {summary['win']} | "
-               f"{pe('cross')} {summary['loss']} | {pe('minus')} {summary['doji']} | "
-               f"? {summary['no_data']}")
-    out.append(f"{pe('crown')} Accuracy: {summary['win_pct']}% {pe('fire')}")
-    return "\n".join(out)
+        sig_lines.append(f"<code>{sig}</code> {emoji}")
+    foot = (f"{pe('chart')} Total: {summary['total']} | {pe('check')} {summary['win']} | "
+            f"{pe('cross')} {summary['loss']} | {pe('minus')} {summary['doji']} | "
+            f"? {summary['no_data']}\n"
+            f"{pe('crown')} Accuracy: {summary['win_pct']}% {pe('fire')}")
+    text = "\n".join(head)
+    kept = 0
+    for ln in sig_lines:
+        add = ("\n\n" + ln) if text else ln
+        # Reserve room for the footer (plus its leading blank line).
+        if len(text) + len(add) + 2 + len(foot) > 4000:
+            break
+        text += add
+        kept += 1
+    dropped = len(sig_lines) - kept
+    if dropped:
+        text += f"\n\n… +{dropped} more lines"
+    text += "\n\n" + foot
+    return text

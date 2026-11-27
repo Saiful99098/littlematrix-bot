@@ -169,6 +169,8 @@ def test_fs_template_and_footer():
     text = handlers._fit_futures_text(head, lines, bw)
     assert text.count("<code>") == text.count("</code>"), text[-200:]
     assert "+1" in text or "more" in text, text[-200:]
+    # A blank line sits between signal lines (the owner, 2026-11-27).
+    assert "\n\n<code>USDARS-OTC,09:01 M1 PUT</code>" in text, text
     print("PASS 4) FS template — title, DD.MM.YYYY date, MTG 1 STEP, "
           "% line, no old extra lines; Rules footer blackout/whiteout only")
 
@@ -184,11 +186,32 @@ def test_checker_template():
     summary = {"total": 2, "win": 1, "loss": 1, "doji": 0,
                "no_data": 0, "win_pct": 50.0}
     text = format_check_results(results, summary, date_str="2026-11-27")
-    assert "Check Results" in text, text
-    assert "DATE: 27.11.2026" in text, text
+    assert "OTC SIGNAL Check Results" in text, text
+    # DATE line carries premium emojis around the date (same pair as
+    # the FS date line, the owner, 2026-11-27).
+    assert f"DATE: {pe('sparkle')}27.11.2026{pe('star')}" in text, text
     assert "<code>USDPKR-OTC,02:39 M1 PUT</code>" in text, text
     assert "Total: 2" in text, text
     assert "Accuracy: 50.0%" in text, text
+    # A blank line sits between signal lines (the owner, 2026-11-27:
+    # packed lines looked cramped) — also before the first line.
+    assert "\n\n<code>USDPKR-OTC,02:39 M1 PUT</code>" in text, text
+    assert "\n\n<code>USDPKR-OTC,02:40 M1 CALL</code>" in text, text
+    # The header names the mode that was checked.
+    w_text = format_check_results(results, summary, date_str="2026-11-27",
+                                  mode="WHITEOUT")
+    assert "WHITEOUT SIGNAL Check Results" in w_text, w_text
+    # A very long list is cut to whole lines under the Telegram cap,
+    # with a note — the footer still counts the whole list.
+    many = [{"asset": "USDPKR_otc", "hhmm": f"{h:02d}:{m:02d}",
+             "direction": "CALL", "result": "WIN", "actual": "CALL"}
+            for h in range(10) for m in range(10)]
+    many_sum = {"total": 100, "win": 100, "loss": 0, "doji": 0,
+                "no_data": 0, "win_pct": 100.0}
+    long_text = format_check_results(many, many_sum, date_str="2026-11-27")
+    assert len(long_text) <= 4000, len(long_text)
+    assert "more lines" in long_text, long_text
+    assert "Total: 100" in long_text, long_text
     # No header for Backtest Lab.
     plain = format_check_results(results, summary, header=False)
     assert "Check Results" not in plain, plain
@@ -262,7 +285,9 @@ def test_checker_blackout_derived():
     assert results_m[0]["mtg1"] == "WIN", results_m
     assert summary_m["win"] == 1 and summary_m["loss"] == 0, summary_m
     assert summary_m["win_pct"] == 100.0
-    text = format_check_results(results_m, summary_m, date_str=d)
+    text = format_check_results(results_m, summary_m, date_str=d,
+                                mode="BLACKOUT")
+    assert "BLACKOUT SIGNAL Check Results" in text, text
     dotted = [ln for ln in text.splitlines()
               if "USDARS-OTC,09:07" in ln][0]
     assert dotted.endswith(pe("check") + "."), dotted
@@ -306,9 +331,11 @@ def test_admin_stats_and_keyboard():
         admin_kb = handlers.main_keyboard(admin=True)
         admin_btns = [b for row in admin_kb.inline_keyboard for b in row]
         assert any(b.callback_data == "menu_admin" for b in admin_btns)
+        assert any(b.callback_data == "menu_botstatus" for b in admin_btns)
         plain_kb = handlers.main_keyboard(admin=False)
         plain_btns = [b for row in plain_kb.inline_keyboard for b in row]
         assert not any(b.callback_data == "menu_admin" for b in plain_btns)
+        assert not any(b.callback_data == "menu_botstatus" for b in plain_btns)
         old_admins = config.ADMIN_USER_IDS
         try:
             config.ADMIN_USER_IDS = {5618029321}
@@ -482,8 +509,10 @@ def test_checker_four_mode_flow():
         assert "USDARS-OTC,09:07 M1" in upd.message.texts[-1], upd.message.texts
         upd2 = _send_text(ctx, "USDARS-OTC,09:02 M1\nUSDARS-OTC,09:07 M1")
         result = upd2.message.working.texts[-1]
-        assert "Check Results" in result, result
-        assert "DATE: 25.11.2026" in result, result
+        assert "BLACKOUT SIGNAL Check Results" in result, result
+        assert f"DATE: {pe('sparkle')}25.11.2026{pe('star')}" in result, result
+        # A blank line sits between the two signal lines.
+        assert "\n\n<code>USDARS-OTC,09:07 M1</code>" in result, result
         # 09:02 is a blackout WIN (T-1 green -> PUT, T red);
         # 09:07 lost M1 but recovered on MTG1 (09:08 red) -> dot.
         win_line = [ln for ln in result.splitlines()

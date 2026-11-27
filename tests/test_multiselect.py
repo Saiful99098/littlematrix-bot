@@ -386,7 +386,10 @@ def test_botstatus_refresh():
     db, tmp = _tmp_db()
     _load_today(db, "BTCUSD_otc")
     restore = _setup(db)
+    old_admins = config.ADMIN_USER_IDS
     try:
+        # Bot Status is owner-only (the owner, 2026-11-27).
+        config.ADMIN_USER_IDS = {999}  # FakeUser id
         ctx = FakeContext()
         q = FakeQuery("menu_botstatus")
         _drive(ctx, q, "menu_botstatus")
@@ -396,9 +399,28 @@ def test_botstatus_refresh():
         _drive(ctx, q, "refresh")
         assert len(q.texts) > n_before, q.texts
         assert "BOT STATUS" in q.texts[-1], q.texts[-1]
+        # The main menu shows Bot Status ONLY to the owner.
+        import bot.handlers as handlers
+        admin_btns = [b for row in handlers.main_keyboard(admin=True).inline_keyboard
+                      for b in row]
+        assert any(b.callback_data == "menu_botstatus" for b in admin_btns)
+        plain_btns = [b for row in handlers.main_keyboard(admin=False).inline_keyboard
+                      for b in row]
+        assert not any(b.callback_data == "menu_botstatus" for b in plain_btns)
+        # A non-admin tapping the button (or a crafted callback)
+        # gets a denial, not the status — and Refresh on a Bot
+        # Status message is a no-op for them.
+        config.ADMIN_USER_IDS = {5618029321}
+        q2 = FakeQuery("menu_botstatus")
+        _drive(ctx, q2, "menu_botstatus")
+        assert "Only the owner can see Bot Status." in q2.texts[-1], q2.texts[-1]
+        n2 = len(q2.texts)
+        _drive(ctx, q2, "refresh")
+        assert len(q2.texts) == n2, q2.texts
     finally:
+        config.ADMIN_USER_IDS = old_admins
         restore()
-    print("PASS g) Bot Status has Refresh and re-reads the database")
+    print("PASS g) Bot Status has Refresh and re-reads the database (owner only)")
 
 
 def test_payouts_as_buttons():

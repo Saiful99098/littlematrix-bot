@@ -122,20 +122,20 @@ MAIN_MENU = [
      _btn("My Status", "menu_status", icon="status")],
     [_btn("About", "menu_about", icon="about"),
      _btn("Auto Signals", "menu_autolive", icon="autolive")],
-    [_btn("Bot Status", "menu_botstatus", icon="bot_status")],
     [_btn("Premium — 5 USDT", "menu_premium", icon="premium", style="primary")],
     [_url_btn("Contact Owner", "https://t.me/LittleMatrix", icon="contact")],
 ]
 
 
 def main_keyboard(admin=False):
-    """The main menu. The Admin Dashboard row is appended ONLY for
-    the owner (the owner, 2026-11-27) — no other user, premium or
-    free, ever sees the option. `admin` is the caller's check
-    (user.id in config.ADMIN_USER_IDS)."""
+    """The main menu. The Admin Dashboard and Bot Status rows are
+    appended ONLY for the owner (the owner, 2026-11-27) — no other
+    user, premium or free, ever sees those options. `admin` is the
+    caller's check (user.id in config.ADMIN_USER_IDS)."""
     rows = [list(r) for r in MAIN_MENU]
     if admin:
         rows.append([_btn("Admin Dashboard", "menu_admin", icon="admin")])
+        rows.append([_btn("Bot Status", "menu_botstatus", icon="bot_status")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -789,6 +789,10 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["fs_pct"] = pct
             await _run_futures(query, context, start, end, animate=False)
         elif spec[0] == "botstatus":
+            # Bot Status is owner-only (the owner, 2026-11-27) — a
+            # crafted callback from anyone else gets nothing.
+            if not _is_admin(user.id):
+                return
             await _run_bot_status(query, context)
         elif spec[0] == "payouts":
             await _run_payouts(query, context)
@@ -919,7 +923,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(
                 f"{pe('hourglass')} The database is still collecting — no candles yet. {pe('diamond')}\n"
                 "The backfill collects the last 5 days first. "
-                "Press Bot Status to see the progress, then try again.",
+                "Please try again in a bit.",
                 reply_markup=back_keyboard(), parse_mode="HTML")
             return
         # Live mode: show EVERY open asset from Quotex (get_all_assets).
@@ -1042,6 +1046,14 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "menu_botstatus":
+        # Bot Status is owner-only (the owner, 2026-11-27). The
+        # button is hidden from everyone else, but a crafted
+        # callback could still reach this — check again here.
+        if not _is_admin(user.id):
+            await query.edit_message_text(
+                "Only the owner can see Bot Status.",
+                reply_markup=back_keyboard(), parse_mode="HTML")
+            return
         await _run_bot_status(query, context)
         return
     if data == "menu_ai":
@@ -1328,17 +1340,18 @@ def _fit_futures_text(header, lines, footer, limit=3950):
     """Join header + signal lines + footer, dropping whole lines
     from the end when the Telegram 4096-char cap would cut a line
     (or a <code> tag) in half. Dropped lines are counted, never
-    silently lost."""
+    silently lost. Signal lines are separated by a blank line (the
+    owner, 2026-11-27: packed lines looked cramped)."""
     body = header
     kept = 0
     for ln in lines:
-        if len(body) + 1 + len(ln) + len(footer) > limit:
+        if len(body) + 2 + len(ln) + len(footer) > limit:
             break
-        body += "\n" + ln
+        body += "\n\n" + ln
         kept += 1
     dropped = len(lines) - kept
     if dropped:
-        body += f"\n… +{dropped} more (narrow the window or raise the %)"
+        body += f"\n\n… +{dropped} more (narrow the window or raise the %)"
     return body + footer
 
 
@@ -1394,7 +1407,7 @@ async def _compute_futures_text_db(context, start, end):
         if not db_assets:
             return (f"{pe('cross')} No candles for the selected assets in the database yet.\n"
                     "The backfill collects the last 5 days first. "
-                    "Press Bot Status to see the progress, then try again.")
+                    "Please try again in a bit.")
         all_dates = db.get_dates()
         completed = [d for d in all_dates if d < today] or all_dates
         dates = completed[-days:]
@@ -1416,7 +1429,7 @@ async def _compute_futures_text_db(context, start, end):
     if not dates:
         return (f"{pe('cross')} No candles for {display_asset(asset)} in the database yet.\n"
                 "The backfill collects the last 5 days first. "
-                "Press Bot Status to see the progress, then try again.")
+                "Please try again in a bit.")
     signals = _gen(asset, dates)
     lines = [f"<code>{ln}</code>" for ln in
              format_signals_list(signals, show_direction=not is_bw)]
@@ -1829,7 +1842,7 @@ async def _run_ai_signal(query, context, assets=None, animate=True):
         await query.edit_message_text(
             f"{pe('cross')} No candles in the database yet.\n"
             "The backfill collects the last 5 days first. "
-            "Press Bot Status to see the progress, then try again.",
+            "Please try again in a bit.",
             reply_markup=back_keyboard(), parse_mode="HTML")
         return
     sections = []
@@ -2145,7 +2158,8 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         results, summary = check_signals(lines, lookup, check_date,
                                          with_mtg1=with_mtg1, mode=mode)
         await working.edit_text(
-            format_check_results(results, summary, date_str=check_date),
+            format_check_results(results, summary, date_str=check_date,
+                                 mode=mode),
             reply_markup=back_keyboard(), parse_mode="HTML")
         context.user_data["flow"] = None
         return
