@@ -739,6 +739,98 @@ def test_dead_background_task_restarts():
     print("PASS q) a dead background task restarts itself (budget 5 in 10 min)")
 
 
+def _never_ticked_setup(clock_start, eth_candle_ts):
+    """Fake clock at `clock_start` + a DB with one ETHUSD candle at
+    `eth_candle_ts` (or None for no candle). Returns (db, clock)."""
+    db, tmp = _tmp_db()
+    clock = _FakeClock(clock_start)
+    if eth_candle_ts is not None:
+        db.insert_candles("ETHUSD_otc", [{
+            "ts": datetime.fromtimestamp(eth_candle_ts, tz=timezone.utc),
+            "open": 200.0, "high": 201.0, "low": 199.0, "close": 200.5}])
+    return db, tmp, clock
+
+
+def test_stream_reconnects_when_subscribed_asset_never_ticks():
+    """r) The owner, 2026-11-27: 20 major forex OTC pairs sat at
+    10:44 while exotics kept ticking — they never ticked in the new
+    run, so neither the global check nor the per-asset silence
+    check could fire for them. A subscribed asset that was trading
+    recently but delivers no tick at all in this run has a broken
+    subscription — the loop reconnects so the tail-fill can heal it."""
+    start = int(datetime(2026, 11, 27, 12, 0, tzinfo=timezone.utc).timestamp())
+    db, tmp, clock = _never_ticked_setup(
+        start, start - 1800)  # ETH candle 30 min before the run
+    session = _TickScriptSession(clock, eth_stop=start)  # ETH never ticks
+    real_time = live_stream.time
+    live_stream.time = clock
+    cap = _CaptureHandler()
+    logger = logging.getLogger("littlematrix.live_stream")
+    logger.addHandler(cap)
+    try:
+        asyncio.run(live_stream.live_stream_loop(
+            db=db, session_factory=lambda: session,
+            sleep=_ClockSleep(clock, max_calls=300)))
+    except _StopLoop:
+        pass
+    finally:
+        live_stream.time = real_time
+        logger.removeHandler(cap)
+    assert session.connects >= 2, session.connects
+    hit = [m for m in cap.records if "never ticked" in m]
+    assert hit, cap.records
+    assert "ETHUSD_otc" in hit[0], hit
+    print("PASS r) stream reconnects when a subscribed asset never ticks")
+
+
+def test_stream_ignores_never_ticked_asset_with_old_candle():
+    """s) A subscribed asset whose last candle is days old (delisted
+    or long-closed) must NOT trigger a reconnect — only recently
+    trading assets count as broken subscriptions."""
+    start = int(datetime(2026, 11, 27, 12, 0, tzinfo=timezone.utc).timestamp())
+    db, tmp, clock = _never_ticked_setup(
+        start, start - 2 * 86400)  # ETH candle 2 days before the run
+    session = _TickScriptSession(clock, eth_stop=start)  # ETH never ticks
+    real_time = live_stream.time
+    live_stream.time = clock
+    try:
+        asyncio.run(live_stream.live_stream_loop(
+            db=db, session_factory=lambda: session,
+            sleep=_ClockSleep(clock, max_calls=100)))
+    except _StopLoop:
+        pass
+    finally:
+        live_stream.time = real_time
+    assert session.connects == 1, session.connects
+    print("PASS s) stream ignores a never-ticked asset whose last candle is old")
+
+
+def test_never_ticked_cooldown_bounds_reconnects():
+    """t) After a never-ticked reconnect, the same asset must not
+    re-trigger until its cooldown expires — otherwise a persistently
+    broken subscription would flap the stream every 10 minutes."""
+    start = int(datetime(2026, 11, 27, 12, 0, tzinfo=timezone.utc).timestamp())
+    db, tmp, clock = _never_ticked_setup(start, start - 1800)
+    session = _TickScriptSession(clock, eth_stop=start)  # ETH never ticks
+    real_time = live_stream.time
+    live_stream.time = clock
+    old_cool = live_stream._NEVER_TICKED_COOLDOWN_SECONDS
+    live_stream._NEVER_TICKED_COOLDOWN_SECONDS = 60
+    try:
+        asyncio.run(live_stream.live_stream_loop(
+            db=db, session_factory=lambda: session,
+            sleep=_ClockSleep(clock, max_calls=300)))
+    except _StopLoop:
+        pass
+    finally:
+        live_stream.time = real_time
+        live_stream._NEVER_TICKED_COOLDOWN_SECONDS = old_cool
+    # Initial connect + two never-ticked reconnects (one per grace
+    # window once the 60s test cooldown expired).
+    assert session.connects >= 3, session.connects
+    print("PASS t) never-ticked cooldown bounds reconnects")
+
+
 if __name__ == "__main__":
     test_stream_stores_generated_candles()
     test_stream_reconnects_and_tail_fills()
@@ -757,4 +849,7 @@ if __name__ == "__main__":
     test_stream_reconnects_when_one_asset_goes_silent()
     test_stream_ignores_never_ticked_asset()
     test_dead_background_task_restarts()
+    test_stream_reconnects_when_subscribed_asset_never_ticks()
+    test_stream_ignores_never_ticked_asset_with_old_candle()
+    test_never_ticked_cooldown_bounds_reconnects()
     print("ALL LIVE-STREAM TESTS PASSED")

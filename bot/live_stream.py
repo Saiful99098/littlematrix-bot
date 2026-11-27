@@ -48,6 +48,16 @@ from .collector import (
 
 logger = logging.getLogger("littlematrix.live_stream")
 
+# A subscribed asset counts as "was trading recently" when its last
+# stored candle is within this long (24h). Used by the never-ticked
+# check: a subscribed asset that was trading recently but delivers
+# no tick at all in this run has a broken subscription.
+_NEVER_TICKED_RECENT_SECONDS = 86400
+# After a never-ticked reconnect, don't re-trigger for the same
+# asset within this long (2h) — bounds reconnect flapping when a
+# subscription stays broken.
+_NEVER_TICKED_COOLDOWN_SECONDS = 7200
+
 
 def _row_from_event(asset, ev, prev_ts, prev_close):
     """One closed-candle server event -> DB row, or None to skip.
@@ -199,12 +209,14 @@ def _store_tick_candles(db, ticks, period, buckets, built_until, now_s):
     return inserted, n_assets, newest_ts
 
 
-async def _poll_loop(db, session, sleep, n_assets=0):
+async def _poll_loop(db, session, sleep, assets=(), never_cool=None):
     """Watch for newly closed candles and store them.
 
-    Returns only when the connection is lost or goes stale — the
-    caller reconnects. Raises nothing except the injected sleep's
-    stop signal (tests) and QuotexRateLimited.
+    Returns only when the connection is lost, goes stale, one asset
+    goes silent while others tick, or a subscribed asset never ticks
+    at all in this run — the caller reconnects. Raises nothing
+    except the injected sleep's stop signal (tests) and
+    QuotexRateLimited.
 
     Diagnostic (the owner, 2026-11-26): the stream can sit
     "connected" while delivering nothing — Bot Status then shows
@@ -223,6 +235,8 @@ async def _poll_loop(db, session, sleep, n_assets=0):
     period = config.LIVE_STREAM_PERIOD
     poll = config.LIVE_STREAM_POLL_SECONDS
     stale_after = config.LIVE_STREAM_STALE_MINUTES * 60
+    n_assets = len(assets)
+    never_cool = never_cool if never_cool is not None else {}
     diag_polls = max(1, int(60 // poll))  # ~60s between diagnostic lines
     last_ts = {}     # asset -> datetime (UTC) of last stored stream candle
     last_close = {}  # asset -> close of that candle
@@ -246,6 +260,28 @@ async def _poll_loop(db, session, sleep, n_assets=0):
     tick_buckets = {}
     built_until = {}
     last_tick = {}  # asset -> newest tick unix-seconds seen in THIS run
+    loop_started = time.monotonic()
+    # Assets that were trading recently (last DB candle within 24h)
+    # but have not ticked at all in THIS run — see the never-ticked
+    # check at the end of the poll. Closed assets are never in the
+    # open-assets list, so a subscribed asset in this set is one
+    # whose subscription is broken, not one whose market is shut.
+    expected = {}
+    if assets:
+        now_ts = time.time()
+        for asset in assets:
+            try:
+                prev = db.last_candle(asset)
+            except Exception:
+                prev = None
+            if not prev or prev.get("ts") is None:
+                continue
+            try:
+                age = now_ts - prev["ts"].timestamp()
+            except Exception:
+                continue
+            if age < _NEVER_TICKED_RECENT_SECONDS:
+                expected[asset] = prev["ts"]
     while True:
         await sleep(poll)
         if not await session.is_connected():
@@ -403,6 +439,34 @@ async def _poll_loop(db, session, sleep, n_assets=0):
                 "others still tick (%s%s) — reconnecting",
                 len(silent), config.LIVE_STREAM_STALE_MINUTES, shown, extra)
             return
+        # Never ticked at all in this run (the owner, 2026-11-27):
+        # 20 major forex OTC pairs sat at 10:44 while exotics kept
+        # ticking — they never ticked in the new run, so neither the
+        # global check nor the per-asset silence check above could
+        # fire for them. A subscribed asset that was trading
+        # recently but stays completely silent for the whole stale
+        # window — the run must be older than the window first, so
+        # subscriptions have time to deliver first ticks — while
+        # others tick has a broken subscription. Reconnect so the
+        # tail-fill can heal it. A per-asset cooldown (2h) bounds
+        # reconnect flapping when the subscription stays broken.
+        if expected and fresh and time.monotonic() - loop_started > stale_after:
+            now_mono = time.monotonic()
+            never = [a for a in expected
+                     if a not in last_tick
+                     and now_mono - never_cool.get(a, 0)
+                     > _NEVER_TICKED_COOLDOWN_SECONDS]
+            if never:
+                for a in never:
+                    never_cool[a] = now_mono
+                shown = ", ".join(sorted(never)[:10])
+                extra = (f" +{len(never) - 10} more"
+                         if len(never) > 10 else "")
+                logger.warning(
+                    "live stream: %d subscribed asset(s) never ticked "
+                    "in this run while others tick (%s%s) — reconnecting",
+                    len(never), shown, extra)
+                return
 
 
 async def live_stream_loop(db=None, session_factory=None, sleep=None):
@@ -415,6 +479,10 @@ async def live_stream_loop(db=None, session_factory=None, sleep=None):
     session_factory = session_factory or SharedQuotexSession
     sleep = sleep or asyncio.sleep
     backoff = 30
+    # Per-asset cooldown for the never-ticked reconnect trigger —
+    # shared across reconnects so one broken subscription cannot
+    # flap the stream every 10 minutes.
+    never_cool = {}
     logger.info("live stream: starting (all open assets, %d-second candles)",
                 config.LIVE_STREAM_PERIOD)
     while True:
@@ -431,7 +499,7 @@ async def live_stream_loop(db=None, session_factory=None, sleep=None):
             await _tail_fill(db, session, assets)
             _safe_set_state(db, "live_stream_status", "connected")
             run_started = time.monotonic()
-            await _poll_loop(db, session, sleep, len(assets))
+            await _poll_loop(db, session, sleep, assets, never_cool)
             # A long clean run resets the backoff; a flapping
             # connection keeps doubling it (up to 5 minutes).
             if time.monotonic() - run_started > 300:
