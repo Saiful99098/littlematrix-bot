@@ -132,12 +132,30 @@ def main_keyboard(admin=False):
     """The main menu. The Admin Dashboard and Bot Status rows are
     appended ONLY for the owner (the owner, 2026-11-27) — no other
     user, premium or free, ever sees those options. `admin` is the
-    caller's check (user.id in config.ADMIN_USER_IDS)."""
+    caller's check (user.id in config.ADMIN_USER_IDS). The owner
+    never sees the user-only buttons either (the owner, 2026-11-27):
+    Referral and Premium are for earning/buying premium, and
+    Contact Owner points at himself — those stay for the users."""
     rows = [list(r) for r in MAIN_MENU]
     if admin:
+        rows = [r for r in rows
+                if not any(_is_user_only_button(b) for b in r)]
         rows.append([_btn("Admin Dashboard", "menu_admin", icon="admin")])
         rows.append([_btn("Bot Status", "menu_botstatus", icon="bot_status")])
     return InlineKeyboardMarkup(rows)
+
+
+# Buttons that exist for the users, not the owner: Referral and
+# Premium (callback buttons) and Contact Owner (a URL button to the
+# owner's own Telegram — it has no callback_data, so it is matched
+# by its URL).
+_USER_ONLY_CALLBACKS = {"menu_referral", "menu_premium"}
+_USER_ONLY_URLS = {"https://t.me/LittleMatrix"}
+
+
+def _is_user_only_button(button):
+    return (getattr(button, "callback_data", None) in _USER_ONLY_CALLBACKS
+            or getattr(button, "url", None) in _USER_ONLY_URLS)
 
 
 def _is_admin(user_id):
@@ -259,7 +277,9 @@ async def _gap_fill_job(bot, chat_id, db=None, session_factory=None,
     scans the DB (no login) — if there are no gaps it says so
     without logging in at all. Sends a progress message, then edits
     it with the result, so the owner taps Fill Gaps on the dashboard
-    and gets the answer here without leaving Telegram. Returns the
+    and gets the answer here without leaving Telegram. The result
+    message carries a Back button (the owner, 2026-11-27) — tapping
+    it turns that message back into the main menu. Returns the
     fill_gaps() tuple, or None when the run failed. Never raises.
     """
     db = db or _db()
@@ -321,21 +341,28 @@ async def _gap_fill_job(bot, chat_id, db=None, session_factory=None,
             text = (f"{pe('check')} Gap-fill for {date_str} done: "
                     f"{assets} asset(s), {gaps} gap(s), "
                     f"{candles} new candles.")
+    # The result carries a Back button (the owner, 2026-11-27): the
+    # result text would otherwise sit in the chat below the menu
+    # forever. Tapping Back edits THIS message into the main menu,
+    # so the result goes away and the menu comes back.
     if msg is not None:
         try:
             await bot.edit_message_text(chat_id=chat_id,
                                         message_id=msg.message_id,
-                                        text=text, parse_mode="HTML")
+                                        text=text, parse_mode="HTML",
+                                        reply_markup=back_keyboard())
         except Exception:
             try:
                 await bot.send_message(chat_id=chat_id, text=text,
-                                       parse_mode="HTML")
+                                       parse_mode="HTML",
+                                       reply_markup=back_keyboard())
             except Exception:
                 pass
     else:
         try:
             await bot.send_message(chat_id=chat_id, text=text,
-                                   parse_mode="HTML")
+                                   parse_mode="HTML",
+                                   reply_markup=back_keyboard())
         except Exception:
             pass
     return result if isinstance(result, tuple) else None

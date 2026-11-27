@@ -427,11 +427,17 @@ class RecordingBot(FakeBot):
     def __init__(self):
         self.edits = []  # (chat_id, message_id, text)
         self.sends = []  # (chat_id, text)
+        # reply_markup per edit/send, in the same order — so tests can
+        # assert a message carries the Back button (the owner,
+        # 2026-11-27) without changing the tuple shapes above.
+        self.edit_markups = []
+        self.send_markups = []
         self._next_mid = 1000
 
     async def send_message(self, chat_id=None, text=None,
                            reply_markup=None, parse_mode=None, **kwargs):
         self.sends.append((chat_id, text))
+        self.send_markups.append(reply_markup)
         self._next_mid += 1
         return FakeMessage(self._next_mid)
 
@@ -439,6 +445,7 @@ class RecordingBot(FakeBot):
                                 text=None, reply_markup=None,
                                 parse_mode=None, **kwargs):
         self.edits.append((chat_id, message_id, text))
+        self.edit_markups.append(reply_markup)
         return None
 
 
@@ -727,6 +734,12 @@ def test_admin_fill_gaps_job():
     assert any("Gap-fill started" in (t or "") for _, t in bot.sends), bot.sends
     assert any("1 asset(s), 1 gap(s), 352 new candles" in (t or "")
                for _, _, t in bot.edits), bot.edits
+    # The result message carries a Back button (the owner, 2026-11-27)
+    # — tapping it turns the message back into the main menu.
+    assert bot.edit_markups[-1] is not None, bot.edit_markups
+    assert [b.callback_data
+            for row in bot.edit_markups[-1].inline_keyboard
+            for b in row] == ["menu_main"], bot.edit_markups[-1].inline_keyboard
     # c) No gaps -> no Quotex login at all.
     db2, tmp2 = _tmp_db()
     _seed_day_with_hole(db2, "EURUSD_otc", date, 1440, 1440)  # full day
@@ -737,6 +750,11 @@ def test_admin_fill_gaps_job():
     assert result2 == (0, 0, 0), result2
     assert session2.connects == 0, session2.connects
     assert any("no gaps found" in (t or "") for _, _, t in bot2.edits), bot2.edits
+    # The "no gaps" result carries the Back button too.
+    assert bot2.edit_markups[-1] is not None, bot2.edit_markups
+    assert [b.callback_data
+            for row in bot2.edit_markups[-1].inline_keyboard
+            for b in row] == ["menu_main"], bot2.edit_markups[-1].inline_keyboard
     # d) A 429 on the first pass waits and retries once.
     db3, tmp3 = _tmp_db()
     _seed_day_with_hole(db3, "USDPHP_otc", date, 161, 513)
@@ -983,6 +1001,61 @@ def test_checker_long_list_sent_in_parts():
           "Back on the last part")
 
 
+# ---------------------------------------------------------------------------
+# 14) Gap-fill result Back button (the owner, 2026-11-27: the result
+# text sat below the menu forever — it now carries a Back button,
+# and tapping it turns that message back into the main menu)
+# ---------------------------------------------------------------------------
+def test_gap_fill_result_back_button():
+    old_admins = config.ADMIN_USER_IDS
+    old_user = handlers.database.get_or_create_user
+    try:
+        config.ADMIN_USER_IDS = {999}
+        handlers.database.get_or_create_user = lambda *a, **k: None
+        ctx = FakeContext()
+        q = FakeQuery("menu_main")
+        _drive(ctx, q, "menu_main")
+        assert "BLUE FISH PRIME" in q.texts[-1], q.texts[-1]
+        assert "Pick a tool below" in q.texts[-1], q.texts[-1]
+        cbs = [b.callback_data for row in q.markups[-1].inline_keyboard
+               for b in row]
+        assert "menu_checker" in cbs, cbs
+        assert "menu_admin" in cbs, cbs
+    finally:
+        config.ADMIN_USER_IDS = old_admins
+        handlers.database.get_or_create_user = old_user
+    print("PASS 14) gap-fill result Back button -> main menu")
+
+
+# ---------------------------------------------------------------------------
+# 15) Owner menu hides the user-only buttons (the owner, 2026-11-27:
+# Contact Owner, Referral and Premium are for the users, not for
+# him — his menu must not show them)
+# ---------------------------------------------------------------------------
+def test_owner_menu_hides_user_only_buttons():
+    user_kb = handlers.main_keyboard(admin=False)
+    user_cbs = [b.callback_data for row in user_kb.inline_keyboard
+                for b in row]
+    user_urls = [b.url for row in user_kb.inline_keyboard
+                 for b in row if getattr(b, "url", None)]
+    assert "menu_referral" in user_cbs, user_cbs
+    assert "menu_premium" in user_cbs, user_cbs
+    assert "https://t.me/LittleMatrix" in user_urls, user_urls
+    owner_kb = handlers.main_keyboard(admin=True)
+    owner_cbs = [b.callback_data for row in owner_kb.inline_keyboard
+                 for b in row]
+    owner_urls = [b.url for row in owner_kb.inline_keyboard
+                  for b in row if getattr(b, "url", None)]
+    assert "menu_referral" not in owner_cbs, owner_cbs
+    assert "menu_premium" not in owner_cbs, owner_cbs
+    assert "https://t.me/LittleMatrix" not in owner_urls, owner_urls
+    # The owner still gets his own rows, and the rest of the menu.
+    assert "menu_admin" in owner_cbs, owner_cbs
+    assert "menu_botstatus" in owner_cbs, owner_cbs
+    assert "menu_checker" in owner_cbs, owner_cbs
+    print("PASS 15) owner menu hides Contact Owner / Referral / Premium")
+
+
 def main():
     test_prev_minute_engine()
     test_gap_removed_in_fs_generators()
@@ -999,7 +1072,9 @@ def main():
     test_channel_post_ignored()
     test_split_message()
     test_checker_long_list_sent_in_parts()
-    print("ALL EDIT-ROUND TESTS PASSED (13/13)")
+    test_gap_fill_result_back_button()
+    test_owner_menu_hides_user_only_buttons()
+    print("ALL EDIT-ROUND TESTS PASSED (15/15)")
 
 
 if __name__ == "__main__":
