@@ -786,6 +786,79 @@ def test_incremental_includes_missing_recent_otc_assets():
           "missing from the open list")
 
 
+def _seed_day_with_hole(db, asset, date_str, hole_start_min, hole_end_min,
+                        base=1.08):
+    """One full Dhaka day of candles for `asset` except the minutes
+    [hole_start_min, hole_end_min) — the shape of a morning hole
+    (e.g. USDPHP 02:41-08:32). Returns the number of candles stored."""
+    day = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=DHAKA)
+    rows = []
+    for minute in range(1440):
+        if hole_start_min <= minute < hole_end_min:
+            continue
+        ts = day + timedelta(minutes=minute)
+        o = base + (minute % 10) * 0.001
+        c = o + 0.001 if minute % 2 == 0 else o - 0.001
+        rows.append({"ts": ts, "open": o, "high": max(o, c) + 0.001,
+                     "low": min(o, c) - 0.001, "close": c})
+    return db.insert_candles(asset, rows, on_conflict="nothing")
+
+
+def test_find_gaps_detects_missing_ranges():
+    """m) The owner, 2026-11-27: USDPHP_otc lost 02:41-08:32 and
+    SOLUSD_otc 01:28-08:32 — holes in the middle of the day that the
+    tail-fill and the incremental collector never heal. find_gaps()
+    must report exactly those ranges, and nothing before the asset's
+    first candle (a real-market asset opening at 08:33 is not
+    'missing' 00:00-08:32)."""
+    from bot.collector import find_gaps
+
+    db = _tmp_db()
+    date = "2026-11-25"
+    now = datetime(2026, 11, 25, 12, 0, tzinfo=DHAKA)
+    # USDPHP: full day except 02:41-08:32 (minutes 161-512).
+    _seed_day_with_hole(db, "USDPHP_otc", date, 161, 513)
+    gaps = find_gaps(db, "USDPHP_otc", date, now=now)
+    assert len(gaps) == 1, gaps
+    gs, ge = gaps[0]
+    assert gs.astimezone(DHAKA).strftime("%H:%M") == "02:41", gaps
+    assert ge.astimezone(DHAKA).strftime("%H:%M") == "08:33", gaps
+    # A complete day has no gaps.
+    _seed_day_with_hole(db, "EURUSD_otc", date, 1440, 1440)  # no hole
+    assert find_gaps(db, "EURUSD_otc", date, now=now) == []
+    # An asset whose first candle is 08:33: no gap before it.
+    _seed_day_with_hole(db, "XAUUSD", date, 0, 513)  # first candle 08:33
+    assert find_gaps(db, "XAUUSD", date, now=now) == []
+    # An asset with no candles at all: no gaps (closed market).
+    assert find_gaps(db, "F40EUR", date, now=now) == []
+    print("PASS m) find_gaps reports exactly the middle-of-day holes")
+
+
+def test_fill_gaps_fills_missing_ranges():
+    """n) fill_gaps() fetches exactly the missing ranges (one fetch
+    per asset) and stores them, so a morning hole closes; dry-run
+    lists the gaps without storing anything."""
+    from bot.collector import fill_gaps, find_gaps
+
+    db = _tmp_db()
+    date = "2026-11-25"
+    now = datetime(2026, 11, 25, 12, 0, tzinfo=DHAKA)
+    _seed_day_with_hole(db, "USDPHP_otc", date, 161, 513)
+    assert len(find_gaps(db, "USDPHP_otc", date, now=now)) == 1
+    # Dry run: gaps counted, nothing stored.
+    result = asyncio.run(fill_gaps(db, FakeSession(now=now), date_str=date,
+                                   assets=["USDPHP_otc"], now=now, dry_run=True))
+    assert result == (1, 1, 0), result
+    assert len(find_gaps(db, "USDPHP_otc", date, now=now)) == 1
+    # Real run: one fetch covers the hole; the gap closes.
+    result = asyncio.run(fill_gaps(db, FakeSession(now=now), date_str=date,
+                                   assets=["USDPHP_otc"], now=now))
+    assert result == (1, 1, 352), result
+    assert find_gaps(db, "USDPHP_otc", date, now=now) == []
+    assert len(db.get_candles("USDPHP_otc", date)) == 1440
+    print("PASS n) fill_gaps closes a morning hole with one fetch per asset")
+
+
 def main():
     test_window_math()
     test_db_roundtrip()
@@ -804,7 +877,9 @@ def main():
     test_auto_signals_sent_once_per_window()
     test_loop_retries_failed_run_once()
     test_incremental_includes_missing_recent_otc_assets()
-    print("ALL TESTS PASSED (17/17)")
+    test_find_gaps_detects_missing_ranges()
+    test_fill_gaps_fills_missing_ranges()
+    print("ALL TESTS PASSED (19/19)")
 
 
 if __name__ == "__main__":

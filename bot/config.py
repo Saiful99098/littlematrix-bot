@@ -140,9 +140,15 @@ LIVE_STREAM_PERIOD = int(os.getenv("LIVE_STREAM_PERIOD", "60") or 60)
 LIVE_STREAM_SUBSCRIBE_DELAY = float(os.getenv("LIVE_STREAM_SUBSCRIBE_DELAY", "0.2") or 0.2)
 # Seconds between checks for newly closed candles.
 LIVE_STREAM_POLL_SECONDS = float(os.getenv("LIVE_STREAM_POLL_SECONDS", "5") or 5)
-# Minutes with no new candle from any asset before the stream treats
-# the connection as dead and reconnects.
-LIVE_STREAM_STALE_MINUTES = int(os.getenv("LIVE_STREAM_STALE_MINUTES", "10") or 10)
+# Minutes an asset may stay quiet (while others still tick) before
+# the stream treats its subscription as broken and reconnects — the
+# per-asset silence trigger and the never-ticked grace both use this.
+# 3 minutes since 2026-11-27 (the owner: the socket flaps every
+# ~15 min and drops half the subscriptions, so a 10-minute wait left
+# the count halved for 10 minutes after every flap). A shorter wait
+# heals faster; the never-ticked 2h per-asset cooldown still bounds
+# reconnect flapping when a subscription stays broken.
+LIVE_STREAM_STALE_MINUTES = int(os.getenv("LIVE_STREAM_STALE_MINUTES", "3") or 3)
 # TEST MODE for the silent-stream investigation (2026-11-26): when
 # set to one asset name (e.g. BTCUSD-OTC), the stream subscribes to
 # that asset only — if events flow for one asset, the server caps

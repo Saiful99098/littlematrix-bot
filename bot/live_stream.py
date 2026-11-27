@@ -494,7 +494,8 @@ async def live_stream_loop(db=None, session_factory=None, sleep=None):
     backoff = 30
     # Per-asset cooldown for the never-ticked reconnect trigger —
     # shared across reconnects so one broken subscription cannot
-    # flap the stream every 10 minutes.
+    # flap the stream every few minutes (the stale window is 3 min
+    # since 2026-11-27).
     never_cool = {}
     logger.info("live stream: starting (all open assets, %d-second candles)",
                 config.LIVE_STREAM_PERIOD)

@@ -506,6 +506,130 @@ def _store_rows(db, asset, raw, ts_min, ts_max=None):
     return len(rows), db.insert_candles(asset, rows, on_conflict="update")
 
 
+def find_gaps(db, asset, date_str, now=None):
+    """Missing 1-minute ranges for one asset on one Dhaka date.
+
+    The tail-fill and the incremental collector only fill the RECENT
+    tail/window, so a hours-old hole in the middle of the day (the
+    owner, 2026-11-27: USDPHP_otc 02:41-08:32, SOLUSD_otc 01:28-08:32)
+    is never healed by them. This finds those holes so fill_gaps()
+    can fetch exactly them.
+
+    Returns [(start_utc, end_utc), ...] with end exclusive — each
+    range is a run of missing minutes. Only minutes AFTER the asset's
+    first candle of the day count: a real-market asset that opens at
+    08:33 is not "missing" 00:00-08:32, its market was shut. The
+    still-forming current minute is never a gap. Assets with no
+    candles at all on the date have no gaps (closed market — nothing
+    to fill). Never raises: a DB read failure returns [].
+    """
+    now = now or dhaka_now()
+    try:
+        rows = db.get_candles(asset, date_str)
+    except Exception:
+        return []
+    if not rows:
+        return []
+    day_start, day_end = day_window_utc(date_str)
+    now_utc = now.astimezone(timezone.utc)
+    # Last minute that can be complete: the minute that started at
+    # or before now (the current minute is still forming).
+    end = min(now_utc.replace(second=0, microsecond=0), day_end)
+    present = {int(r["time"]) for r in rows}
+    first = min(present)
+    gaps = []
+    t = max(day_start, datetime.fromtimestamp(first, tz=timezone.utc))
+    # Align to the minute grid (stored times are minute-aligned).
+    t = t.replace(second=0, microsecond=0)
+    gap_start = None
+    while t < end:
+        ts = int(t.timestamp())
+        if ts not in present:
+            if gap_start is None:
+                gap_start = t
+        elif gap_start is not None:
+            gaps.append((gap_start, t))
+            gap_start = None
+        t += timedelta(minutes=1)
+    if gap_start is not None:
+        gaps.append((gap_start, end))
+    return gaps
+
+
+async def fill_gaps(db, session, date_str=None, assets=None, now=None,
+                    dry_run=False):
+    """Fill the middle-of-day holes find_gaps() reports.
+
+    One fetch per asset (span = first gap start -> now, via the same
+    3-at-a-time fetcher the collector uses), then each gap range is
+    stored from those rows — so a 6-hour hole costs one fetch, not
+    one per minute. Returns (assets_filled, gaps_filled,
+    candles_inserted). With dry_run=True nothing is fetched or
+    stored — the gaps are only counted and logged. Raises
+    QuotexRateLimited (the caller waits 10 minutes and retries once,
+    like every other run); a per-asset fetch failure is logged by the
+    fetcher and that asset is skipped.
+    """
+    now = now or dhaka_now()
+    date_str = date_str or now.strftime("%Y-%m-%d")
+    if assets is None:
+        try:
+            assets = db.get_assets()
+        except Exception:
+            assets = []
+    wanted = []
+    for asset in assets:
+        gaps = find_gaps(db, asset, date_str, now=now)
+        if gaps:
+            wanted.append((asset, gaps))
+    if not wanted:
+        logger.info("collector: gap-fill %s — no gaps found", date_str)
+        return 0, 0, 0
+    total_gaps = sum(len(gaps) for _, gaps in wanted)
+    logger.info("collector: gap-fill %s — %d asset(s), %d gap(s)%s",
+                date_str, len(wanted), total_gaps,
+                " (dry run — nothing fetched)" if dry_run else "")
+    for asset, gaps in wanted:
+        for gs, ge in gaps:
+            mins = int((ge - gs).total_seconds() // 60)
+            logger.info("collector: gap-fill %s %s — missing %d min "
+                        "(%s-%s Dhaka)", date_str, asset, mins,
+                        gs.astimezone(DHAKA).strftime("%H:%M"),
+                        ge.astimezone(DHAKA).strftime("%H:%M"))
+    if dry_run:
+        return len(wanted), total_gaps, 0
+    spans = {}
+    for asset, gaps in wanted:
+        first_start = min(gs for gs, _ in gaps)
+        spans[asset] = fetch_seconds_back(first_start, now)
+    raw_by_asset = await _fetch_assets_3_at_a_time(
+        session, [a for a, _ in wanted], spans)
+    assets_filled = 0
+    gaps_filled = 0
+    total = 0
+    for asset, gaps in wanted:
+        raw = raw_by_asset.get(asset)
+        if not raw:
+            continue
+        filled_here = 0
+        asset_total = 0
+        for gs, ge in gaps:
+            _, inserted = _store_rows(db, asset, raw, gs, ge)
+            total += inserted
+            asset_total += inserted
+            if inserted:
+                filled_here += 1
+        if filled_here:
+            assets_filled += 1
+            gaps_filled += filled_here
+            logger.info("collector: gap-fill %s %s — %d/%d gap(s) filled, "
+                        "%d candles", date_str, asset, filled_here,
+                        len(gaps), asset_total)
+    logger.info("collector: gap-fill %s finished — %d asset(s), %d gap(s), "
+                "%d new candles", date_str, assets_filled, gaps_filled, total)
+    return assets_filled, gaps_filled, total
+
+
 async def run_backfill(db, session, days=None, now=None):
     """Collect the last `days` completed days + today 00:00-now.
 

@@ -680,7 +680,7 @@ def test_stream_reconnects_when_one_asset_goes_silent():
     # The loop reconnected: the per-asset check fired while BTCUSD
     # kept ticking (the old global-only check never would).
     assert session.connects >= 2, session.connects
-    hit = [m for m in cap.records if "silent for 10 minutes" in m]
+    hit = [m for m in cap.records if "silent for 3 minutes" in m]
     assert hit, cap.records
     assert "ETHUSD_otc" in hit[0], hit
     print("PASS o) stream reconnects when one asset goes silent "
@@ -690,7 +690,7 @@ def test_stream_reconnects_when_one_asset_goes_silent():
 def test_stream_ignores_never_ticked_asset():
     """p) An asset that NEVER ticked in this run (closed market)
     must NOT trigger a reconnect, or the loop would flap forever
-    every 10 minutes."""
+    every few minutes."""
     db, tmp = _tmp_db()
     clock = _FakeClock(1_700_000_000)
     # eth_stop == start: ETH never ticks at all.
@@ -808,7 +808,7 @@ def test_stream_ignores_never_ticked_asset_with_old_candle():
 def test_never_ticked_cooldown_bounds_reconnects():
     """t) After a never-ticked reconnect, the same asset must not
     re-trigger until its cooldown expires — otherwise a persistently
-    broken subscription would flap the stream every 10 minutes."""
+    broken subscription would flap the stream every few minutes."""
     start = int(datetime(2026, 11, 27, 12, 0, tzinfo=timezone.utc).timestamp())
     db, tmp, clock = _never_ticked_setup(start, start - 1800)
     session = _TickScriptSession(clock, eth_stop=start)  # ETH never ticks
