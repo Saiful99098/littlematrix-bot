@@ -152,6 +152,7 @@ def _is_admin(user_id):
 # (Back), or when the message can no longer be edited.
 _ADMIN_DASH = {}
 _ADMIN_DASH_MAX_RUNS = 180  # 10s x 180 = ~30 min
+_ADMIN_DASH_INTERVAL_SECONDS = 10  # patched to ~0.05 in tests
 
 
 def _admin_dashboard_text(stats):
@@ -178,7 +179,7 @@ async def _admin_dash_loop(bot, chat_id, message_id, user_id):
     Telegram never answers 'Message is not modified'."""
     try:
         for _ in range(_ADMIN_DASH_MAX_RUNS):
-            await asyncio.sleep(10)
+            await asyncio.sleep(_ADMIN_DASH_INTERVAL_SECONDS)
             entry = _ADMIN_DASH.get(user_id)
             if not entry or entry.get("task") is not asyncio.current_task():
                 return
@@ -742,6 +743,17 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
     data = query.data
     user = update.effective_user
+    # The dashboard refresh runs ONLY while the owner is looking at
+    # the dashboard (the owner, 2026-11-27): any other tap means he
+    # navigated away, so stop the loop here — otherwise it keeps
+    # editing that message back into the dashboard every 10 seconds.
+    # The dashboard's own buttons are exempt: a stat tap
+    # (admin_stat_noop) means he is still on the dashboard, and
+    # menu_admin re-opens it (which restarts the loop itself). This
+    # runs before the channel gate, so even a gate-blocked tap
+    # stops the loop.
+    if data not in ("menu_admin", "admin_stat_noop"):
+        _cancel_admin_dash(user.id)
     database.get_or_create_user(user.id, user.username or "")
 
     # Channel gate: members only (except the re-check itself and
@@ -1022,9 +1034,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["flow"] = "futures_pct"
         await query.edit_message_text(
             f"{pe('diamond')} Win rate filter {pe('chart')}\n{DIVIDER}\n\n"
-            "Type the minimum win rate a signal must have — a whole number from 70 to 100.\n\n"
-            "Example: 80 means only signals with 80% win rate or higher are shown.\n"
-            "(With 1 day selected, every signal is 100%, so the filter changes nothing.)",
+            "Type the minimum win rate a signal must have — a whole number from 70 to 100.",
             reply_markup=InlineKeyboardMarkup(
                 [[_btn("Back", "menu_main", icon="back")]]),
             parse_mode="HTML")
@@ -1035,7 +1045,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f"{pe('sparkle')} Custom Time {pe('pin')}\n\n"
             "Send the start and end time, e.g.:\n"
-            "09:00 10:59\nor 09:00-10:59\n\nI will build the signals for that window only.",
+            "09:00 10:59\nor 09:00-10:59",
             reply_markup=back_keyboard(), parse_mode="HTML")
         return
 
@@ -1303,20 +1313,23 @@ def _fs_pairs_label(mode):
 
 def _futures_template_head(mode, date_dot, pct):
     """The owner's FUTURE SIGNALS template header (2026-11-27) —
-    premium emojis, no extra lines. The date is the day the signals
-    are FOR (today), in DD.MM.YYYY. The 'Avoid Below' % is the
-    user-typed threshold. The MARTINGALE line is replaced by
-    'MTG 1 STEP' (the owner, 2026-11-27). Where the owner's template
-    has a Unicode emoji with no premium match in the packs, it is
-    dropped, not kept as Unicode (premium-only rule): 🇧🇩 (no premium
-    flag), 🤪 (no zany face), ➕ (no plus sign)."""
-    return (f"{pe('diamond')}{pe('lightning')}• FUTURE SIGNALS — {_fs_mode_title(mode)} {pe('fire')}\n"
-            f"{DIVIDER}\n"
-            f"{pe('sparkle')}{date_dot}{pe('star')}\n"
-            f"{pe('hourglass')}TIMEZONE: UTC/GMT +6:00 [DHAKA, BANGLADESH]\n"
-            f"{pe('warning')}Filtered {_fs_pairs_label(mode)} — Avoid Below {pct}% &amp; Doji Candles\n"
-            f"{pe('red')} MTG 1 STEP\n"
-            f"{pe('next')}1 MINUTES:\n"
+    premium emojis, no extra lines, a blank line between the header
+    lines (the owner, 2026-11-27: the packed header looked cramped).
+    The date is the day the signals are FOR (today), in DD.MM.YYYY.
+    The 'Avoid Below' % is the user-typed threshold. The MARTINGALE
+    line is replaced by 'MTG 1 STEP' (the owner, 2026-11-27). Where
+    the owner's template has a Unicode emoji with no premium match
+    in the packs, it is dropped, not kept as Unicode (premium-only
+    rule): 🇧🇩 (no premium flag), 🤪 (no zany face), ➕ (no plus sign).
+    Signal lines stay packed under the header (the owner, 2026-11-27)
+    — see _fit_futures_text."""
+    return (f"{pe('diamond')}{pe('lightning')}• FUTURE SIGNALS — {_fs_mode_title(mode)} {pe('fire')}\n\n"
+            f"{DIVIDER}\n\n"
+            f"{pe('sparkle')}{date_dot}{pe('star')}\n\n"
+            f"{pe('hourglass')}TIMEZONE: UTC/GMT +6:00 [DHAKA, BANGLADESH]\n\n"
+            f"{pe('warning')}Filtered {_fs_pairs_label(mode)} — Avoid Below {pct}% &amp; Doji Candles\n\n"
+            f"{pe('red')} MTG 1 STEP\n\n"
+            f"{pe('next')}1 MINUTES:\n\n"
             f" {pe('fire')} BLUE FISH PRIME {pe('fire')}")
 
 
@@ -1340,18 +1353,19 @@ def _fit_futures_text(header, lines, footer, limit=3950):
     """Join header + signal lines + footer, dropping whole lines
     from the end when the Telegram 4096-char cap would cut a line
     (or a <code> tag) in half. Dropped lines are counted, never
-    silently lost. Signal lines are separated by a blank line (the
-    owner, 2026-11-27: packed lines looked cramped)."""
+    silently lost. Signal lines stay packed, one per line (the
+    owner, 2026-11-27) — the gaps live between the HEADER lines,
+    not between signals (see _futures_template_head)."""
     body = header
     kept = 0
     for ln in lines:
-        if len(body) + 2 + len(ln) + len(footer) > limit:
+        if len(body) + 1 + len(ln) + len(footer) > limit:
             break
-        body += "\n\n" + ln
+        body += "\n" + ln
         kept += 1
     dropped = len(lines) - kept
     if dropped:
-        body += f"\n\n… +{dropped} more (narrow the window or raise the %)"
+        body += f"\n… +{dropped} more (narrow the window or raise the %)"
     return body + footer
 
 
@@ -2047,6 +2061,9 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     flow = context.user_data.get("flow")
     text = update.message.text or ""
     user = update.effective_user
+    # A typed message means the owner is not looking at the dashboard
+    # any more — stop its refresh (the owner, 2026-11-27).
+    _cancel_admin_dash(user.id)
 
     # Channel gate: members only (same as /start and the menu).
     if not await _is_channel_member(context.bot, user.id):

@@ -285,8 +285,9 @@ def format_check_results(results, summary, date_str=None, header=True,
     checked — "OTC SIGNAL Check Results", "WHITEOUT SIGNAL Check
     Results", and so on — so a pasted result is never ambiguous.
     The DATE line carries premium emojis around the date (same pair
-    as the FS date line). Signal lines are separated by a blank line
-    (the owner, 2026-11-27: packed lines looked cramped), and a
+    as the FS date line). A blank line sits between the HEADER lines
+    (the owner, 2026-11-27: the packed header looked cramped);
+    signal lines stay packed, one per line, exactly as before. A
     long list is cut to whole lines under Telegram's 4096-char cap
     with a "… +N more lines" note — the Total / Accuracy footer
     still counts the whole list.
@@ -330,10 +331,10 @@ def format_check_results(results, summary, date_str=None, header=True,
             f"{pe('cross')} {summary['loss']} | {pe('minus')} {summary['doji']} | "
             f"? {summary['no_data']}\n"
             f"{pe('crown')} Accuracy: {summary['win_pct']}% {pe('fire')}")
-    text = "\n".join(head)
+    text = "\n\n".join(head)
     kept = 0
     for ln in sig_lines:
-        add = ("\n\n" + ln) if text else ln
+        add = ("\n" + ln) if text else ln
         # Reserve room for the footer (plus its leading blank line).
         if len(text) + len(add) + 2 + len(foot) > 4000:
             break
@@ -341,6 +342,6 @@ def format_check_results(results, summary, date_str=None, header=True,
         kept += 1
     dropped = len(sig_lines) - kept
     if dropped:
-        text += f"\n\n… +{dropped} more lines"
+        text += f"\n… +{dropped} more lines"
     text += "\n\n" + foot
     return text

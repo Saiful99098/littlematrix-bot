@@ -169,8 +169,12 @@ def test_fs_template_and_footer():
     text = handlers._fit_futures_text(head, lines, bw)
     assert text.count("<code>") == text.count("</code>"), text[-200:]
     assert "+1" in text or "more" in text, text[-200:]
-    # A blank line sits between signal lines (the owner, 2026-11-27).
-    assert "\n\n<code>USDARS-OTC,09:01 M1 PUT</code>" in text, text
+    # Gaps live between the HEADER lines (the owner, 2026-11-27) —
+    # the MTG line is followed by a blank line, then 1 MINUTES:.
+    assert "MTG 1 STEP\n\n" in head, head
+    # ...while signal lines stay packed, one per line, as before.
+    assert "\n<code>USDARS-OTC,09:01 M1 PUT</code>" in text, text
+    assert "\n\n<code>USDARS-OTC,09:01" not in text, text
     print("PASS 4) FS template — title, DD.MM.YYYY date, MTG 1 STEP, "
           "% line, no old extra lines; Rules footer blackout/whiteout only")
 
@@ -193,10 +197,12 @@ def test_checker_template():
     assert "<code>USDPKR-OTC,02:39 M1 PUT</code>" in text, text
     assert "Total: 2" in text, text
     assert "Accuracy: 50.0%" in text, text
-    # A blank line sits between signal lines (the owner, 2026-11-27:
-    # packed lines looked cramped) — also before the first line.
-    assert "\n\n<code>USDPKR-OTC,02:39 M1 PUT</code>" in text, text
-    assert "\n\n<code>USDPKR-OTC,02:40 M1 CALL</code>" in text, text
+    # A blank line sits between the HEADER lines (the owner,
+    # 2026-11-27) — the DATE line follows the divider after one.
+    assert "\n\nDATE:" in text, text
+    # ...while signal lines stay packed, one per line, as before.
+    assert "\n<code>USDPKR-OTC,02:40 M1 CALL</code>" in text, text
+    assert "\n\n<code>USDPKR-OTC,02:40" not in text, text
     # The header names the mode that was checked.
     w_text = format_check_results(results, summary, date_str="2026-11-27",
                                   mode="WHITEOUT")
@@ -402,6 +408,20 @@ class FakeBot:
         return FakeMember()
 
 
+class RecordingBot(FakeBot):
+    """A bot that records every edit_message_text call (the admin
+    dashboard loop edits through the bot, not through a query)."""
+
+    def __init__(self):
+        self.edits = []  # (chat_id, message_id, text)
+
+    async def edit_message_text(self, chat_id=None, message_id=None,
+                                text=None, reply_markup=None,
+                                parse_mode=None, **kwargs):
+        self.edits.append((chat_id, message_id, text))
+        return None
+
+
 class FakeContext:
     def __init__(self):
         self.user_data = {}
@@ -511,8 +531,10 @@ def test_checker_four_mode_flow():
         result = upd2.message.working.texts[-1]
         assert "BLACKOUT SIGNAL Check Results" in result, result
         assert f"DATE: {pe('sparkle')}25.11.2026{pe('star')}" in result, result
-        # A blank line sits between the two signal lines.
-        assert "\n\n<code>USDARS-OTC,09:07 M1</code>" in result, result
+        # Header lines have gaps; signal lines stay packed, as before.
+        assert "\n\nDATE:" in result, result
+        assert "\n<code>USDARS-OTC,09:07 M1</code>" in result, result
+        assert "\n\n<code>USDARS-OTC,09:07" not in result, result
         # 09:02 is a blackout WIN (T-1 green -> PUT, T red);
         # 09:07 lost M1 but recovered on MTG1 (09:08 red) -> dot.
         win_line = [ln for ln in result.splitlines()
@@ -528,6 +550,76 @@ def test_checker_four_mode_flow():
           "date, directionless blackout list, MTG1 dot, DD.MM.YYYY date")
 
 
+# ---------------------------------------------------------------------------
+# 9) Admin dashboard refresh stops the moment the owner leaves it
+# ---------------------------------------------------------------------------
+def test_admin_dashboard_stops_when_leaving():
+    # The owner, 2026-11-27: the dashboard refresh kept editing the
+    # message back into the dashboard every 10s even after he went
+    # back to the main menu. The refresh must run ONLY while he is
+    # looking at the dashboard.
+    old_interval = handlers._ADMIN_DASH_INTERVAL_SECONDS
+    old_stats = handlers.database.get_user_stats
+    old_user = handlers.database.get_or_create_user
+    old_admins = config.ADMIN_USER_IDS
+    try:
+        handlers._ADMIN_DASH_INTERVAL_SECONDS = 0.05
+        handlers.database.get_user_stats = lambda: {
+            "total": 5, "premium": 1, "free": 4, "online": 2}
+        handlers.database.get_or_create_user = lambda *a, **k: None
+        config.ADMIN_USER_IDS = {999}  # FakeUser id
+        bot = RecordingBot()
+
+        def dash_edits():
+            return [e for e in bot.edits if "ADMIN DASHBOARD" in (e[2] or "")]
+
+        async def scenario():
+            ctx = FakeContext()
+            ctx.bot = bot
+            q = FakeQuery("menu_admin")
+            await handlers.menu_callback(FakeUpdate(q), ctx)
+            assert "ADMIN DASHBOARD" in q.texts[-1], q.texts[-1]
+            await asyncio.sleep(0.25)
+            assert len(dash_edits()) >= 2, bot.edits
+            # A stat tap means he is STILL on the dashboard — the
+            # loop must keep refreshing.
+            q_stat = FakeQuery("admin_stat_noop")
+            await handlers.menu_callback(FakeUpdate(q_stat), ctx)
+            n_before = len(dash_edits())
+            await asyncio.sleep(0.15)
+            assert len(dash_edits()) > n_before, bot.edits
+            # Leave via ANOTHER tool (not Back): the loop must stop
+            # too. The old code only cancelled on Back, so leaving
+            # any other way kept flipping the message back to the
+            # dashboard every 10 seconds.
+            q_fs = FakeQuery("menu_futures")
+            await handlers.menu_callback(FakeUpdate(q_fs), ctx)
+            n_dash = len(dash_edits())
+            await asyncio.sleep(0.3)
+            assert len(dash_edits()) == n_dash, bot.edits
+            # Re-open, then leave via Back: also stops.
+            q2 = FakeQuery("menu_admin")
+            await handlers.menu_callback(FakeUpdate(q2), ctx)
+            await asyncio.sleep(0.15)
+            assert len(dash_edits()) > n_dash, bot.edits
+            q_menu = FakeQuery("menu_main")
+            await handlers.menu_callback(FakeUpdate(q_menu), ctx)
+            assert "Trading Terminal" in q_menu.texts[-1], q_menu.texts[-1]
+            n_dash2 = len(dash_edits())
+            await asyncio.sleep(0.3)
+            assert len(dash_edits()) == n_dash2, bot.edits
+
+        asyncio.run(scenario())
+    finally:
+        handlers._ADMIN_DASH_INTERVAL_SECONDS = old_interval
+        handlers.database.get_user_stats = old_stats
+        handlers.database.get_or_create_user = old_user
+        config.ADMIN_USER_IDS = old_admins
+        handlers._ADMIN_DASH.clear()
+    print("PASS 9) admin dashboard refresh stops when leaving it "
+          "(stat taps keep it alive)")
+
+
 def main():
     test_prev_minute_engine()
     test_gap_removed_in_fs_generators()
@@ -537,7 +629,8 @@ def main():
     test_checker_blackout_derived()
     test_admin_stats_and_keyboard()
     test_checker_four_mode_flow()
-    print("ALL EDIT-ROUND TESTS PASSED (8/8)")
+    test_admin_dashboard_stops_when_leaving()
+    print("ALL EDIT-ROUND TESTS PASSED (9/9)")
 
 
 if __name__ == "__main__":
