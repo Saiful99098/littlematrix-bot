@@ -172,7 +172,8 @@ def test_fs_template_and_footer():
     # Gaps live between the HEADER lines (the owner, 2026-11-27) —
     # the MTG line is followed by a blank line, then 1 MINUTES:.
     assert "MTG 1 STEP\n\n" in head, head
-    # ...while signal lines stay packed, one per line, as before.
+    # One blank line after BLUE FISH PRIME, then packed signals.
+    assert "\n\n<code>USDARS-OTC,09:00 M1 PUT</code>" in text, text
     assert "\n<code>USDARS-OTC,09:01 M1 PUT</code>" in text, text
     assert "\n\n<code>USDARS-OTC,09:01" not in text, text
     print("PASS 4) FS template — title, DD.MM.YYYY date, MTG 1 STEP, "
@@ -200,7 +201,8 @@ def test_checker_template():
     # A blank line sits between the HEADER lines (the owner,
     # 2026-11-27) — the DATE line follows the divider after one.
     assert "\n\nDATE:" in text, text
-    # ...while signal lines stay packed, one per line, as before.
+    # ...and one blank line after BLUE FISH PRIME, then packed signals.
+    assert "\n\n<code>USDPKR-OTC,02:39 M1 PUT</code>" in text, text
     assert "\n<code>USDPKR-OTC,02:40 M1 CALL</code>" in text, text
     assert "\n\n<code>USDPKR-OTC,02:40" not in text, text
     # The header names the mode that was checked.
@@ -531,8 +533,10 @@ def test_checker_four_mode_flow():
         result = upd2.message.working.texts[-1]
         assert "BLACKOUT SIGNAL Check Results" in result, result
         assert f"DATE: {pe('sparkle')}25.11.2026{pe('star')}" in result, result
-        # Header lines have gaps; signal lines stay packed, as before.
+        # Header lines have gaps; one blank line after BLUE FISH
+        # PRIME, then packed signals.
         assert "\n\nDATE:" in result, result
+        assert "\n\n<code>USDARS-OTC,09:02 M1</code>" in result, result
         assert "\n<code>USDARS-OTC,09:07 M1</code>" in result, result
         assert "\n\n<code>USDARS-OTC,09:07" not in result, result
         # 09:02 is a blackout WIN (T-1 green -> PUT, T red);

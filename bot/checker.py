@@ -286,8 +286,9 @@ def format_check_results(results, summary, date_str=None, header=True,
     Results", and so on — so a pasted result is never ambiguous.
     The DATE line carries premium emojis around the date (same pair
     as the FS date line). A blank line sits between the HEADER lines
-    (the owner, 2026-11-27: the packed header looked cramped);
-    signal lines stay packed, one per line, exactly as before. A
+    (the owner, 2026-11-27: the packed header looked cramped), and
+    one blank line sits between BLUE FISH PRIME and the first
+    signal; signal lines stay packed after that, one per line. A
     long list is cut to whole lines under Telegram's 4096-char cap
     with a "… +N more lines" note — the Total / Accuracy footer
     still counts the whole list.
@@ -334,7 +335,11 @@ def format_check_results(results, summary, date_str=None, header=True,
     text = "\n\n".join(head)
     kept = 0
     for ln in sig_lines:
-        add = ("\n" + ln) if text else ln
+        # One blank line between BLUE FISH PRIME and the first
+        # signal (the owner, 2026-11-27); signals stay packed
+        # after that.
+        sep = "\n\n" if kept == 0 else "\n"
+        add = sep + ln
         # Reserve room for the footer (plus its leading blank line).
         if len(text) + len(add) + 2 + len(foot) > 4000:
             break

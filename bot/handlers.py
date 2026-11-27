@@ -1353,15 +1353,17 @@ def _fit_futures_text(header, lines, footer, limit=3950):
     """Join header + signal lines + footer, dropping whole lines
     from the end when the Telegram 4096-char cap would cut a line
     (or a <code> tag) in half. Dropped lines are counted, never
-    silently lost. Signal lines stay packed, one per line (the
-    owner, 2026-11-27) — the gaps live between the HEADER lines,
-    not between signals (see _futures_template_head)."""
+    silently lost. One blank line sits between BLUE FISH PRIME and
+    the first signal (the owner, 2026-11-27); signals stay packed
+    after that, one per line. The gaps live between the HEADER
+    lines, not between signals (see _futures_template_head)."""
     body = header
     kept = 0
     for ln in lines:
-        if len(body) + 1 + len(ln) + len(footer) > limit:
+        sep = "\n\n" if kept == 0 else "\n"
+        if len(body) + len(sep) + len(ln) + len(footer) > limit:
             break
-        body += "\n" + ln
+        body += sep + ln
         kept += 1
     dropped = len(lines) - kept
     if dropped:
