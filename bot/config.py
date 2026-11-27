@@ -118,6 +118,13 @@ COLLECTOR_429_RETRY_MINUTES = int(os.getenv("COLLECTOR_429_RETRY_MINUTES", "10")
 # that asset — the owner, 2026-11-27).
 COLLECTOR_FAILED_ASSET_RETRY_SECONDS = int(os.getenv(
     "COLLECTOR_FAILED_ASSET_RETRY_SECONDS", "30") or 30)
+# Seconds to wait and retry, once, a whole collector run that failed
+# (e.g. the login got a transient 403 — the owner, 2026-11-27: the
+# 17:45 run died on "Error on access page: 403" and the next run was
+# 30 minutes away, while the stream logged in fine 2 minutes later).
+# A 429 has its own 10-minute retry; this covers every other failure.
+COLLECTOR_FAILED_RUN_RETRY_SECONDS = int(os.getenv(
+    "COLLECTOR_FAILED_RUN_RETRY_SECONDS", "180") or 180)
 # Live candle stream (hybrid): one persistent Quotex WebSocket that
 # writes each closed 1-minute candle for every open asset into the DB
 # as it arrives. The batch collector stays the backbone

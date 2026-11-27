@@ -43,6 +43,7 @@ from .collector import (
     day_window_utc,
     dhaka_now,
     fetch_seconds_back,
+    recent_otc_assets_missing,
     rows_from_raw,
 )
 
@@ -98,6 +99,18 @@ async def _stream_assets(db, session):
         logger.warning("live stream: open assets failed: %s", exc)
         assets = None
     if assets:
+        # The open list can silently drop a pair while its market
+        # stays open (the owner, 2026-11-27: 20 major forex OTC pairs
+        # vanished at 10:44) — add recently-trading OTC assets from
+        # the DB so they keep streaming and tail-filling anyway.
+        missing = recent_otc_assets_missing(db, assets)
+        if missing:
+            logger.warning("live stream: %d recently-trading OTC asset(s) "
+                           "missing from the Quotex open list — adding "
+                           "from DB: %s%s",
+                           len(missing), ", ".join(sorted(missing)[:10]),
+                           f" +{len(missing) - 10} more" if len(missing) > 10 else "")
+            assets = sorted(set(assets) | set(missing))
         return sorted(set(assets))
     try:
         return sorted(db.get_assets())

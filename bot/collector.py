@@ -32,10 +32,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 
 from . import candles_db, config, quotex_client
-from .candles_db import DHAKA, utc_iso
+from .candles_db import DHAKA, normalize_asset_name, utc_iso
 
 logger = logging.getLogger("littlematrix.collector")
 
@@ -408,6 +409,51 @@ async def _capture_payouts(db, session):
         logger.warning("collector: payout store failed: %s", exc)
 
 
+# A DB asset counts as "recently trading" when its last stored candle
+# is within this long (24h) — the same window the live stream's
+# never-ticked check uses.
+_RECENT_TRADE_SECONDS = 86400
+
+
+def recent_otc_assets_missing(db, assets, seconds=None):
+    """Recently-trading OTC assets in the DB that are NOT in `assets`
+    (the live open list from Quotex).
+
+    The Quotex open list can silently drop a pair while its market
+    stays open (the owner, 2026-11-27: 20 major forex OTC pairs
+    vanished at 10:44 and neither the stream nor the batch fetched
+    them again, because both build their asset list from that list).
+    Real-market assets are excluded: they close on schedule, so a
+    missing real asset is normal, not a break. Names are returned in
+    the DB/live spelling ('EURUSD_otc'), ready to fetch/subscribe.
+    Returns [] when the DB cannot be read (never raises)."""
+    seconds = _RECENT_TRADE_SECONDS if seconds is None else seconds
+    try:
+        db_assets = db.get_assets()
+    except Exception:
+        return []
+    live = {normalize_asset_name(a) for a in assets}
+    missing = []
+    now_ts = time.time()
+    for name in db_assets:
+        norm = normalize_asset_name(name)
+        if norm in live or not norm.endswith("_otc"):
+            continue
+        try:
+            prev = db.last_candle(name)
+        except Exception:
+            continue
+        if not prev or prev.get("ts") is None:
+            continue
+        try:
+            age = now_ts - prev["ts"].timestamp()
+        except Exception:
+            continue
+        if age < seconds:
+            missing.append(norm)
+    return missing
+
+
 def _tail_seconds_back(db, asset, oldest_start, now):
     """Seconds to fetch for one asset: only the missing tail.
 
@@ -480,6 +526,14 @@ async def run_backfill(db, session, days=None, now=None):
     if not assets:
         logger.warning("collector: no open assets from Quotex, using sample list")
         assets = list(config.SAMPLE_ASSETS)
+    else:
+        missing = recent_otc_assets_missing(db, assets)
+        if missing:
+            logger.warning("collector: %d recently-trading OTC asset(s) missing "
+                           "from the Quotex open list — adding from DB: %s%s",
+                           len(missing), ", ".join(sorted(missing)[:10]),
+                           f" +{len(missing) - 10} more" if len(missing) > 10 else "")
+            assets = list(assets) + missing
     logger.info("collector: backfill starting — %d assets, %d days (%s..%s), "
                 "span %d seconds back",
                 len(assets), days, dates[-1], dates[0], seconds_back)
@@ -535,6 +589,14 @@ async def run_incremental(db, session, now=None):
     if not assets:
         logger.warning("collector: no open assets from Quotex, using sample list")
         assets = list(config.SAMPLE_ASSETS)
+    else:
+        missing = recent_otc_assets_missing(db, assets)
+        if missing:
+            logger.warning("collector: %d recently-trading OTC asset(s) missing "
+                           "from the Quotex open list — adding from DB: %s%s",
+                           len(missing), ", ".join(sorted(missing)[:10]),
+                           f" +{len(missing) - 10} more" if len(missing) > 10 else "")
+            assets = list(assets) + missing
     logger.info("collector: %d-minutely run starting — %d assets, window %s..%s Dhaka",
                 mins, len(assets),
                 start.astimezone(DHAKA).strftime("%H:%M"),
@@ -782,6 +844,17 @@ async def collector_loop(db=None, session_factory=None, sleep=None, bot=None):
             if result == "rate_limited":
                 logger.warning("collector: backfill hit 429 again, "
                                "will retry on the next cycle")
+        if result is False:
+            # A failed login (e.g. transient 403) used to cost the
+            # whole run until the next cycle — the owner, 2026-11-27:
+            # the 17:45 run died on "Error on access page: 403" while
+            # the stream logged in fine 2 minutes later. Retry once
+            # after a short wait instead of waiting the full interval.
+            logger.info("collector: backfill failed (e.g. login 403), "
+                        "retrying once in %d seconds",
+                        config.COLLECTOR_FAILED_RUN_RETRY_SECONDS)
+            await sleep(config.COLLECTOR_FAILED_RUN_RETRY_SECONDS)
+            result = await _one_run("backfill")
         if result is True:
             log_status_summary(db, "collector: backfill done")
 
@@ -799,5 +872,17 @@ async def collector_loop(db=None, session_factory=None, sleep=None, bot=None):
             await sleep(retry_wait)
             try:
                 await _one_run("incremental")
+            except Exception as exc:
+                logger.warning("collector: incremental retry crashed: %s", exc)
+        if result is False:
+            # Same one-retry rule as the backfill above: a transient
+            # login failure (403) must not cost a whole 30-minute
+            # cycle when the block usually clears within minutes.
+            logger.info("collector: incremental run failed (e.g. login 403), "
+                        "retrying once in %d seconds",
+                        config.COLLECTOR_FAILED_RUN_RETRY_SECONDS)
+            await sleep(config.COLLECTOR_FAILED_RUN_RETRY_SECONDS)
+            try:
+                result = await _one_run("incremental")
             except Exception as exc:
                 logger.warning("collector: incremental retry crashed: %s", exc)

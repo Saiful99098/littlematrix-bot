@@ -831,6 +831,35 @@ def test_never_ticked_cooldown_bounds_reconnects():
     print("PASS t) never-ticked cooldown bounds reconnects")
 
 
+def test_stream_assets_includes_missing_recent_otc():
+    """u) The owner, 2026-11-27: EURUSD-OTC stopped at 10:44 and the
+    stream never fetched it again, because the open list Quotex
+    returns had dropped it. The stream now adds recently-trading OTC
+    assets from the DB to the subscribe list, so they keep streaming
+    and tail-filling. Real-market and stale assets are NOT added."""
+    db, tmp = _tmp_db()
+    now = datetime.now(DHAKA)
+
+    def _seed(asset, ts):
+        db.insert_candles(asset, [{"ts": ts, "open": 1.0, "high": 1.1,
+                                   "low": 0.9, "close": 1.05}],
+                          on_conflict="nothing")
+
+    _seed("EURUSD_otc", now - timedelta(minutes=70))
+    _seed("XAUUSD", now - timedelta(minutes=70))
+    _seed("USDPHP_otc", now - timedelta(days=2))
+    # The fake session's open list is BTCUSD + ETHUSD only — EURUSD
+    # is missing from it.
+    session = FakeSession()
+    assets = asyncio.run(live_stream._stream_assets(db, session))
+    assert "EURUSD_otc" in assets, assets
+    assert "XAUUSD" not in assets, assets
+    assert "USDPHP_otc" not in assets, assets
+    assert "BTCUSD_otc" in assets and "ETHUSD_otc" in assets, assets
+    print("PASS u) stream adds recently-trading OTC assets missing "
+          "from the open list")
+
+
 if __name__ == "__main__":
     test_stream_stores_generated_candles()
     test_stream_reconnects_and_tail_fills()
@@ -852,4 +881,5 @@ if __name__ == "__main__":
     test_stream_reconnects_when_subscribed_asset_never_ticks()
     test_stream_ignores_never_ticked_asset_with_old_candle()
     test_never_ticked_cooldown_bounds_reconnects()
+    test_stream_assets_includes_missing_recent_otc()
     print("ALL LIVE-STREAM TESTS PASSED")

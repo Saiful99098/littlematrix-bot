@@ -41,6 +41,7 @@ from bot.collector import (
     backfill_dates,
     day_window_utc,
     fetch_seconds_back,
+    recent_otc_assets_missing,
     recent_window_utc,
     rows_from_raw,
     run_backfill,
@@ -666,6 +667,125 @@ def test_auto_signals_sent_once_per_window():
     print("PASS j) auto signals sent once per window (30-min runs)")
 
 
+def test_loop_retries_failed_run_once():
+    """k) The owner, 2026-11-27: the collector's 17:45 run died at
+    login ("Error on access page: 403") and the next run was 30
+    minutes away, while the stream logged in fine 2 minutes later.
+    A failed run now retries once after a short wait instead of
+    waiting the whole interval."""
+    from bot.collector import collector_loop, dhaka_now
+
+    db = _tmp_db()
+    now = datetime(2026, 11, 25, 12, 0, tzinfo=DHAKA)
+    # Backfill already done today, so the loop goes straight to the
+    # 30-minute cycle.
+    db.set_state("backfill_done", "true")
+    db.set_state("backfill_window", "full-day")
+    db.set_state("last_backfill", utc_iso(now))
+    calls = {"connects": 0, "sleeps": []}
+
+    class _FlakyFactory:
+        """First connect raises a 403-style login error; later
+        connects succeed (the block clears within minutes)."""
+
+        def __call__(self):
+            session = FakeSession(now=now)
+
+            async def connect():
+                calls["connects"] += 1
+                if calls["connects"] == 1:
+                    raise RuntimeError(
+                        "Quotex login failed: Error on access page: 403")
+                session.connected = True
+                return True
+
+            session.connect = connect
+            return session
+
+    async def _recording_sleep(seconds):
+        calls["sleeps"].append(seconds)
+        if len(calls["sleeps"]) >= 3:
+            raise _StopLoop
+
+    # Freeze the loop's clock so the fake "now" matches the run window.
+    _real_now = collector.dhaka_now
+    collector.dhaka_now = lambda: now
+    try:
+        try:
+            asyncio.run(collector_loop(
+                db=db, session_factory=_FlakyFactory(),
+                sleep=_recording_sleep))
+        except _StopLoop:
+            pass
+    finally:
+        collector.dhaka_now = _real_now
+    # interval sleep -> failed run -> retry-wait sleep -> retried run
+    # -> interval sleep (stopped here).
+    assert calls["connects"] == 2, calls
+    assert calls["sleeps"] == [config.COLLECTOR_INTERVAL_SECONDS,
+                               config.COLLECTOR_FAILED_RUN_RETRY_SECONDS,
+                               config.COLLECTOR_INTERVAL_SECONDS], calls["sleeps"]
+    # The retried run collected the window (2 assets x 40 minutes).
+    assert db.count_total() == 2 * 40, db.count_total()
+    print("PASS k) collector loop retries a failed run once after a short wait")
+
+
+def test_incremental_includes_missing_recent_otc_assets():
+    """l) The owner, 2026-11-27: EURUSD-OTC stopped at 10:44 and
+    neither the stream nor the batch fetched it again, because both
+    build their asset list from Quotex's open list and EURUSD had
+    vanished from it. The collector now adds recently-trading OTC
+    assets from the DB to the live list, so they get fetched anyway.
+    Real-market assets (close on schedule) and stale OTC assets are
+    NOT added."""
+    from bot.collector import dhaka_now
+
+    db = _tmp_db()
+    # The recency check reads the real clock, so seed against it.
+    # Whole seconds: the DB stores timestamps to the second, so a
+    # seed with microseconds would never compare equal on read-back.
+    now = dhaka_now().replace(microsecond=0)
+
+    def _seed(asset, ts):
+        db.insert_candles(asset, [{"ts": ts, "open": 1.0, "high": 1.1,
+                                   "low": 0.9, "close": 1.05}],
+                          on_conflict="nothing")
+
+    eur_ts = now - timedelta(minutes=70)
+    xau_ts = now - timedelta(minutes=70)
+    php_ts = now - timedelta(days=2)
+    # EURUSD: OTC, last candle 70 min ago (recent) — missing from the
+    # live list, must be fetched. XAUUSD: real market, recent — must
+    # NOT be added. USDPHP: OTC but last candle 2 days ago — must NOT
+    # be added.
+    _seed("EURUSD_otc", eur_ts)
+    _seed("XAUUSD", xau_ts)
+    _seed("USDPHP_otc", php_ts)
+    missing = recent_otc_assets_missing(db, ["USDMXN_otc"])
+    assert missing == ["EURUSD_otc"], missing
+
+    class _LiveListSession(FakeSession):
+        async def get_open_assets(self):
+            return ["USDMXN_otc"]
+
+    done, total = asyncio.run(
+        run_incremental(db, _LiveListSession(now=now), now=now))
+    assert done == 2, done
+    assert total == 2 * 40, total
+    # EURUSD got its 40 window candles (checked by range, so the test
+    # is safe across midnight).
+    start, end = recent_window_utc(now)
+    assert len(db.get_candles_range("EURUSD_otc", start, end)) == 40
+    # XAUUSD and USDPHP were NOT fetched — their last candles are
+    # still the seeded ones.
+    assert (db.last_candle("XAUUSD")["ts"].timestamp()
+            == xau_ts.timestamp()), db.last_candle("XAUUSD")
+    assert (db.last_candle("USDPHP_otc")["ts"].timestamp()
+            == php_ts.timestamp()), db.last_candle("USDPHP_otc")
+    print("PASS l) incremental run fetches recently-trading OTC assets "
+          "missing from the open list")
+
+
 def main():
     test_window_math()
     test_db_roundtrip()
@@ -682,7 +802,9 @@ def main():
     test_handlers_db_end_to_end()
     test_incremental_retries_failed_assets()
     test_auto_signals_sent_once_per_window()
-    print("ALL TESTS PASSED (15/15)")
+    test_loop_retries_failed_run_once()
+    test_incremental_includes_missing_recent_otc_assets()
+    print("ALL TESTS PASSED (17/17)")
 
 
 if __name__ == "__main__":
