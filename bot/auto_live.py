@@ -1,17 +1,22 @@
 """Live Auto Signal loop (the owner, 2026-11-28).
 
-The user picks ONE market and turns it ON; the bot watches that
-market live and sends a signal only when the analysis is strong
-(multi-day analysis + win-% threshold — the same four checks as AI
-Signal: EMA trend, RSI zone, last 3 candles, 5-day same-time
+The user picks one or more markets and turns it ON; the bot watches
+those markets live and sends a signal only when the analysis is
+strong (multi-day analysis + win-% threshold — the same four checks
+as AI Signal: EMA trend, RSI zone, last 3 candles, 5-day same-time
 history), NOT a signal every minute. Each signal carries a chart
-screenshot; after the minute closes, a result screenshot follows
-with a tick on the winning candle (profit) or a cross (loss).
+screenshot; the result follows within 5 seconds of the deciding
+candle's close (the loop wakes 5s past each minute), with a tick on
+the winning candle (profit) or a cross (loss). In MTG1 mode the
+result waits for the next minute and a MTG1 win carries the dot
+(check + dot), exactly like the CHECKER. Every 5 completed signals
+the bot sends the user a 5-signal summary. When the user presses
+Back from the dashboard to the menu, pending results are cancelled
+(they are no longer sent). The owner can also post his own signals
+to his channel from the dashboard.
 
-The loop wakes just after each minute turns, so the just-closed
-candle is already stored by the stream. Pending signals (sent, result
-not yet delivered) live in the candle DB state, so a restart neither
-loses them nor double-sends them.
+Pending signals (sent, result not yet delivered) live in the candle
+DB state, so a restart neither loses them nor double-sends them.
 """
 from __future__ import annotations
 
@@ -20,9 +25,10 @@ import json
 import logging
 from datetime import timedelta
 
-from . import candles_db
+from . import candles_db, config
 from .chart import draw_candles_png
 from .collector import _safe_set_state, dhaka_now
+from .premium_emoji import pe
 from .signal_engine import (
     ai_next_signal,
     candle_direction,
@@ -33,8 +39,12 @@ from .signal_engine import (
 logger = logging.getLogger("littlematrix.auto_live")
 
 _AUTO_PENDING_KEY = "auto_live_pending"
+_AUTO_HISTORY_KEY = "auto_live_history"
+_AUTO_CHANNEL_KEY = "auto_live_channel"
 _CHART_CANDLES = 30
-_RESULT_WAIT_MINUTES = 3  # drop a pending signal this old (candle never came)
+_RESULT_WAIT_MINUTES = 3  # non-MTG: drop a pending signal this old
+_RESULT_WAIT_MTG1_MINUTES = 4  # MTG1 decides a minute later
+_SUMMARY_SIGNALS = 5  # send a summary after this many completed signals
 
 
 def _load_pending(db):
@@ -59,6 +69,67 @@ def _save_pending(db, pending):
         logger.warning("auto live: could not save pending signals: %s", exc)
 
 
+def cancel_pending_for_user(db, uid):
+    """Drop a user's pending Auto Live signals (the owner,
+    2026-11-28): when he presses Back from the dashboard to the
+    menu, the bot stops sending those signals' results. Returns the
+    number dropped."""
+    pending = _load_pending(db)
+    kept = [s for s in pending if s.get("uid") != uid]
+    dropped = len(pending) - len(kept)
+    if dropped:
+        _save_pending(db, kept)
+        logger.info("auto live: cancelled %d pending signal(s) for %s",
+                    dropped, uid)
+    return dropped
+
+
+def _load_history(db):
+    """Completed-signal history as {str(uid): [entries]}; each entry
+    is {asset, hhmm, direction, outcome}."""
+    try:
+        raw = db.get_state(_AUTO_HISTORY_KEY)
+    except Exception:
+        return {}
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_history(db, history):
+    try:
+        _safe_set_state(db, _AUTO_HISTORY_KEY, json.dumps(history))
+    except Exception as exc:
+        logger.warning("auto live: could not save signal history: %s", exc)
+
+
+def history_count(db, uid):
+    """Completed signals a user has banked toward their next
+    5-signal summary (0-4)."""
+    entries = _load_history(db).get(str(uid)) or []
+    return len(entries) if isinstance(entries, list) else 0
+
+
+def channel_send_on(db):
+    """True when the owner turned ON posting his Auto Live signals
+    to his channel (the owner, 2026-11-28)."""
+    try:
+        return db.get_state(_AUTO_CHANNEL_KEY) == "1"
+    except Exception:
+        return False
+
+
+def set_channel_send(db, on):
+    try:
+        _safe_set_state(db, _AUTO_CHANNEL_KEY, "1" if on else "0")
+    except Exception as exc:
+        logger.warning("auto live: could not save channel setting: %s", exc)
+
+
 def _tick_delay(now):
     """Seconds until 5s past the next minute boundary — the
     just-closed candle is stored by the stream by then."""
@@ -68,16 +139,24 @@ def _tick_delay(now):
 
 def _signal_result(db, sig, now):
     """(outcome, candle) for a pending signal, or None when the
-    minute has not closed yet / its candle is not stored. outcome is
-    'WIN', 'LOSS' or 'DOJI'."""
+    deciding candle has not closed yet / is not stored. outcome is
+    'WIN', 'WIN_MTG1' (MTG1 win — carries the dot), 'LOSS' or
+    'DOJI'. Non-MTG decides on the signal minute itself; MTG1
+    decides on the next minute (MTG1) when the signal minute lost.
+    The result is ready 5s after the deciding candle closes — the
+    loop wakes 5s past each minute (the owner, 2026-11-28: the old
+    2-minute grace made every result 1 minute late)."""
     from datetime import datetime as _dt
     try:
         minute_dt = _dt.strptime(sig["minute"], "%Y-%m-%d %H:%M")
     except (KeyError, ValueError):
         return ("LOSS", None)  # a broken record — drop it, do not retry
-    # The minute closes one minute after it starts; give the stream
-    # a minute of grace before calling it missing.
-    if now.replace(tzinfo=None) < minute_dt + timedelta(minutes=2):
+    mtg1 = bool(sig.get("mtg1"))
+    # The deciding candle closes one minute after its minute starts:
+    # non-MTG = the signal minute (+1 min); MTG1 = the MTG1 minute
+    # (signal minute +1, closes at +2 min).
+    decide_dt = minute_dt + timedelta(minutes=2 if mtg1 else 1)
+    if now.replace(tzinfo=None) < decide_dt:
         return None
     date_str, hhmm = sig["minute"][:10], sig["minute"][11:16]
     try:
@@ -89,7 +168,26 @@ def _signal_result(db, sig, now):
     direction = candle_direction(candle)
     if direction == "DOJI":
         return ("DOJI", candle)
-    return ("WIN" if direction == sig.get("direction") else "LOSS", candle)
+    if direction == sig.get("direction"):
+        return ("WIN", candle)
+    if not mtg1:
+        return ("LOSS", candle)
+    # MTG1: the signal minute lost — the next minute decides.
+    mtg1_dt = minute_dt + timedelta(minutes=1)
+    mtg1_date, mtg1_hhmm = (mtg1_dt.strftime("%Y-%m-%d"),
+                            mtg1_dt.strftime("%H:%M"))
+    try:
+        mtg1_candle = db.get_candle(sig["asset"], mtg1_date, mtg1_hhmm)
+    except Exception:
+        mtg1_candle = None
+    if mtg1_candle is None:
+        return None
+    mtg1_dir = candle_direction(mtg1_candle)
+    if mtg1_dir == "DOJI":
+        return ("DOJI", mtg1_candle)
+    if mtg1_dir == sig.get("direction"):
+        return ("WIN_MTG1", mtg1_candle)
+    return ("LOSS", mtg1_candle)
 
 
 def _recent_chart_candles(db, asset, now, n=_CHART_CANDLES):
@@ -101,43 +199,123 @@ def _recent_chart_candles(db, asset, now, n=_CHART_CANDLES):
     return [normalize_candle(c) for c in rows[-n:]]
 
 
-async def _send_signal(bot, db, uid, asset, minute_key, direction, now):
+async def _send_photo_or_text(bot, chat_id, png, caption, what):
+    """Send a chart photo with a premium caption to one chat; fall
+    back to the caption as a plain message when the photo fails.
+    Returns True when something was delivered."""
+    if png is not None:
+        try:
+            await bot.send_photo(chat_id=chat_id, photo=png,
+                                 caption=caption, parse_mode="HTML")
+            return True
+        except Exception as exc:
+            logger.warning("auto live: %s photo to %s failed: %s",
+                           what, chat_id, exc)
+    try:
+        await bot.send_message(chat_id=chat_id, text=caption,
+                               parse_mode="HTML")
+        return True
+    except Exception as exc:
+        logger.warning("auto live: %s to %s failed: %s", what, chat_id, exc)
+        return False
+
+
+async def _send_signal(bot, db, uid, asset, minute_key, direction, now,
+                       mtg1=False, extra_chats=()):
     candles = _recent_chart_candles(db, asset, now)
     hhmm = minute_key[11:16]
-    caption = (f"{display_asset(asset)} — {hhmm} M1 {direction}\n"
-               "Auto Live Signal — all four checks agree.")
+    mode = " (MTG1)" if mtg1 else ""
+    caption = (f"{pe('bell')} {display_asset(asset)} — {hhmm} M1 {direction}\n"
+               f"{pe('diamond')} Auto Live Signal{mode} — all four checks agree.")
     try:
         png = draw_candles_png(
             candles, title=f"{display_asset(asset)} {hhmm} M1 {direction}")
-        await bot.send_photo(chat_id=uid, photo=png, caption=caption)
     except Exception:
-        # A chart must never block the signal itself.
-        await bot.send_message(chat_id=uid, text=caption)
+        png = None
+    await _send_photo_or_text(bot, uid, png, caption, "signal")
+    for chat_id in extra_chats:
+        await _send_photo_or_text(bot, chat_id, png, caption, "signal")
     logger.info("auto live: signal %s %s %s to %s",
                 asset, minute_key, direction, uid)
 
 
-async def _send_result(bot, db, sig, outcome, candle, now):
+async def _send_result(bot, db, sig, outcome, candle, now, extra_chats=()):
     uid, asset = sig["uid"], sig["asset"]
     hhmm = sig["minute"][11:16]
     candles = _recent_chart_candles(db, asset, now)
+    # Highlight the deciding candle (the MTG1 candle in MTG1 mode).
+    decide_hhmm = hhmm
+    if candle is not None:
+        try:
+            decide_hhmm = normalize_candle(candle).get("hhmm") or hhmm
+        except Exception:
+            pass
     idx = None
     for i, c in enumerate(candles):
-        if c.get("hhmm") == hhmm:
+        if c.get("hhmm") == decide_hhmm:
             idx = i
             break
-    mark = "win" if outcome == "WIN" else ("loss" if outcome == "LOSS" else None)
-    caption = (f"{display_asset(asset)} — {hhmm} M1 {sig.get('direction')} — "
-               f"{outcome}")
+    if outcome == "WIN":
+        mark, sticker = "win", pe("check")
+        outcome_text = "WIN"
+    elif outcome == "WIN_MTG1":
+        # The MTG1 win carries the dot, exactly like the CHECKER.
+        mark, sticker = "win", pe("check") + "."
+        outcome_text = "WIN (MTG1)"
+    elif outcome == "LOSS":
+        mark, sticker = "loss", pe("cross")
+        outcome_text = "LOSS"
+    else:
+        mark, sticker = None, pe("minus")
+        outcome_text = "DOJI"
+    caption = (f"{sticker} {display_asset(asset)} — {hhmm} M1 "
+               f"{sig.get('direction')} — {outcome_text}")
     try:
         png = draw_candles_png(
             candles, highlight_idx=idx, mark=mark,
-            title=f"{display_asset(asset)} {hhmm} M1 {sig.get('direction')} — {outcome}")
-        await bot.send_photo(chat_id=uid, photo=png, caption=caption)
+            title=f"{display_asset(asset)} {hhmm} M1 {sig.get('direction')} — {outcome_text}")
     except Exception:
-        await bot.send_message(chat_id=uid, text=caption)
+        png = None
+    await _send_photo_or_text(bot, uid, png, caption, "result")
+    for chat_id in extra_chats:
+        await _send_photo_or_text(bot, chat_id, png, caption, "result")
     logger.info("auto live: result %s %s %s to %s",
                 asset, sig["minute"], outcome, uid)
+
+
+def _summary_text(entries):
+    """The 5-signal summary, with a premium check/cross/minus per
+    signal and an accuracy line (DOJI excluded, like the CHECKER)."""
+    lines = []
+    wins = losses = 0
+    for i, e in enumerate(entries, 1):
+        out = e.get("outcome")
+        if out in ("WIN", "WIN_MTG1"):
+            wins += 1
+            mark = pe("check") + ("." if out == "WIN_MTG1" else "")
+        elif out == "LOSS":
+            losses += 1
+            mark = pe("cross")
+        else:
+            mark = pe("minus")
+        lines.append(f"{i}. {display_asset(e['asset'])}, {e['hhmm']} M1 "
+                     f"{e['direction']} {mark}")
+    total = wins + losses
+    acc = f"{wins}/{total} = {wins * 100 // total}%" if total else "—"
+    return (
+        f"{pe('bell')}{pe('diamond')} Auto Live Signal — "
+        f"{len(entries)} Signals Summary\n"
+        + "\n".join(lines)
+        + f"\n{pe('crown')} Accuracy: {acc}")
+
+
+async def _send_summary(bot, uid, entries):
+    try:
+        await bot.send_message(chat_id=uid, text=_summary_text(entries),
+                               parse_mode="HTML")
+    except Exception as exc:
+        logger.warning("auto live: summary to %s failed: %s", uid, exc)
+    logger.info("auto live: %d-signal summary to %s", len(entries), uid)
 
 
 async def _auto_live_tick(bot, db, now_fn=None):
@@ -145,30 +323,53 @@ async def _auto_live_tick(bot, db, now_fn=None):
     now = now_fn() if now_fn else dhaka_now()
     pending = _load_pending(db)
     still_pending = []
+    history = _load_history(db)
     for sig in pending:
         got = _signal_result(db, sig, now)
         if got is None:
-            # Give up on a signal whose candle never arrives.
+            # Give up on a signal whose candle never arrives. MTG1
+            # decides a minute later, so it gets a minute more.
             from datetime import datetime as _dt
             try:
                 age = (now.replace(tzinfo=None)
                        - _dt.strptime(sig["minute"], "%Y-%m-%d %H:%M"))
             except (KeyError, ValueError):
                 age = timedelta(minutes=99)
-            if age > timedelta(minutes=_RESULT_WAIT_MINUTES):
+            limit = timedelta(
+                minutes=_RESULT_WAIT_MTG1_MINUTES if sig.get("mtg1")
+                else _RESULT_WAIT_MINUTES)
+            if age > limit:
                 logger.info("auto live: dropping stale pending signal %s %s",
                             sig["asset"], sig["minute"])
                 continue
             still_pending.append(sig)
             continue
         outcome, candle = got
+        extra = _extra_chats(db, sig["uid"])
         try:
-            await _send_result(bot, db, sig, outcome, candle, now)
+            await _send_result(bot, db, sig, outcome, candle, now,
+                               extra_chats=extra)
         except Exception as exc:
             logger.warning("auto live: result to %s failed: %s",
                            sig["uid"], exc)
             still_pending.append(sig)
+            continue
+        # Bank the completed signal; every 5th one sends a summary.
+        key = str(sig["uid"])
+        entries = history.get(key) or []
+        if not isinstance(entries, list):
+            entries = []
+        entries.append({"asset": sig["asset"],
+                        "hhmm": sig["minute"][11:16],
+                        "direction": sig.get("direction"),
+                        "outcome": outcome})
+        if len(entries) >= _SUMMARY_SIGNALS:
+            await _send_summary(bot, sig["uid"], entries)
+            history[key] = []
+        else:
+            history[key] = entries
     _save_pending(db, still_pending)
+    _save_history(db, history)
     try:
         from . import database as users_db
         subs = users_db.get_auto_subscribers()
@@ -194,13 +395,35 @@ async def _auto_live_tick(bot, db, now_fn=None):
         if not direction:
             continue  # no signal this minute — the point of the filter
         try:
-            await _send_signal(bot, db, uid, asset, minute_key, direction, now)
+            mtg1 = users_db.get_auto_mtg1(uid)
+        except Exception:
+            mtg1 = False
+        try:
+            await _send_signal(bot, db, uid, asset, minute_key, direction,
+                               now, mtg1=mtg1,
+                               extra_chats=_extra_chats(db, uid))
         except Exception as exc:
             logger.warning("auto live: signal to %s failed: %s", uid, exc)
             continue
         still_pending.append({"uid": uid, "asset": asset,
-                              "minute": minute_key, "direction": direction})
+                              "minute": minute_key, "direction": direction,
+                              "mtg1": bool(mtg1)})
     _save_pending(db, still_pending)
+
+
+def _extra_chats(db, uid):
+    """Extra chats for one subscriber's signals: the owner's channel,
+    but only for the owner's own signals and only when he turned the
+    channel send ON in the dashboard (the owner, 2026-11-28)."""
+    try:
+        if uid not in config.ADMIN_USER_IDS:
+            return []
+        if not channel_send_on(db):
+            return []
+        ch = (config.REQUIRED_CHANNEL or "").strip()
+        return [ch] if ch else []
+    except Exception:
+        return []
 
 
 async def auto_live_loop(bot, db, sleep=asyncio.sleep, now_fn=None,

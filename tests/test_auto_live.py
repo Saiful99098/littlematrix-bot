@@ -153,7 +153,8 @@ def test_auto_live_signal_and_result():
         db.insert_candles("BTCUSD_otc", [{
             "ts": datetime(2026, 11, 28, 12, 1, tzinfo=DHAKA),
             "open": 100.0, "high": 100.3, "low": 99.9, "close": 100.2}])
-        # Advance the clock past 12:03 (the result grace) and tick.
+        # Advance the clock past the result time (ready 5s after the
+        # 12:01 candle closes, i.e. 12:02:05) and tick.
         clock.now += 150
         asyncio.run(auto_live._auto_live_tick(bot, db, now_fn=_now_fn(clock)))
         assert len(bot.photos) == 2, bot.photos
@@ -230,9 +231,120 @@ def _setup_candles(db):
     return restore
 
 
+def test_auto_live_result_within_5s_of_close():
+    """f) The result follows within 5 seconds of the signal candle
+    closing (the owner, 2026-11-28): the old 2-minute grace made
+    every result 1 minute late. The signal caption carries a premium
+    sticker too."""
+    db = _tmp_candle_db()
+    restore = _setup_users()
+    try:
+        start = datetime(2026, 11, 28, 12, 0, tzinfo=DHAKA)
+        clock = _FakeClock(start.timestamp())
+        _seed_bullish(db, "BTCUSD_otc", start)
+        database.set_auto_asset(123, "BTCUSD_otc")
+        database.set_auto_signals(123, True)
+        bot = FakeBot()
+        # Tick at 12:00:05 -> signal for 12:01, then stop new
+        # signals so the result ticks are measured cleanly.
+        asyncio.run(auto_live._auto_live_tick(bot, db, now_fn=_now_fn(clock)))
+        assert len(bot.photos) == 1, bot.photos
+        assert "tg-emoji" in bot.photos[0][2], "signal caption has no premium sticker"
+        database.set_auto_signals(123, False)
+        db.insert_candles("BTCUSD_otc", [{
+            "ts": datetime(2026, 11, 28, 12, 1, tzinfo=DHAKA),
+            "open": 100.0, "high": 100.3, "low": 99.9, "close": 100.2}])
+        # 12:01:05 — the minute has not closed yet: no result.
+        clock.now += 60
+        asyncio.run(auto_live._auto_live_tick(bot, db, now_fn=_now_fn(clock)))
+        assert len(bot.photos) == 1, bot.photos
+        # 12:02:05 — 5s after the 12:01 candle closed: the result.
+        clock.now += 60
+        asyncio.run(auto_live._auto_live_tick(bot, db, now_fn=_now_fn(clock)))
+        assert len(bot.photos) == 2, bot.photos
+        assert "WIN" in bot.photos[1][2], bot.photos[1][2]
+        assert "tg-emoji" in bot.photos[1][2], "result caption has no premium sticker"
+    finally:
+        restore()
+    print("PASS f) auto live: result within 5s of the signal candle closing")
+
+
+def test_auto_live_mtg1_dot_and_timing():
+    """g) MTG1 mode: the result waits for the next minute, and a
+    MTG1 win carries the dot (check + dot), like the CHECKER."""
+    db = _tmp_candle_db()
+    restore = _setup_users()
+    try:
+        start = datetime(2026, 11, 28, 12, 0, tzinfo=DHAKA)
+        clock = _FakeClock(start.timestamp())
+        _seed_bullish(db, "BTCUSD_otc", start)
+        database.set_auto_asset(123, "BTCUSD_otc")
+        database.set_auto_mtg1(123, True)
+        database.set_auto_signals(123, True)
+        bot = FakeBot()
+        asyncio.run(auto_live._auto_live_tick(bot, db, now_fn=_now_fn(clock)))
+        assert len(bot.photos) == 1, bot.photos
+        assert "(MTG1)" in bot.photos[0][2], bot.photos[0][2]
+        database.set_auto_signals(123, False)
+        # 12:01 loses (PUT against the CALL), 12:02 wins (CALL).
+        db.insert_candles("BTCUSD_otc", [
+            {"ts": datetime(2026, 11, 28, 12, 1, tzinfo=DHAKA),
+             "open": 100.2, "high": 100.3, "low": 99.9, "close": 100.0},
+            {"ts": datetime(2026, 11, 28, 12, 2, tzinfo=DHAKA),
+             "open": 100.0, "high": 100.3, "low": 99.9, "close": 100.2}])
+        # 12:02:05 — the MTG1 candle has not closed yet: no result.
+        clock.now += 120
+        asyncio.run(auto_live._auto_live_tick(bot, db, now_fn=_now_fn(clock)))
+        assert len(bot.photos) == 1, bot.photos
+        # 12:03:05 — 5s after the MTG1 candle closed: the result.
+        clock.now += 60
+        asyncio.run(auto_live._auto_live_tick(bot, db, now_fn=_now_fn(clock)))
+        assert len(bot.photos) == 2, bot.photos
+        assert "WIN (MTG1)" in bot.photos[1][2], bot.photos[1][2]
+        assert "tg-emoji" in bot.photos[1][2], "result caption has no premium sticker"
+    finally:
+        restore()
+    print("PASS g) auto live MTG1: result waits for MTG1, win carries the dot")
+
+
+def test_auto_live_five_signal_summary():
+    """h) After 5 completed signals the bot sends a 5-signal
+    summary (premium stickers + accuracy), then the counter resets."""
+    db = _tmp_candle_db()
+    restore = _setup_users()
+    try:
+        start = datetime(2026, 11, 28, 12, 0, tzinfo=DHAKA)
+        clock = _FakeClock(start.timestamp())
+        pending = []
+        for m in range(1, 6):
+            db.insert_candles("BTCUSD_otc", [{
+                "ts": datetime(2026, 11, 28, 12, m, tzinfo=DHAKA),
+                "open": 100.0, "high": 100.3, "low": 99.9, "close": 100.2}])
+            pending.append({"uid": 123, "asset": "BTCUSD_otc",
+                            "minute": f"2026-11-28 12:{m:02d}",
+                            "direction": "CALL", "mtg1": False})
+        auto_live._save_pending(db, pending)
+        bot = FakeBot()
+        # 12:06:05 — all 5 minutes are decided: 5 results + 1 summary.
+        clock.now += 6 * 60 + 5
+        asyncio.run(auto_live._auto_live_tick(bot, db, now_fn=_now_fn(clock)))
+        assert len(bot.photos) == 5, bot.photos
+        assert len(bot.messages) == 1, bot.messages
+        summary = bot.messages[0][1]
+        assert "5 Signals Summary" in summary, summary
+        assert "Accuracy: 5/5" in summary, summary
+        assert "tg-emoji" in summary, "summary has no premium sticker"
+        assert auto_live.history_count(db, 123) == 0
+        assert auto_live._load_pending(db) == []
+    finally:
+        restore()
+    print("PASS h) auto live: 5-signal summary after 5 completed signals")
+
+
 def test_auto_live_menu_pick_and_toggle():
-    """e) The menu: pick a market, then Turn ON — the subscriber list
-    gains (uid, market); turning OFF removes it."""
+    """e) The menu: multi-select markets (toggle + SELECT ALL +
+    Next), then Turn ON — the subscriber list gains one (uid,
+    market) pair per market; turning OFF removes them."""
     import bot.handlers as handlers
     from tests.test_multiselect import (
         FakeContext, FakeQuery, _drive, _load_today)
@@ -246,29 +358,138 @@ def test_auto_live_menu_pick_and_toggle():
         q = FakeQuery("menu_autolive")
         _drive(ctx, q, "menu_autolive")
         assert "not picked yet" in q.texts[-1], q.texts[-1]
-        # Toggling ON without a market asks to pick one first.
+        assert "Signals: 0/5" in q.texts[-1], q.texts[-1]
+        # Toggling ON without a market asks to pick markets first.
         _drive(ctx, q, "autolive_toggle")
-        assert "Pick a market first" in q.texts[-1], q.texts[-1]
+        assert "Pick markets first" in q.texts[-1], q.texts[-1]
         _drive(ctx, q, "autolive_pick")
-        assert "pick your market" in q.texts[-1], q.texts[-1]
+        assert "pick markets" in q.texts[-1], q.texts[-1]
+        # Toggle two markets (multi-select), then Next saves them.
         _drive(ctx, q, "autolive_asset_BTCUSD_otc")
-        assert "BTCUSD-OTC" in q.texts[-1], q.texts[-1]
-        assert database.get_auto_asset(999) == "BTCUSD_otc"
+        assert "Selected: 1" in q.texts[-1], q.texts[-1]
+        _drive(ctx, q, "autolive_asset_ETHUSD_otc")
+        assert "Selected: 2" in q.texts[-1], q.texts[-1]
+        # SELECT ALL with everything picked clears the selection.
+        _drive(ctx, q, "autolive_all")
+        assert "Selected: 0" in q.texts[-1], q.texts[-1]
+        _drive(ctx, q, "autolive_all")
+        assert "Selected: 2" in q.texts[-1], q.texts[-1]
+        _drive(ctx, q, "autolive_next")
+        assert "BTCUSD-OTC" in q.texts[-1] and "ETHUSD-OTC" in q.texts[-1], q.texts[-1]
+        assert database.get_auto_assets(999) == ["BTCUSD_otc", "ETHUSD_otc"]
         _drive(ctx, q, "autolive_toggle")
         assert "Status: ON" in q.texts[-1], q.texts[-1]
-        assert database.get_auto_subscribers() == [(999, "BTCUSD_otc")]
+        assert database.get_auto_subscribers() == [(999, "BTCUSD_otc"), (999, "ETHUSD_otc")]
         _drive(ctx, q, "autolive_toggle")
         assert "Status: OFF" in q.texts[-1], q.texts[-1]
         assert database.get_auto_subscribers() == []
     finally:
         restore()
         restore_users()
-    print("PASS e) auto live menu: pick market + ON/OFF toggle")
+    print("PASS e) auto live menu: multi-select markets + ON/OFF toggle")
+
+
+def test_auto_live_menu_mtg_and_channel():
+    """j) The dashboard: MTG1/Non-MTG toggle flips the stored mode;
+    the Send to Channel toggle is owner-only."""
+    import bot.handlers as handlers
+    from tests.test_multiselect import (
+        FakeContext, FakeQuery, _button, _drive, _load_today)
+    from bot import config as config_mod
+    db = _tmp_candle_db()
+    _load_today(db, "BTCUSD_otc")
+    restore = _setup_candles(db)
+    restore_users = _setup_users()
+    old_admins = config_mod.ADMIN_USER_IDS
+    try:
+        ctx = FakeContext()
+        q = FakeQuery("menu_autolive")
+        _drive(ctx, q, "menu_autolive")
+        # Non-admin (999): no channel button.
+        assert _button(q, "autolive_channel") is None
+        assert _button(q, "autolive_mtg").text == "Mode: Non-MTG"
+        _drive(ctx, q, "autolive_mtg")
+        assert _button(q, "autolive_mtg").text == "Mode: MTG1"
+        assert database.get_auto_mtg1(999) is True
+        _drive(ctx, q, "autolive_mtg")
+        assert database.get_auto_mtg1(999) is False
+        # Owner (999 as admin): the channel button appears and toggles.
+        config_mod.ADMIN_USER_IDS = {999}
+        _drive(ctx, q, "menu_autolive")
+        assert _button(q, "autolive_channel").text == "Send to Channel: OFF"
+        _drive(ctx, q, "autolive_channel")
+        assert _button(q, "autolive_channel").text == "Send to Channel: ON"
+        assert auto_live.channel_send_on(db) is True
+    finally:
+        config_mod.ADMIN_USER_IDS = old_admins
+        restore()
+        restore_users()
+    print("PASS j) auto live menu: MTG toggle + owner-only channel toggle")
+
+
+def test_auto_live_back_cancels_pending():
+    """i) Back from the dashboard cancels pending results — the bot
+    stops sending them (the owner, 2026-11-28)."""
+    import bot.handlers as handlers
+    from tests.test_multiselect import FakeContext, FakeQuery, _drive
+    db = _tmp_candle_db()
+    restore = _setup_candles(db)
+    restore_users = _setup_users()
+    try:
+        auto_live._save_pending(db, [{"uid": 999, "asset": "BTCUSD_otc",
+                                      "minute": "2026-11-28 12:01",
+                                      "direction": "CALL", "mtg1": False}])
+        assert len(auto_live._load_pending(db)) == 1
+        ctx = FakeContext()
+        q = FakeQuery("autolive_back")
+        _drive(ctx, q, "autolive_back")
+        assert auto_live._load_pending(db) == []
+        assert "BLUE FISH PRIME" in q.texts[-1], q.texts[-1]
+    finally:
+        restore()
+        restore_users()
+    print("PASS i) auto live Back cancels pending results")
+
+
+def test_stale_button_after_start():
+    """k) After a fresh /start, buttons on older messages no longer
+    work (the owner, 2026-11-28)."""
+    import bot.handlers as handlers
+    from tests.test_multiselect import (
+        FakeContext, FakeQuery, FakeUpdate, _drive)
+    from datetime import datetime, timezone
+    db = _tmp_candle_db()
+    restore = _setup_candles(db)
+    restore_users = _setup_users()
+    try:
+        ctx = FakeContext()
+        now = datetime.now(timezone.utc).timestamp()
+        ctx.user_data["menu_started_at"] = now
+        # A button on a message sent 10 minutes before /start: dead.
+        q = FakeQuery("menu_autolive")
+        q.message.date = datetime.fromtimestamp(now - 600, tz=timezone.utc)
+        asyncio.run(handlers.menu_callback(FakeUpdate(q), ctx))
+        assert q.texts == [], q.texts
+        # A button on a fresh message still works.
+        q2 = FakeQuery("menu_autolive")
+        q2.message.date = datetime.fromtimestamp(now + 5, tz=timezone.utc)
+        _drive(ctx, q2, "menu_autolive")
+        assert "Auto Live Signal" in q2.texts[-1], q2.texts[-1]
+    finally:
+        restore()
+        restore_users()
+    print("PASS k) stale buttons die after a fresh /start")
 
 
 if __name__ == "__main__":
     test_auto_live_signal_and_result()
     test_auto_live_weak_analysis_sends_nothing()
     test_chart_png_marks_signal_candle()
+    test_auto_live_result_within_5s_of_close()
+    test_auto_live_mtg1_dot_and_timing()
+    test_auto_live_five_signal_summary()
     test_auto_live_menu_pick_and_toggle()
+    test_auto_live_menu_mtg_and_channel()
+    test_auto_live_back_cancels_pending()
+    test_stale_button_after_start()
     print("ALL AUTO-LIVE TESTS PASSED")

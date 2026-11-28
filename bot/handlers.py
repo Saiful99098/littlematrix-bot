@@ -31,7 +31,8 @@ logger = logging.getLogger("littlematrix.handlers")
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
-from . import candles_db, collector, config, database, live_stream, quotex_client, referral
+from . import (auto_live, candles_db, collector, config, database,
+               live_stream, quotex_client, referral)
 from .chart import draw_candles_png
 from .checker import (build_lookup, check_signals, dot_date,
                       format_check_results, parse_checker_date,
@@ -647,9 +648,13 @@ async def _show_analysis_picker(query, context, tool):
 
 
 async def _show_auto_picker(query, context, page):
-    """Single-select market picker for Live Auto Signal (the owner,
-    2026-11-28): tap one market and it becomes the watched market.
-    Paginated, OTC first."""
+    """Paginated MULTI-SELECT market picker for Live Auto Signal
+    (the owner, 2026-11-28): tap a market to toggle it (a premium
+    check appears on selected buttons), SELECT ALL toggles
+    everything, Next saves the selection. The picker stays on the
+    same page — it is re-rendered in place on every tap. The
+    selection lives in user_data["autolive_picked"], seeded from the
+    saved markets when the picker opens."""
     assets = _analysis_assets()
     if not assets:
         await query.edit_message_text(
@@ -657,12 +662,16 @@ async def _show_auto_picker(query, context, page):
             "The backfill collects the last 5 days first.",
             reply_markup=back_keyboard(), parse_mode="HTML")
         return
+    picked = context.user_data.get("autolive_picked") or set()
     total_pages = max(1, (len(assets) + ASSETS_PER_PAGE - 1) // ASSETS_PER_PAGE)
     page = max(0, min(page, total_pages - 1))
+    context.user_data["autolive_page"] = page
     chunk = assets[page * ASSETS_PER_PAGE:(page + 1) * ASSETS_PER_PAGE]
-    kb = []
+    kb = [[_btn("SELECT ALL", "autolive_all", icon="select_all",
+               style="success")]]
     for i in range(0, len(chunk), 2):
-        kb.append([_btn(display_asset(a), f"autolive_asset_{a}", icon="asset")
+        kb.append([_btn(display_asset(a), f"autolive_asset_{a}",
+                        icon="check" if a in picked else "asset")
                    for a in chunk[i:i + 2]])
     nav = []
     if page > 0:
@@ -671,11 +680,55 @@ async def _show_auto_picker(query, context, page):
         nav.append(_btn("Next Page", f"autolive_page_{page + 1}", icon="next"))
     if nav:
         kb.append(nav)
+    kb.append([_btn("Next", "autolive_next", icon="next")])
     kb.append([_btn("Back", "menu_autolive", icon="back")])
     await query.edit_message_text(
-        f"{pe('bell')} Auto Live Signal — pick your market {pe('chart')}\n"
+        f"{pe('bell')} Auto Live Signal — pick markets {pe('chart')}\n"
         f"{DIVIDER}\nPage {page + 1}/{total_pages}\n"
-        "Tap one market — the bot will watch it when you turn it ON.",
+        f"Selected: {len(picked)} — tap a market to toggle it, then tap Next.",
+        reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+
+
+async def _show_autolive_menu(query, context, uid):
+    """Render the Live Auto Signal dashboard (the owner,
+    2026-11-28): the Status and Markets lines carry premium emojis,
+    the explainer paragraph is gone, MTG1/Non-MTG and (owner only)
+    Send to Channel are toggle buttons, and Back cancels any pending
+    results. The Signals line shows progress toward the automatic
+    5-signal summary."""
+    on = database.is_auto_subscriber(uid)
+    assets = database.get_auto_assets(uid)
+    mtg1 = database.get_auto_mtg1(uid)
+    try:
+        db = _db()
+    except Exception:
+        db = None
+    done = auto_live.history_count(db, uid)
+    status_icon = pe("green") if on else pe("red")
+    market_line = (f"{pe('chart')} Markets: "
+                   f"{', '.join(display_asset(a) for a in assets)}"
+                   if assets else
+                   f"{pe('chart')} Markets: not picked yet — pick markets first.")
+    kb = []
+    if assets:
+        kb.append([_btn(f"Markets: {len(assets)} picked", "autolive_pick",
+                        icon="asset")])
+    else:
+        kb.append([_btn("Pick markets", "autolive_pick", icon="asset")])
+    kb.append([_btn(f"Mode: {'MTG1' if mtg1 else 'Non-MTG'}",
+                    "autolive_mtg", icon="mtg")])
+    if _is_admin(uid):
+        ch_on = auto_live.channel_send_on(db)
+        kb.append([_btn(f"Send to Channel: {'ON' if ch_on else 'OFF'}",
+                        "autolive_channel", icon="admin")])
+    kb.append([_btn("Turn OFF" if on else "Turn ON", "autolive_toggle",
+                   icon="toggle_off" if on else "toggle_on")])
+    kb.append([_btn("Back", "autolive_back", icon="back")])
+    await query.edit_message_text(
+        f"{pe('bell')} Auto Live Signal\n{DIVIDER}\n"
+        f"{status_icon} Status: {'ON' if on else 'OFF'}\n"
+        f"{market_line}\n"
+        f"{pe('diamond')} Signals: {done}/5",
         reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
 
 
@@ -875,8 +928,41 @@ def _db_recent_candles(asset, n):
     return [normalize_candle(c) for c in candles[-n:]]
 
 
+def _is_stale_menu_button(query, context, uid):
+    """True when a tapped button lives on a message sent before the
+    user's last fresh /start (the owner, 2026-11-28): after /start
+    starts the menu anew, the old buttons above no longer work. The
+    2-second tolerance covers Telegram's 1-second message-date
+    resolution, so the fresh menu itself is never stale. Returns
+    False when no /start is recorded or the message has no date."""
+    started = context.user_data.get("menu_started_at")
+    if started is None:
+        started = database.get_menu_started_at(uid)
+        if started:
+            context.user_data["menu_started_at"] = started
+    if not started:
+        return False
+    msg = query.message
+    if msg is None or getattr(msg, "date", None) is None:
+        return False
+    try:
+        return msg.date.timestamp() < float(started) - 2
+    except Exception:
+        return False
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    # A fresh /start (a real message, not an edit of an old one)
+    # retires every button above it: record the moment now, before
+    # the new menu is sent, so the fresh menu itself stays live.
+    if update.message is not None:
+        started = datetime.now(timezone.utc).timestamp()
+        context.user_data["menu_started_at"] = started
+        try:
+            database.set_menu_started_at(user.id, started)
+        except Exception:
+            pass
     _cancel_admin_dash(user.id)
     database.get_or_create_user(user.id, user.username or "")
     if not await _is_channel_member(context.bot, user.id):
@@ -971,14 +1057,35 @@ def _futures_time_text():
 
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    data = query.data
+    user = update.effective_user
+    # Stale-button guard (the owner, 2026-11-28): a button on a
+    # message sent before the user's last fresh /start does nothing
+    # — its keyboard is stripped so it visibly dies. The channel-gate
+    # re-check and admin premium decisions are exempt: they are not
+    # menu buttons and must always work. This runs before the normal
+    # query.answer(), because a callback can only be answered once.
+    if (data != "check_member"
+            and not data.startswith("premium_approve_")
+            and not data.startswith("premium_reject_")
+            and _is_stale_menu_button(query, context, user.id)):
+        try:
+            await query.answer(
+                "This menu is old — send /start for a fresh menu.",
+                show_alert=True)
+        except Exception:
+            pass
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
     try:
         await query.answer()
     except Exception:
         # "Query is too old" / timeout (slow instance under backfill
         # load): the tap still works — the menu is edited below.
         pass
-    data = query.data
-    user = update.effective_user
     # The dashboard refresh runs ONLY while the owner is looking at
     # the dashboard (the owner, 2026-11-27): any other tap means he
     # navigated away, so stop the loop here — otherwise it keeps
@@ -1662,37 +1769,17 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=back_keyboard(), parse_mode="HTML")
         return
     if data == "menu_autolive":
-        # Live Auto Signal (the owner, 2026-11-28): pick ONE market,
-        # then turn it ON — the bot watches that market live and
-        # sends a signal only when the analysis is strong, never
-        # every minute. ON stays on until the user turns it OFF.
-        on = database.is_auto_subscriber(user.id)
-        asset = database.get_auto_asset(user.id)
-        kb = []
-        if asset:
-            kb.append([_btn(f"Market: {display_asset(asset)}",
-                            "autolive_pick", icon="asset")])
-        else:
-            kb.append([_btn("Pick market", "autolive_pick", icon="asset")])
-        toggle = _btn("Turn OFF" if on else "Turn ON",
-                      "autolive_toggle",
-                      icon="toggle_off" if on else "toggle_on")
-        kb.append([toggle])
-        kb.append([_btn("Back", "menu_main", icon="back")])
-        market_line = (f"Market: {display_asset(asset)}\n" if asset
-                       else "Market: not picked yet — pick one first.\n")
-        await query.edit_message_text(
-            f"{pe('bell')} Auto Live Signal\n{DIVIDER}\n"
-            f"Status: {'ON' if on else 'OFF'}\n"
-            f"{market_line}\n"
-            "When ON, the bot watches your market live and sends a "
-            "signal only when the analysis is strong (multi-day + "
-            "win-%), with a chart screenshot — then a result "
-            "screenshot with a tick (profit) or a cross (loss).",
-            reply_markup=InlineKeyboardMarkup(kb),
-            parse_mode="HTML")
+        # Live Auto Signal dashboard (the owner, 2026-11-28): pick
+        # one or more markets, choose MTG1 or Non-MTG, turn it ON —
+        # the bot watches those markets live and sends a signal only
+        # when the analysis is strong. ON stays on until OFF.
+        await _show_autolive_menu(query, context, user.id)
         return
     if data == "autolive_pick":
+        # Seed the multi-select from the saved markets, then open
+        # the picker on page 0.
+        context.user_data["autolive_picked"] = set(
+            database.get_auto_assets(user.id))
         await _show_auto_picker(query, context, 0)
         return
     if data.startswith("autolive_page_"):
@@ -1703,47 +1790,87 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _show_auto_picker(query, context, page)
         return
     if data.startswith("autolive_asset_"):
+        # Toggle one market in the picker selection (no save yet —
+        # Next saves). Re-render the same page in place.
         asset = data[len("autolive_asset_"):]
-        database.set_auto_asset(user.id, asset)
-        on = database.is_auto_subscriber(user.id)
-        toggle = _btn("Turn OFF" if on else "Turn ON",
-                      "autolive_toggle",
-                      icon="toggle_off" if on else "toggle_on")
+        picked = context.user_data.get("autolive_picked") or set()
+        if asset in picked:
+            picked.discard(asset)
+        else:
+            picked.add(asset)
+        context.user_data["autolive_picked"] = picked
+        await _show_auto_picker(
+            query, context, context.user_data.get("autolive_page", 0))
+        return
+    if data == "autolive_all":
+        # SELECT ALL toggles everything (all pages), like the
+        # analysis pickers.
+        picked = context.user_data.get("autolive_picked") or set()
+        assets = _analysis_assets()
+        if len(picked) >= len(assets):
+            picked = set()
+        else:
+            picked = set(assets)
+        context.user_data["autolive_picked"] = picked
+        await _show_auto_picker(
+            query, context, context.user_data.get("autolive_page", 0))
+        return
+    if data == "autolive_next":
+        # Save the multi-select, then show the dashboard.
+        picked = context.user_data.get("autolive_picked") or set()
+        database.set_auto_assets(user.id, sorted(picked))
+        await _show_autolive_menu(query, context, user.id)
+        return
+    if data == "autolive_mtg":
+        # MTG1 / Non-MTG toggle (the owner, 2026-11-28): the mode
+        # is stored per user and stamped onto each signal, so the
+        # result logic uses the mode that was chosen when the signal
+        # was sent.
+        database.set_auto_mtg1(user.id, not database.get_auto_mtg1(user.id))
+        await _show_autolive_menu(query, context, user.id)
+        return
+    if data == "autolive_channel":
+        # Send-to-channel toggle — owner only (the owner,
+        # 2026-11-28). When ON, the owner's own Auto Live signals
+        # (and their results) are also posted to his channel.
+        if not _is_admin(user.id):
+            await query.answer("Only the owner can use this.")
+            return
+        try:
+            db = _db()
+        except Exception:
+            db = None
+        auto_live.set_channel_send(db, not auto_live.channel_send_on(db))
+        await _show_autolive_menu(query, context, user.id)
+        return
+    if data == "autolive_back":
+        # Back to the menu from the dashboard (the owner,
+        # 2026-11-28): any pending Auto Live results for this user
+        # are cancelled — the bot stops sending them.
+        try:
+            auto_live.cancel_pending_for_user(_db(), user.id)
+        except Exception:
+            pass
+        _cancel_admin_dash(user.id)
+        context.user_data.pop("flow", None)
         await query.edit_message_text(
-            f"{pe('bell')} Auto Live Signal\n{DIVIDER}\n"
-            f"Status: {'ON' if on else 'OFF'}\n"
-            f"Market: {display_asset(asset)}\n\n"
-            "Tap Turn ON and the bot starts watching this market.",
-            reply_markup=InlineKeyboardMarkup(
-                [[toggle], [_btn("Back", "menu_main", icon="back")]]),
-            parse_mode="HTML")
+            f"{pe('diamond')}{pe('lightning')} BLUE FISH PRIME — Trading Terminal {pe('sparkle')}\n"
+            f"Pick a tool below. {pe('fire')}",
+            reply_markup=main_keyboard(admin=_is_admin(user.id)), parse_mode="HTML")
         return
     if data == "autolive_toggle":
-        asset = database.get_auto_asset(user.id)
-        if not asset:
+        assets = database.get_auto_assets(user.id)
+        if not assets:
             await query.edit_message_text(
-                f"{pe('warning')} Pick a market first — tap Pick market.",
+                f"{pe('warning')} Pick markets first — tap Pick markets.",
                 reply_markup=InlineKeyboardMarkup(
-                    [[_btn("Pick market", "autolive_pick", icon="asset")],
-                     [_btn("Back", "menu_main", icon="back")]]),
+                    [[_btn("Pick markets", "autolive_pick", icon="asset")],
+                     [_btn("Back", "autolive_back", icon="back")]]),
                 parse_mode="HTML")
             return
         on = not database.is_auto_subscriber(user.id)
         database.set_auto_signals(user.id, on)
-        toggle = _btn("Turn OFF" if on else "Turn ON",
-                      "autolive_toggle",
-                      icon="toggle_off" if on else "toggle_on")
-        await query.edit_message_text(
-            f"{pe('bell')} Auto Live Signal\n{DIVIDER}\n"
-            f"Status: {'ON' if on else 'OFF'}\n"
-            f"Market: {display_asset(asset)}\n\n"
-            "When ON, the bot watches your market live and sends a "
-            "signal only when the analysis is strong (multi-day + "
-            "win-%), with a chart screenshot — then a result "
-            "screenshot with a tick (profit) or a cross (loss).",
-            reply_markup=InlineKeyboardMarkup(
-                [[toggle], [_btn("Back", "menu_main", icon="back")]]),
-            parse_mode="HTML")
+        await _show_autolive_menu(query, context, user.id)
         return
     if data == "menu_premium":
         context.user_data["flow"] = "premium_txn"

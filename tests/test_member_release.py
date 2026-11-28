@@ -149,6 +149,16 @@ def test_users_db_sqlite():
         assert database.get_auto_subscribers() == [(123, "BTCUSD_otc")]
         database.set_auto_signals(123, False)
         assert database.get_auto_subscribers() == []
+        # Multi-asset + MTG mode (the owner, 2026-11-28): one
+        # (telegram_id, market) pair per picked market.
+        database.set_auto_assets(123, ["BTCUSD_otc", "ETHUSD_otc"])
+        database.set_auto_signals(123, True)
+        assert database.get_auto_subscribers() == [(123, "BTCUSD_otc"),
+                                                   (123, "ETHUSD_otc")]
+        assert database.get_auto_mtg1(123) is False
+        database.set_auto_mtg1(123, True)
+        assert database.get_auto_mtg1(123) is True
+        database.set_auto_signals(123, False)
         # Premium request round-trip + approve.
         req_id = database.save_premium_request(123, "abc123hash")
         pending = database.get_pending_premium_requests()

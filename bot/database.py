@@ -135,6 +135,40 @@ def _ensure_auto_asset_column():
         pass  # a failed migration must never break the bot
 
 
+def _ensure_menu_started_at_column():
+    """Add the /start timestamp column to a users table created
+    before it existed. Same tolerant pattern as auto_mtg1: a
+    migration failure must never break the bot."""
+    try:
+        if _backend() == "postgres":
+            _execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS menu_started_at TEXT")
+        else:
+            try:
+                _execute("ALTER TABLE users ADD COLUMN menu_started_at TEXT")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc):
+                    raise
+    except Exception:
+        pass  # a failed migration must never break the bot
+
+
+def _ensure_auto_mtg1_column():
+    """Add the Live Auto Signal MTG mode column to a users table
+    created before it existed. Same tolerant pattern as
+    auto_asset: a migration failure must never break the bot."""
+    try:
+        if _backend() == "postgres":
+            _execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS auto_mtg1 INTEGER NOT NULL DEFAULT 0")
+        else:
+            try:
+                _execute("ALTER TABLE users ADD COLUMN auto_mtg1 INTEGER NOT NULL DEFAULT 0")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc):
+                    raise
+    except Exception:
+        pass  # a failed migration must never break the bot
+
+
 def _ensure_matrix_coins_column():
     """Add the MATRIX coin balance column to a users table created
     before referrals existed. Same tolerant pattern as last_seen:
@@ -174,6 +208,8 @@ def _connect():
     _ensure_last_seen_column()
     _ensure_matrix_coins_column()
     _ensure_auto_asset_column()
+    _ensure_auto_mtg1_column()
+    _ensure_menu_started_at_column()
     return _CONN
 
 
@@ -337,31 +373,102 @@ def is_auto_subscriber(telegram_id):
 def set_auto_asset(telegram_id, asset):
     """Set the market a user's Live Auto Signal watches (None clears
     it). The column is added by _ensure_auto_asset_column; a users
-    table that predates it gets the column on connect."""
-    get_or_create_user(telegram_id)
-    _execute("UPDATE users SET auto_asset=? WHERE telegram_id=?",
-             (asset, telegram_id))
+    table that predates it gets the column on connect. Single-asset
+    wrapper around set_auto_assets (the owner, 2026-11-28, picked
+    multi-asset select)."""
+    set_auto_assets(telegram_id, [asset] if asset else [])
 
 
 def get_auto_asset(telegram_id):
+    """The first market a user's Live Auto Signal watches, or None."""
+    assets = get_auto_assets(telegram_id)
+    return assets[0] if assets else None
+
+
+def set_auto_assets(telegram_id, assets):
+    """Set the markets a user's Live Auto Signal watches, as a
+    comma-separated list in the auto_asset column (an empty list
+    clears it)."""
+    get_or_create_user(telegram_id)
+    value = ",".join(a for a in (assets or []) if a) or None
+    _execute("UPDATE users SET auto_asset=? WHERE telegram_id=?",
+             (value, telegram_id))
+
+
+def get_auto_assets(telegram_id):
+    """The markets a user's Live Auto Signal watches, as a list."""
     try:
         cur = _execute("SELECT auto_asset FROM users WHERE telegram_id=?",
                        (telegram_id,))
         row = cur.fetchone()
-        return row[0] if row else None
+        if not row or not row[0]:
+            return []
+        return [a for a in row[0].split(",") if a]
+    except Exception:
+        return []
+
+
+def set_auto_mtg1(telegram_id, mtg1):
+    """Set whether a user's Live Auto Signal trades MTG1 (True) or
+    Non-MTG / M1 only (False). The column is added by
+    _ensure_auto_mtg1_column."""
+    get_or_create_user(telegram_id)
+    _execute("UPDATE users SET auto_mtg1=? WHERE telegram_id=?",
+             (1 if mtg1 else 0, telegram_id))
+
+
+def get_auto_mtg1(telegram_id):
+    """True when a user's Live Auto Signal trades MTG1, False for
+    Non-MTG (the default)."""
+    try:
+        cur = _execute("SELECT auto_mtg1 FROM users WHERE telegram_id=?",
+                       (telegram_id,))
+        row = cur.fetchone()
+        return bool(row[0]) if row else False
+    except Exception:
+        return False
+
+
+def set_menu_started_at(telegram_id, ts):
+    """Record when a user last started the menu fresh with /start
+    (Unix seconds). Buttons on messages sent before that moment are
+    stale and no longer work. The column is added by
+    _ensure_menu_started_at_column."""
+    get_or_create_user(telegram_id)
+    _execute("UPDATE users SET menu_started_at=? WHERE telegram_id=?",
+             (str(float(ts)), telegram_id))
+
+
+def get_menu_started_at(telegram_id):
+    """Unix seconds of a user's last fresh /start, or None when the
+    user never pressed /start (or the column is missing)."""
+    try:
+        cur = _execute("SELECT menu_started_at FROM users WHERE telegram_id=?",
+                       (telegram_id,))
+        row = cur.fetchone()
+        if not row or not row[0]:
+            return None
+        return float(row[0])
     except Exception:
         return None
 
 
 def get_auto_subscribers():
     """Live Auto Signal subscribers as (telegram_id, auto_asset)
-    pairs — only users who are ON and have picked a market."""
+    pairs — only users who are ON and have picked at least one
+    market. A user with several markets yields one pair per market,
+    so the loop watches each of their markets."""
     try:
         cur = _execute(
             "SELECT telegram_id, auto_asset FROM users "
             "WHERE auto_signals=1 AND auto_asset IS NOT NULL "
             "AND auto_asset != ''")
-        return [(r[0], r[1]) for r in cur.fetchall()]
+        pairs = []
+        for telegram_id, raw in cur.fetchall():
+            for asset in (raw or "").split(","):
+                if asset:
+                    pairs.append((telegram_id, asset))
+        return pairs
     except Exception:
         return []
 
