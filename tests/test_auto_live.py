@@ -158,7 +158,10 @@ def test_auto_live_signal_and_result():
         clock.now += 150
         asyncio.run(auto_live._auto_live_tick(bot, db, now_fn=_now_fn(clock)))
         assert len(bot.photos) == 2, bot.photos
-        assert "WIN" in bot.photos[1][2], bot.photos[1][2]
+        # Fix 1 (2026-11-28): no "WIN" text — only the premium
+        # check sticker.
+        assert "WIN" not in bot.photos[1][2], bot.photos[1][2]
+        assert "tg-emoji" in bot.photos[1][2], bot.photos[1][2]
         assert bot.photos[1][1][:8] == PNG_MAGIC, "result photo is not a PNG"
     finally:
         restore()
@@ -250,7 +253,11 @@ def test_auto_live_result_within_5s_of_close():
         asyncio.run(auto_live._auto_live_tick(bot, db, now_fn=_now_fn(clock)))
         assert len(bot.photos) == 1, bot.photos
         assert "tg-emoji" in bot.photos[0][2], "signal caption has no premium sticker"
-        database.set_auto_signals(123, False)
+        # Stop new signals WITHOUT turning OFF: turning OFF would
+        # cancel the pending result (Fix 2, 2026-11-28). Clearing
+        # the picked markets stops new signals but keeps the
+        # subscriber flag, so the pending result is still sent.
+        database.set_auto_assets(123, [])
         db.insert_candles("BTCUSD_otc", [{
             "ts": datetime(2026, 11, 28, 12, 1, tzinfo=DHAKA),
             "open": 100.0, "high": 100.3, "low": 99.9, "close": 100.2}])
@@ -262,7 +269,8 @@ def test_auto_live_result_within_5s_of_close():
         clock.now += 60
         asyncio.run(auto_live._auto_live_tick(bot, db, now_fn=_now_fn(clock)))
         assert len(bot.photos) == 2, bot.photos
-        assert "WIN" in bot.photos[1][2], bot.photos[1][2]
+        # Fix 1: no "WIN" text — only the premium check sticker.
+        assert "WIN" not in bot.photos[1][2], bot.photos[1][2]
         assert "tg-emoji" in bot.photos[1][2], "result caption has no premium sticker"
     finally:
         restore()
@@ -285,7 +293,9 @@ def test_auto_live_mtg1_dot_and_timing():
         asyncio.run(auto_live._auto_live_tick(bot, db, now_fn=_now_fn(clock)))
         assert len(bot.photos) == 1, bot.photos
         assert "(MTG1)" in bot.photos[0][2], bot.photos[0][2]
-        database.set_auto_signals(123, False)
+        # Stop new signals WITHOUT turning OFF (Fix 2): turning OFF
+        # would cancel the pending result.
+        database.set_auto_assets(123, [])
         # 12:01 loses (PUT against the CALL), 12:02 wins (CALL).
         db.insert_candles("BTCUSD_otc", [
             {"ts": datetime(2026, 11, 28, 12, 1, tzinfo=DHAKA),
@@ -300,7 +310,10 @@ def test_auto_live_mtg1_dot_and_timing():
         clock.now += 60
         asyncio.run(auto_live._auto_live_tick(bot, db, now_fn=_now_fn(clock)))
         assert len(bot.photos) == 2, bot.photos
-        assert "WIN (MTG1)" in bot.photos[1][2], bot.photos[1][2]
+        # Fix 1: no "WIN (MTG1)" text — the MTG1 win is the premium
+        # check sticker + a dot.
+        assert "WIN" not in bot.photos[1][2], bot.photos[1][2]
+        assert "</tg-emoji>." in bot.photos[1][2], bot.photos[1][2]
         assert "tg-emoji" in bot.photos[1][2], "result caption has no premium sticker"
     finally:
         restore()
@@ -315,6 +328,10 @@ def test_auto_live_five_signal_summary():
     try:
         start = datetime(2026, 11, 28, 12, 0, tzinfo=DHAKA)
         clock = _FakeClock(start.timestamp())
+        # The pending signals belong to a subscriber (Fix 2's guard
+        # drops results for users who turned OFF).
+        database.set_auto_asset(123, "BTCUSD_otc")
+        database.set_auto_signals(123, True)
         pending = []
         for m in range(1, 6):
             db.insert_candles("BTCUSD_otc", [{
@@ -334,6 +351,18 @@ def test_auto_live_five_signal_summary():
         assert "5 Signals Summary" in summary, summary
         assert "Accuracy: 5/5" in summary, summary
         assert "tg-emoji" in summary, "summary has no premium sticker"
+        # Fix 3 (2026-11-28): CHECKER format — date at the top,
+        # monospace signal lines, a gap below the header and above
+        # the Accuracy line, signals packed together.
+        assert "DATE:" in summary and "28.11.2026" in summary, summary
+        assert "<code>" in summary, "summary signals are not monospace"
+        lines = summary.split("\n")
+        assert lines[0].startswith("DATE:"), lines
+        assert lines[2] == "", lines  # gap below the header
+        assert lines[-2] == "", lines  # gap above Accuracy
+        assert "Accuracy:" in lines[-1], lines
+        sig_lines = [ln for ln in lines if ln.startswith("<code>")]
+        assert len(sig_lines) == 5, sig_lines
         assert auto_live.history_count(db, 123) == 0
         assert auto_live._load_pending(db) == []
     finally:
@@ -481,6 +510,138 @@ def test_stale_button_after_start():
     print("PASS k) stale buttons die after a fresh /start")
 
 
+def test_auto_live_mtg1_m1_win_is_immediate():
+    """Fix 4 (2026-11-28): MTG1 mode, M1 direct win — the result
+    comes 5s after the signal candle closes, NOT after the MTG1
+    candle. Only a lost M1 waits for MTG1."""
+    db = _tmp_candle_db()
+    restore = _setup_users()
+    try:
+        start = datetime(2026, 11, 28, 12, 0, tzinfo=DHAKA)
+        clock = _FakeClock(start.timestamp())
+        _seed_bullish(db, "BTCUSD_otc", start)
+        database.set_auto_asset(123, "BTCUSD_otc")
+        database.set_auto_mtg1(123, True)
+        database.set_auto_signals(123, True)
+        bot = FakeBot()
+        asyncio.run(auto_live._auto_live_tick(bot, db, now_fn=_now_fn(clock)))
+        assert len(bot.photos) == 1, bot.photos
+        assert "(MTG1)" in bot.photos[0][2], bot.photos[0][2]
+        # Stop new signals WITHOUT turning OFF (Fix 2).
+        database.set_auto_assets(123, [])
+        # 12:01 wins directly (CALL).
+        db.insert_candles("BTCUSD_otc", [{
+            "ts": datetime(2026, 11, 28, 12, 1, tzinfo=DHAKA),
+            "open": 100.0, "high": 100.3, "low": 99.9, "close": 100.2}])
+        # 12:01:05 — the minute has not closed yet: no result.
+        clock.now += 60
+        asyncio.run(auto_live._auto_live_tick(bot, db, now_fn=_now_fn(clock)))
+        assert len(bot.photos) == 1, bot.photos
+        # 12:02:05 — 5s after the 12:01 candle closed: the result
+        # is already here (no MTG1 wait for a direct M1 win).
+        clock.now += 60
+        asyncio.run(auto_live._auto_live_tick(bot, db, now_fn=_now_fn(clock)))
+        assert len(bot.photos) == 2, bot.photos
+        # Direct M1 win: the premium check sticker, NO dot (the dot
+        # is only for a MTG1 win), NO "WIN" text (Fix 1).
+        assert "tg-emoji" in bot.photos[1][2], bot.photos[1][2]
+        assert "</tg-emoji>." not in bot.photos[1][2], bot.photos[1][2]
+        assert "WIN" not in bot.photos[1][2], bot.photos[1][2]
+    finally:
+        restore()
+    print("PASS Fix 4) auto live MTG1: direct M1 win sends the result at once")
+
+
+def test_auto_live_toggle_off_cancels_pending():
+    """Fix 2 (2026-11-28): turning Auto Live OFF cancels pending
+    results — the bot stops sending them, just like Back."""
+    import bot.handlers as handlers
+    from tests.test_multiselect import FakeContext, FakeQuery, _drive
+    db = _tmp_candle_db()
+    restore = _setup_candles(db)
+    restore_users = _setup_users()
+    try:
+        database.set_auto_assets(999, ["BTCUSD_otc"])
+        database.set_auto_signals(999, True)
+        auto_live._save_pending(db, [{"uid": 999, "asset": "BTCUSD_otc",
+                                      "minute": "2026-11-28 12:01",
+                                      "direction": "CALL", "mtg1": False}])
+        assert len(auto_live._load_pending(db)) == 1
+        ctx = FakeContext()
+        q = FakeQuery("autolive_toggle")
+        _drive(ctx, q, "autolive_toggle")
+        assert auto_live._load_pending(db) == []
+        assert database.get_auto_subscribers() == []
+        assert "Status: OFF" in q.texts[-1], q.texts[-1]
+    finally:
+        restore()
+        restore_users()
+    print("PASS Fix 2) auto live toggle OFF cancels pending results")
+
+
+def test_auto_live_off_user_gets_no_result():
+    """Fix 2 guard (2026-11-28): a tick drops a pending result when
+    the user has turned Auto Live OFF (the toggle already cancels
+    pending; this covers the race where OFF lands mid-tick)."""
+    db = _tmp_candle_db()
+    restore = _setup_users()
+    try:
+        start = datetime(2026, 11, 28, 12, 0, tzinfo=DHAKA)
+        clock = _FakeClock(start.timestamp())
+        _seed_bullish(db, "BTCUSD_otc", start)
+        database.set_auto_asset(123, "BTCUSD_otc")
+        database.set_auto_signals(123, True)
+        bot = FakeBot()
+        asyncio.run(auto_live._auto_live_tick(bot, db, now_fn=_now_fn(clock)))
+        assert len(bot.photos) == 1, bot.photos
+        # The user turns OFF; the pending signal is still in the DB
+        # (the toggle's cancel missed it — the race).
+        database.set_auto_signals(123, False)
+        db.insert_candles("BTCUSD_otc", [{
+            "ts": datetime(2026, 11, 28, 12, 1, tzinfo=DHAKA),
+            "open": 100.0, "high": 100.3, "low": 99.9, "close": 100.2}])
+        clock.now += 125  # 12:02:05 — the result would be due
+        asyncio.run(auto_live._auto_live_tick(bot, db, now_fn=_now_fn(clock)))
+        assert len(bot.photos) == 1, bot.photos  # no result sent
+        assert auto_live._load_pending(db) == []  # dropped, not kept
+    finally:
+        restore()
+    print("PASS Fix 2 guard) auto live: OFF user gets no pending result")
+
+
+def test_auto_live_summary_stickers_aligned():
+    """Fix 3 (2026-11-28): the 5-signal summary pads every signal
+    line to the longest one (CHECKER style), so the premium
+    stickers form one straight column."""
+    import re
+    entries = [
+        {"asset": "BTCUSD_otc", "hhmm": "12:01", "date": "2026-11-28",
+         "direction": "CALL", "outcome": "WIN"},
+        {"asset": "USDARS_otc", "hhmm": "12:02", "date": "2026-11-28",
+         "direction": "PUT", "outcome": "LOSS"},
+        {"asset": "ETHUSD_otc", "hhmm": "12:03", "date": "2026-11-28",
+         "direction": "CALL", "outcome": "WIN_MTG1"},
+        {"asset": "BTCUSD_otc", "hhmm": "12:04", "date": "2026-11-28",
+         "direction": "PUT", "outcome": "DOJI"},
+        {"asset": "USDARS_otc", "hhmm": "12:05", "date": "2026-11-28",
+         "direction": "CALL", "outcome": "WIN"},
+    ]
+    text = auto_live._summary_text(entries)
+    assert "DATE:" in text and "28.11.2026" in text, text
+    assert "5 Signals Summary" in text, text
+    lines = text.split("\n")
+    sig_lines = [ln for ln in lines if ln.startswith("<code>")]
+    assert len(sig_lines) == 5, sig_lines
+    # Every monospace block has the same length (padded) — the
+    # stickers all start at the same column.
+    inner = [re.search(r"<code>(.*)</code>", ln).group(1) for ln in sig_lines]
+    assert len({len(s) for s in inner}) == 1, inner
+    # The MTG1 win carries the dot; accuracy excludes the DOJI.
+    assert "</tg-emoji>." in text, text
+    assert "Accuracy: 3/4" in text, text
+    print("PASS Fix 3) auto live summary: stickers aligned in one column")
+
+
 if __name__ == "__main__":
     test_auto_live_signal_and_result()
     test_auto_live_weak_analysis_sends_nothing()
@@ -492,4 +653,8 @@ if __name__ == "__main__":
     test_auto_live_menu_mtg_and_channel()
     test_auto_live_back_cancels_pending()
     test_stale_button_after_start()
+    test_auto_live_mtg1_m1_win_is_immediate()
+    test_auto_live_toggle_off_cancels_pending()
+    test_auto_live_off_user_gets_no_result()
+    test_auto_live_summary_stickers_aligned()
     print("ALL AUTO-LIVE TESTS PASSED")

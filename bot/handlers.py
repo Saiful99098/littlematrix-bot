@@ -1870,6 +1870,14 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         on = not database.is_auto_subscriber(user.id)
         database.set_auto_signals(user.id, on)
+        if not on:
+            # Turning OFF cancels pending results too (the owner,
+            # 2026-11-28) — OFF means no more results at all, just
+            # like Back from the dashboard.
+            try:
+                auto_live.cancel_pending_for_user(_db(), user.id)
+            except Exception:
+                pass
         await _show_autolive_menu(query, context, user.id)
         return
     if data == "menu_premium":

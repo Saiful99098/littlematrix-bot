@@ -7,13 +7,14 @@ as AI Signal: EMA trend, RSI zone, last 3 candles, 5-day same-time
 history), NOT a signal every minute. Each signal carries a chart
 screenshot; the result follows within 5 seconds of the deciding
 candle's close (the loop wakes 5s past each minute), with a tick on
-the winning candle (profit) or a cross (loss). In MTG1 mode the
-result waits for the next minute and a MTG1 win carries the dot
-(check + dot), exactly like the CHECKER. Every 5 completed signals
-the bot sends the user a 5-signal summary. When the user presses
-Back from the dashboard to the menu, pending results are cancelled
-(they are no longer sent). The owner can also post his own signals
-to his channel from the dashboard.
+the winning candle (profit) or a cross (loss). In MTG1 mode a
+direct M1 win is sent at once; only a lost M1 waits for the next
+minute, and a MTG1 win carries the dot (check + dot), exactly like
+the CHECKER. Every 5 completed signals the bot sends the user a
+5-signal summary. When the user presses Back from the dashboard to
+the menu, pending results are cancelled (they are no longer sent).
+Turning Auto Live OFF cancels pending results too. The owner can
+also post his own signals to his channel from the dashboard.
 
 Pending signals (sent, result not yet delivered) live in the candle
 DB state, so a restart neither loses them nor double-sends them.
@@ -141,22 +142,23 @@ def _signal_result(db, sig, now):
     """(outcome, candle) for a pending signal, or None when the
     deciding candle has not closed yet / is not stored. outcome is
     'WIN', 'WIN_MTG1' (MTG1 win — carries the dot), 'LOSS' or
-    'DOJI'. Non-MTG decides on the signal minute itself; MTG1
-    decides on the next minute (MTG1) when the signal minute lost.
-    The result is ready 5s after the deciding candle closes — the
-    loop wakes 5s past each minute (the owner, 2026-11-28: the old
-    2-minute grace made every result 1 minute late)."""
+    'DOJI'. Non-MTG decides on the signal minute itself. MTG1: a
+    direct M1 win is returned at once, 5s after the signal candle
+    closes (the owner, 2026-11-28: waiting for the MTG1 candle
+    made every direct win 1 minute late); only when the signal
+    minute lost does the next minute (MTG1) decide. The result is
+    ready 5s after the deciding candle closes — the loop wakes 5s
+    past each minute."""
     from datetime import datetime as _dt
     try:
         minute_dt = _dt.strptime(sig["minute"], "%Y-%m-%d %H:%M")
     except (KeyError, ValueError):
         return ("LOSS", None)  # a broken record — drop it, do not retry
     mtg1 = bool(sig.get("mtg1"))
-    # The deciding candle closes one minute after its minute starts:
-    # non-MTG = the signal minute (+1 min); MTG1 = the MTG1 minute
-    # (signal minute +1, closes at +2 min).
-    decide_dt = minute_dt + timedelta(minutes=2 if mtg1 else 1)
-    if now.replace(tzinfo=None) < decide_dt:
+    # The signal-minute candle closes one minute after its minute
+    # starts; the MTG1 candle closes a minute after that.
+    m1_close = minute_dt + timedelta(minutes=1)
+    if now.replace(tzinfo=None) < m1_close:
         return None
     date_str, hhmm = sig["minute"][:10], sig["minute"][11:16]
     try:
@@ -169,11 +171,16 @@ def _signal_result(db, sig, now):
     if direction == "DOJI":
         return ("DOJI", candle)
     if direction == sig.get("direction"):
+        # M1 win — return at once, even in MTG1 mode. Do NOT wait
+        # for the MTG1 candle (Fix 4, 2026-11-28).
         return ("WIN", candle)
     if not mtg1:
         return ("LOSS", candle)
-    # MTG1: the signal minute lost — the next minute decides.
+    # MTG1: the signal minute lost — the next minute decides, so
+    # wait for its candle to close.
     mtg1_dt = minute_dt + timedelta(minutes=1)
+    if now.replace(tzinfo=None) < mtg1_dt + timedelta(minutes=1):
+        return None
     mtg1_date, mtg1_hhmm = (mtg1_dt.strftime("%Y-%m-%d"),
                             mtg1_dt.strftime("%H:%M"))
     try:
@@ -255,25 +262,24 @@ async def _send_result(bot, db, sig, outcome, candle, now, extra_chats=()):
         if c.get("hhmm") == decide_hhmm:
             idx = i
             break
+    # The result caption carries NO "WIN"/"LOSS" text — only the
+    # premium sticker (the owner, 2026-11-28): a win shows the
+    # check sticker, a loss the cross, a DOJI the minus; a MTG1
+    # win carries the dot, exactly like the CHECKER.
     if outcome == "WIN":
         mark, sticker = "win", pe("check")
-        outcome_text = "WIN"
     elif outcome == "WIN_MTG1":
-        # The MTG1 win carries the dot, exactly like the CHECKER.
         mark, sticker = "win", pe("check") + "."
-        outcome_text = "WIN (MTG1)"
     elif outcome == "LOSS":
         mark, sticker = "loss", pe("cross")
-        outcome_text = "LOSS"
     else:
         mark, sticker = None, pe("minus")
-        outcome_text = "DOJI"
     caption = (f"{sticker} {display_asset(asset)} — {hhmm} M1 "
-               f"{sig.get('direction')} — {outcome_text}")
+               f"{sig.get('direction')}")
     try:
         png = draw_candles_png(
             candles, highlight_idx=idx, mark=mark,
-            title=f"{display_asset(asset)} {hhmm} M1 {sig.get('direction')} — {outcome_text}")
+            title=f"{display_asset(asset)} {hhmm} M1 {sig.get('direction')}")
     except Exception:
         png = None
     await _send_photo_or_text(bot, uid, png, caption, "result")
@@ -284,8 +290,18 @@ async def _send_result(bot, db, sig, outcome, candle, now, extra_chats=()):
 
 
 def _summary_text(entries):
-    """The 5-signal summary, with a premium check/cross/minus per
-    signal and an accuracy line (DOJI excluded, like the CHECKER)."""
+    """The 5-signal summary in the CHECKER format (the owner,
+    2026-11-28): the signal date at the top, a gap below the
+    header, the signals packed in monospace with the stickers in
+    one straight column (padded like the checker), a gap above the
+    Accuracy line. Accuracy excludes DOJI, like the CHECKER."""
+    date_str = ((entries[0].get("date") if entries else None)
+                or dhaka_now().strftime("%Y-%m-%d"))
+    y, m, d = date_str.split("-")
+    sigs = [f"{i}. {display_asset(e['asset'])}, {e['hhmm']} M1 "
+            f"{e['direction']}"
+            for i, e in enumerate(entries, 1)]
+    width = max((len(s) for s in sigs), default=0)
     lines = []
     wins = losses = 0
     for i, e in enumerate(entries, 1):
@@ -298,15 +314,16 @@ def _summary_text(entries):
             mark = pe("cross")
         else:
             mark = pe("minus")
-        lines.append(f"{i}. {display_asset(e['asset'])}, {e['hhmm']} M1 "
-                     f"{e['direction']} {mark}")
+        lines.append(f"<code>{sigs[i - 1].ljust(width)}</code> {mark}")
     total = wins + losses
     acc = f"{wins}/{total} = {wins * 100 // total}%" if total else "—"
     return (
+        f"DATE: {pe('sparkle')}{d}.{m}.{y}{pe('star')}\n"
         f"{pe('bell')}{pe('diamond')} Auto Live Signal — "
         f"{len(entries)} Signals Summary\n"
+        f"\n"
         + "\n".join(lines)
-        + f"\n{pe('crown')} Accuracy: {acc}")
+        + f"\n\n{pe('crown')} Accuracy: {acc}")
 
 
 async def _send_summary(bot, uid, entries):
@@ -324,6 +341,10 @@ async def _auto_live_tick(bot, db, now_fn=None):
     pending = _load_pending(db)
     still_pending = []
     history = _load_history(db)
+    try:
+        from . import database as users_db
+    except Exception:
+        users_db = None
     for sig in pending:
         got = _signal_result(db, sig, now)
         if got is None:
@@ -345,6 +366,20 @@ async def _auto_live_tick(bot, db, now_fn=None):
             still_pending.append(sig)
             continue
         outcome, candle = got
+        # OFF means no more results: if the user turned Auto Live
+        # OFF after the signal was sent, drop the result instead of
+        # sending it (Fix 2, 2026-11-28). The toggle already cancels
+        # pending signals; this covers the race where OFF lands
+        # mid-tick.
+        try:
+            subscribed = (users_db.is_auto_subscriber(sig["uid"])
+                          if users_db else True)
+        except Exception:
+            subscribed = True
+        if not subscribed:
+            logger.info("auto live: dropping result for %s — user turned OFF",
+                        sig["uid"])
+            continue
         extra = _extra_chats(db, sig["uid"])
         try:
             await _send_result(bot, db, sig, outcome, candle, now,
@@ -361,6 +396,7 @@ async def _auto_live_tick(bot, db, now_fn=None):
             entries = []
         entries.append({"asset": sig["asset"],
                         "hhmm": sig["minute"][11:16],
+                        "date": sig["minute"][:10],
                         "direction": sig.get("direction"),
                         "outcome": outcome})
         if len(entries) >= _SUMMARY_SIGNALS:
@@ -371,8 +407,7 @@ async def _auto_live_tick(bot, db, now_fn=None):
     _save_pending(db, still_pending)
     _save_history(db, history)
     try:
-        from . import database as users_db
-        subs = users_db.get_auto_subscribers()
+        subs = users_db.get_auto_subscribers() if users_db else []
     except Exception:
         subs = []
     for uid, asset in subs or []:
