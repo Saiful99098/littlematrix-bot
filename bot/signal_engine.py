@@ -418,6 +418,77 @@ def _prev_hhmm(hhmm):
     return f"{h:02d}:{m:02d}"
 
 
+def ai_next_signal(db, asset, now=None):
+    """Decide the NEXT minute's direction for one asset (the owner,
+    2026-11-28). Returns (direction, checks, n_candles) where
+    direction is 'CALL'/'PUT' or None, and checks maps each of the
+    four tests to the direction it voted for (or None). A signal
+    needs ALL FOUR to agree on the same direction:
+
+    1. EMA trend (EMA9 vs EMA21 over the last 60 closes today).
+    2. RSI(14) zone — CALL only when 50 < RSI < 70, PUT only when
+       30 < RSI < 50 (extremes and the neutral 50 give no signal).
+    3. The last 3 closed candles, majority (DOJI ignored).
+    4. The next minute's HH:MM over the past 5 completed days,
+       majority vote, at least 3 voting days and win rate >= 60%.
+
+    Pure engine logic (takes the candle DB explicitly) so both the
+    AI Signal button and the Live Auto Signal loop can use it.
+    `now` is a Dhaka datetime (defaults to now in Asia/Dhaka)."""
+    from datetime import datetime as _dt
+    from datetime import timedelta as _td
+    try:
+        from zoneinfo import ZoneInfo as _Z
+        _tz = _Z("Asia/Dhaka")
+    except Exception:
+        from datetime import timezone as _tzmod
+        _tz = _tzmod(_td(hours=6))
+    now = now or _dt.now(_tz)
+    today = now.strftime("%Y-%m-%d")
+    recent = [normalize_candle(c) for c in db.get_candles(asset, today)][-60:]
+    checks = {"trend": None, "rsi": None, "last3": None, "history": None}
+    if len(recent) < 21:
+        return None, checks, len(recent)
+    closes = [c["close"] for c in recent]
+    # 1. EMA trend.
+    trend = trend_direction(closes)
+    if trend == "UP":
+        checks["trend"] = "CALL"
+    elif trend == "DOWN":
+        checks["trend"] = "PUT"
+    # 2. RSI zone.
+    value = rsi(closes)
+    if 50 < value < 70:
+        checks["rsi"] = "CALL"
+    elif 30 < value < 50:
+        checks["rsi"] = "PUT"
+    # 3. Last 3 closed candles, majority.
+    last3 = [candle_direction(c) for c in recent[-3:]]
+    votes = [d for d in last3 if d in ("CALL", "PUT")]
+    if votes and votes.count("CALL") != votes.count("PUT"):
+        checks["last3"] = ("CALL" if votes.count("CALL") > votes.count("PUT")
+                           else "PUT")
+    # 4. The next minute's HH:MM over the past 5 completed days.
+    next_min = (now.replace(second=0, microsecond=0) + _td(minutes=1))
+    hhmm = next_min.strftime("%H:%M")
+    dates, _ = available_signal_dates(db, asset, 5, now=now)
+    dirs = []
+    for day in load_days_from_db(db, asset, dates):
+        for c in day:
+            # Raw DB rows carry "datetime" as a Dhaka string
+            # "YYYY-MM-DD HH:MM:SS" — slice the HH:MM out of it.
+            if str(c.get("datetime", ""))[11:16] == hhmm:
+                dirs.append(candle_direction(c))
+                break
+    direction, win_rate, calls, puts = majority_vote(dirs)
+    if direction and (calls + puts) >= 3 and win_rate >= 0.6:
+        checks["history"] = direction
+    agreed = {v for v in checks.values() if v}
+    if len(agreed) == 1 and all(v is not None for v in checks.values()):
+        return agreed.pop(), checks, len(recent)
+    return None, checks, len(recent)
+
+
 def generate_prev_minute_signals(days_data, asset, start="00:00",
                                  end="23:59", mode="BLACKOUT",
                                  min_win_rate=MIN_WIN_RATE):

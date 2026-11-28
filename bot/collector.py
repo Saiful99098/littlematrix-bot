@@ -840,63 +840,6 @@ def log_status_summary(db, prefix="collector status"):
 # ---------------------------------------------------------------------------
 # Background loop (started from main.py post_init)
 # ---------------------------------------------------------------------------
-async def _send_auto_signals(bot, db):
-    """After a collection, send the next window's top signals
-    to Auto Signal subscribers. Best-effort: failures are logged,
-    never raised — the collector loop must keep running.
-
-    One window is sent only once: the collector now runs every
-    30 minutes, so two runs in the same hour would otherwise send
-    the same next-hour window twice. The sent window key (date +
-    start-end) is stored in the DB state and checked first."""
-    if bot is None:
-        return
-    try:
-        from . import database as users_db
-        subs = users_db.get_auto_subscribers()
-    except Exception:
-        return
-    if not subs:
-        return
-    try:
-        from .signal_engine import (
-            cross_asset_filter, format_signals_list,
-            generate_futures_signals_from_db)
-        from .premium_emoji import pe as _pe
-        now = dhaka_now()
-        start_dt = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-        end_dt = start_dt + timedelta(hours=1, minutes=59)
-        start, end = start_dt.strftime("%H:%M"), end_dt.strftime("%H:%M")
-        window_key = start_dt.strftime("%Y-%m-%d") + f" {start}-{end}"
-        if db.get_state("auto_signal_window") == window_key:
-            return  # this window was already sent by an earlier run
-        today = now.strftime("%Y-%m-%d")
-        all_dates = db.get_dates()
-        completed = [d for d in all_dates if d < today] or all_dates
-        dates = completed[-3:]
-        assets = [a for a in db.get_assets() if a.endswith("_otc")]
-        all_signals = []
-        for a in assets:
-            all_signals.extend(
-                generate_futures_signals_from_db(db, a, dates, start, end))
-        kept = cross_asset_filter(all_signals)
-        lines = format_signals_list(kept)
-        if not lines:
-            return
-        text = (f"{_pe('diamond')}{_pe('lightning')} BLUE FISH PRIME • AUTO SIGNALS {start}-{end} (UTC+6)\n"
-                f"Dates: {dates[0]} to {dates[-1]} | M1 | Quotex | Source: db\n\n"
-                + "\n".join(lines))[:4000]
-        for uid in subs:
-            try:
-                await bot.send_message(chat_id=uid, text=text, parse_mode="HTML")
-                await asyncio.sleep(0.1)
-            except Exception as exc:
-                logger.warning("collector: auto signal to %s failed: %s", uid, exc)
-        _safe_set_state(db, "auto_signal_window", window_key)
-    except Exception as exc:
-        logger.warning("collector: auto signal send failed: %s", exc)
-
-
 async def collector_loop(db=None, session_factory=None, sleep=None, bot=None):
     """Backfill once, then an incremental run every COLLECTOR_INTERVAL_SECONDS, forever.
 
@@ -928,7 +871,6 @@ async def collector_loop(db=None, session_factory=None, sleep=None, bot=None):
                 await run_backfill(db, session)
             else:
                 await run_incremental(db, session)
-                await _send_auto_signals(bot, db)
             return True
         except quotex_client.QuotexRateLimited as exc:
             _safe_set_state(db, "quotex_session", f"rate limited (429): {exc}")

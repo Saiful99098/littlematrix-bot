@@ -1,33 +1,35 @@
-"""Personal FILTER system — SEPARATE from signal generation.
+"""Signal FILTER — rebuilt (the owner, 2026-11-28).
 
-This is the owner's Aston/Newexe filter, exactly as specified on
-2026-11-22. It must NOT be added inside signal generation.
-It lives here, behind its own FILTER button, and works on lists
-the user pastes (Aston list + Newexe list).
+The old Aston/Newexe filter is dropped from the bot. The new filter
+works on ANY signal list the user pastes: each line's asset is
+analysed from the candle database and the line is kept only when
+all three agree:
 
-Rules (UTC+6, M1):
-1) Remove 14:00-19:00 signals from EACH list separately, without
-   merging yet. 19:00 is treated as included (removed).
-2) In EACH list separately: if two signals are 1-4 minutes apart,
-   remove BOTH.
-3) Merge the two filtered lists and sort by time ascending.
-4) In the merged list: if two signals are 1-4 minutes apart,
-   remove ONLY the Aston signal, keep the Newexe one.
-   (Comparison is by time only, across assets.)
-5) Final output: ONLY "ASSET-OTC,HH:MM M1 CALL/PUT" lines.
-   No Aston/Newexe written after CALL/PUT.
+1) WIN % — over the past N days, how often did the candle at that
+   HH:MM go in the line's direction (CALL = green, PUT = red)?
+   DOJI days are excluded. Keep when win % >= the typed threshold.
+2) TREND — the asset's EMA9/21 trend (last 60 closes today) must
+   agree with the line's direction. When there are not enough
+   candles to compute a trend, this check is skipped, not failed.
+3) BLACKOUT / WHITEOUT — the T-1 candle theory: over the past N
+   days, was the T candle mostly OPPOSITE to the T-1 candle
+   (Blackout) or the SAME as the T-1 candle (Whiteout)? The line is
+   kept only when its direction matches the direction the dominant
+   pattern predicts for T. A tie (no dominant pattern) is neutral
+   and passes.
 
-Note on step 4: "1-4 minutes apart" means the absolute time
-difference between neighbouring signals in the sorted merged list
-is 1, 2, 3 or 4 minutes. 0 minutes (same minute, different asset)
-is NOT removed by this rule — that case is handled by the
-cross-asset filter in the generator, not here.
+The output keeps the input's lines exactly as pasted (same format),
+only the kept ones, with a summary of how many were kept.
 """
 from __future__ import annotations
 
 import re
 
-from .premium_emoji import pe
+from .signal_engine import (
+    candle_direction,
+    normalize_candle,
+    trend_direction,
+)
 
 LINE_RE = re.compile(
     r"^\s*([A-Za-z0-9]+(?:[-_][A-Za-z]+)?)\s*,\s*(\d{1,2}:\d{2})\s+M1\s+(CALL|PUT)\s*$",
@@ -45,84 +47,166 @@ def parse_line(line):
     return {"asset": asset, "hhmm": hhmm, "direction": m.group(3).upper()}
 
 
-def _minutes(hhmm):
+def _prev_hhmm(hhmm):
+    """The minute before HH:MM (T-1), or None for 00:00."""
     h, m = hhmm.split(":")
-    return int(h) * 60 + int(m)
+    total = int(h) * 60 + int(m) - 1
+    if total < 0:
+        return None
+    return f"{total // 60:02d}:{total % 60:02d}"
 
 
-def _in_blocked_window(hhmm):
-    """14:00-19:00 inclusive."""
-    mins = _minutes(hhmm)
-    return 14 * 60 <= mins <= 19 * 60
+def _today_str():
+    from datetime import datetime, timedelta, timezone
+
+    return (datetime.now(timezone.utc) + timedelta(hours=6)).strftime("%Y-%m-%d")
 
 
-def _remove_close_pairs(signals):
-    """Step 2: in one list, remove BOTH signals of any 1-4 min pair.
+def _win_rate_and_pattern(db, asset, hhmm, direction, days, today):
+    """(win_rate, votes, pattern_info) for one signal line over
+    `days` completed days before `today`.
 
-    A signal is removed if it is 1-4 minutes from ANY neighbour.
+    win_rate is the fraction of days (with a non-DOJI T candle)
+    whose T candle matched `direction`. votes is how many days
+    voted. pattern_info is (pattern, t1_calls, t1_puts) where
+    pattern is "BLACKOUT" / "WHITEOUT" / None.
     """
-    ordered = sorted(signals, key=lambda s: _minutes(s["hhmm"]))
-    drop = set()
-    for i in range(len(ordered) - 1):
-        diff = _minutes(ordered[i + 1]["hhmm"]) - _minutes(ordered[i]["hhmm"])
-        if 1 <= diff <= 4:
-            drop.add(i)
-            drop.add(i + 1)
-    return [s for i, s in enumerate(ordered) if i not in drop]
+    from .candles_db import normalize_asset_name
+
+    asset = normalize_asset_name(asset)
+    dates = db.get_dates(asset) if hasattr(db, "get_dates") else []
+    dates = [d for d in dates if d < today][-days:]
+    if not dates:
+        return None, 0, (None, 0, 0)
+    t1 = _prev_hhmm(hhmm)
+    wins = 0
+    votes = 0
+    blackout = 0
+    whiteout = 0
+    t1_calls = 0
+    t1_puts = 0
+    for date in dates:
+        c = db.get_candle(asset, date, hhmm)
+        if not c:
+            continue
+        t_dir = candle_direction(normalize_candle(c))
+        if t_dir is None:
+            continue
+        votes += 1
+        if t_dir == direction:
+            wins += 1
+        if t1:
+            c1 = db.get_candle(asset, date, t1)
+            if c1:
+                t1_dir = candle_direction(normalize_candle(c1))
+                if t1_dir == "CALL":
+                    t1_calls += 1
+                elif t1_dir == "PUT":
+                    t1_puts += 1
+                if t1_dir is not None:
+                    if t_dir != t1_dir:
+                        blackout += 1
+                    else:
+                        whiteout += 1
+    if votes == 0:
+        return None, 0, (None, 0, 0)
+    pattern = None
+    if blackout > whiteout:
+        pattern = "BLACKOUT"
+    elif whiteout > blackout:
+        pattern = "WHITEOUT"
+    return wins / votes, votes, (pattern, t1_calls, t1_puts)
 
 
-def filter_personal(aston_lines, newexe_lines):
-    """Apply the full Aston/Newexe personal filter.
+def _trend_agrees(db, asset, direction, today):
+    """True when the EMA9/21 trend agrees with `direction`, False
+    when it disagrees, None when there is not enough data."""
+    try:
+        candles = db.get_candles(asset, today)
+    except Exception:
+        return None
+    closes = [normalize_candle(c)["close"] for c in candles]
+    if len(closes) < 21:
+        return None
+    trend = trend_direction(closes)
+    if direction == "CALL":
+        return trend == "UP"
+    return trend == "DOWN"
 
-    Returns (final_lines, counts) where counts records how many were
-    removed at each step for reporting.
+
+def filter_one_line(db, line, days, pct, today):
+    """Check ONE parsed signal line against the DB. Returns
+    (kept, detail) where detail is (line, win_rate, pattern, kept,
+    reason)."""
+    win_rate, votes, pat = _win_rate_and_pattern(
+        db, line["asset"], line["hhmm"], line["direction"], days, today)
+    if win_rate is None:
+        return False, (line, None, None, False, "no data")
+    pattern, t1_calls, t1_puts = pat
+    # Pattern check: the line's direction must match the
+    # direction the dominant Blackout/Whiteout pattern predicts.
+    pattern_ok = True
+    if pattern == "BLACKOUT":
+        t1_majority = "CALL" if t1_calls >= t1_puts else "PUT"
+        expected = "PUT" if t1_majority == "CALL" else "CALL"
+        pattern_ok = line["direction"] == expected
+    elif pattern == "WHITEOUT":
+        t1_majority = "CALL" if t1_calls >= t1_puts else "PUT"
+        pattern_ok = line["direction"] == t1_majority
+    trend = _trend_agrees(db, line["asset"], line["direction"], today)
+    if win_rate * 100 < pct:
+        return False, (line, win_rate, pattern, False,
+                       f"win {win_rate * 100:.0f}% < {pct}%")
+    if not pattern_ok:
+        return False, (line, win_rate, pattern, False,
+                       f"{pattern} says the other way")
+    if trend is False:
+        return False, (line, win_rate, pattern, False, "trend disagrees")
+    return True, (line, win_rate, pattern, True, "")
+
+
+def filter_signals_by_db(db, lines, days, pct, today=None):
+    """Filter parsed signal lines against the DB. Returns
+    (kept, stats) where kept is the list of kept line dicts (same
+    order as the input) and stats is {"total", "kept", "dropped",
+    "no_data", "details": [(line, win_rate, pattern, kept, reason)]}.
     """
-    aston = [p for p in (parse_line(x) for x in aston_lines) if p]
-    newexe = [p for p in (parse_line(x) for x in newexe_lines) if p]
-    counts = {"aston_in": len(aston), "newexe_in": len(newexe)}
-
-    # Step 1: remove 14:00-19:00 from each list separately.
-    aston = [s for s in aston if not _in_blocked_window(s["hhmm"])]
-    newexe = [s for s in newexe if not _in_blocked_window(s["hhmm"])]
-    counts["removed_14_19"] = (counts["aston_in"] + counts["newexe_in"]
-                               - len(aston) - len(newexe))
-
-    # Step 2: 1-4 min gap inside each list separately, remove both.
-    before = len(aston) + len(newexe)
-    aston = _remove_close_pairs(aston)
-    newexe = _remove_close_pairs(newexe)
-    counts["removed_gap_each"] = before - len(aston) - len(newexe)
-
-    # Step 3: merge and sort by time.
-    merged = []
-    for s in aston:
-        merged.append({**s, "source": "Aston"})
-    for s in newexe:
-        merged.append({**s, "source": "Newexe"})
-    merged.sort(key=lambda s: (_minutes(s["hhmm"]), s["asset"]))
-
-    # Step 4: in merged list, 1-4 min apart -> remove only Aston.
-    drop_idx = set()
-    for i in range(len(merged) - 1):
-        diff = _minutes(merged[i + 1]["hhmm"]) - _minutes(merged[i]["hhmm"])
-        if 1 <= diff <= 4:
-            for j in (i, i + 1):
-                if merged[j]["source"] == "Aston":
-                    drop_idx.add(j)
-    counts["removed_aston_merged"] = len(drop_idx)
-    merged = [s for i, s in enumerate(merged) if i not in drop_idx]
-
-    final = [f"{s['asset']},{s['hhmm']} M1 {s['direction']}" for s in merged]
-    counts["final"] = len(final)
-    return final, counts
+    today = today or _today_str()
+    kept = []
+    details = []
+    no_data = 0
+    for line in lines:
+        ok, detail = filter_one_line(db, line, days, pct, today)
+        if ok:
+            kept.append(line)
+        elif detail[4] == "no data":
+            no_data += 1
+        details.append(detail)
+    stats = {
+        "total": len(lines),
+        "kept": len(kept),
+        "dropped": len(lines) - len(kept),
+        "no_data": no_data,
+        "details": details,
+    }
+    return kept, stats
 
 
-def format_filter_result(final, counts):
-    lines = list(final)
-    lines.append("")
-    lines.append(f"{pe('chart')} Aston in: {counts['aston_in']} | Newexe in: {counts['newexe_in']}")
-    lines.append(f"Removed 14:00-19:00: {counts['removed_14_19']}")
-    lines.append(f"Removed 1-4 min gap (each list): {counts['removed_gap_each']}")
-    lines.append(f"Removed Aston after merge: {counts['removed_aston_merged']}")
-    lines.append(f"{pe('check')} Final: {counts['final']}")
-    return "\n".join(lines)
+def progress_bar(pct):
+    """A download-style progress bar: 10 blocks + the %."""
+    filled = max(0, min(10, int(pct / 10)))
+    return "█" * filled + "░" * (10 - filled) + f" {pct:.0f}%"
+
+
+def format_filter_result(kept, stats, days, pct):
+    """The kept lines in exactly the input's format, plus a summary.
+    The kept lines are returned as plain text (the caller wraps them
+    in a monospace code block, as the input list is shown)."""
+    if kept:
+        lines = [f"{s['asset']},{s['hhmm']} M1 {s['direction']}" for s in kept]
+        body = "\n".join(lines)
+    else:
+        body = "No signals passed the filter."
+    summary = (f"\n\nFiltered: {stats['kept']}/{stats['total']} kept "
+               f"({days} days, win >= {pct}%)")
+    return body + summary

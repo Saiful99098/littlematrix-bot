@@ -118,6 +118,23 @@ def _ensure_last_seen_column():
             "last_seen column migration failed", exc_info=True)
 
 
+def _ensure_auto_asset_column():
+    """Add the Live Auto Signal market column to a users table created
+    before per-market auto signals existed. Same tolerant pattern as
+    matrix_coins: a migration failure must never break the bot."""
+    try:
+        if _backend() == "postgres":
+            _execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS auto_asset TEXT")
+        else:
+            try:
+                _execute("ALTER TABLE users ADD COLUMN auto_asset TEXT")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc):
+                    raise
+    except Exception:
+        pass  # a failed migration must never break the bot
+
+
 def _ensure_matrix_coins_column():
     """Add the MATRIX coin balance column to a users table created
     before referrals existed. Same tolerant pattern as last_seen:
@@ -135,6 +152,7 @@ def _ensure_matrix_coins_column():
         import logging
         logging.getLogger("littlematrix.database").warning(
             "matrix_coins column migration failed", exc_info=True)
+
 
 
 def _connect():
@@ -155,6 +173,7 @@ def _connect():
         _CONN.commit()
     _ensure_last_seen_column()
     _ensure_matrix_coins_column()
+    _ensure_auto_asset_column()
     return _CONN
 
 
@@ -315,10 +334,36 @@ def is_auto_subscriber(telegram_id):
     return bool(get_or_create_user(telegram_id).get("auto_signals"))
 
 
+def set_auto_asset(telegram_id, asset):
+    """Set the market a user's Live Auto Signal watches (None clears
+    it). The column is added by _ensure_auto_asset_column; a users
+    table that predates it gets the column on connect."""
+    get_or_create_user(telegram_id)
+    _execute("UPDATE users SET auto_asset=? WHERE telegram_id=?",
+             (asset, telegram_id))
+
+
+def get_auto_asset(telegram_id):
+    try:
+        cur = _execute("SELECT auto_asset FROM users WHERE telegram_id=?",
+                       (telegram_id,))
+        row = cur.fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
 def get_auto_subscribers():
-    cur = _execute(
-        "SELECT telegram_id FROM users WHERE auto_signals=1")
-    return [r[0] for r in cur.fetchall()]
+    """Live Auto Signal subscribers as (telegram_id, auto_asset)
+    pairs — only users who are ON and have picked a market."""
+    try:
+        cur = _execute(
+            "SELECT telegram_id, auto_asset FROM users "
+            "WHERE auto_signals=1 AND auto_asset IS NOT NULL "
+            "AND auto_asset != ''")
+        return [(r[0], r[1]) for r in cur.fetchall()]
+    except Exception:
+        return []
 
 
 # ---------------------------------------------------------------------------

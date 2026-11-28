@@ -152,6 +152,19 @@ async def post_init(app):
                     "LIVE_STREAM_ENABLED=%s)",
                     config.DATA_MODE, config.COLLECTOR_ENABLED,
                     config.LIVE_STREAM_ENABLED)
+    if config.collector_active():
+        # Live Auto Signal (the owner, 2026-11-28): watches each ON
+        # subscriber's market and sends a signal only when the
+        # analysis is strong, with a chart screenshot + a result
+        # screenshot. Runs on the candle DB, so it needs db mode.
+        from bot import auto_live
+        from bot import candles_db as _candles_db
+        logger.info("auto live signal enabled — starting background task")
+        _restart_task(
+            app, "auto_live_task",
+            lambda: auto_live.auto_live_loop(
+                app.bot, _candles_db.get_candle_db()),
+            "auto live signal")
 
 
 async def channel_member_update(update, context):

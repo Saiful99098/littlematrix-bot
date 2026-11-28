@@ -31,14 +31,21 @@ logger = logging.getLogger("littlematrix.handlers")
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
-from . import candles_db, collector, config, database, quotex_client, referral
+from . import candles_db, collector, config, database, live_stream, quotex_client, referral
+from .chart import draw_candles_png
 from .checker import (build_lookup, check_signals, dot_date,
                       format_check_results, parse_checker_date,
                       parse_signal_line, split_message)
-from .filters import filter_personal, format_filter_result
+from .filters import (
+    filter_one_line,
+    format_filter_result,
+    parse_line,
+    progress_bar,
+)
 from .news import events_for_dhaka_dates
 from .premium_emoji import BUTTON_ICONS, pe
 from .signal_engine import (
+    ai_next_signal,
     available_signal_dates,
     candle_direction,
     cross_asset_filter,
@@ -52,6 +59,7 @@ from .signal_engine import (
     generate_prev_minute_signals_from_db,
     load_days_from_db,
     load_json_candles,
+    majority_vote,
     normalize_candle,
     rsi,
     trend_direction,
@@ -377,6 +385,39 @@ def back_keyboard():
         [[_btn("Back to Menu", "menu_main", icon="back")]])
 
 
+def _checker_result_keyboard(has_losses):
+    """The keyboard under a checker result: a SHOW LOSS CANDLE
+    button (only when the list has final losses — the owner,
+    2026-11-28) above the Back button."""
+    rows = []
+    if has_losses:
+        rows.append([_btn("SHOW LOSS CANDLE", "checker_loss_candles",
+                          icon="asset")])
+    rows.append([_btn("Back to Menu", "menu_main", icon="back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _checker_losses(results):
+    """The final LOSS entries of a checker run (the owner,
+    2026-11-28): M1 losses in non-MTG mode; in MTG mode a loss
+    only when the MTG1 minute lost too (an MTG1 WIN or DOJI is not
+    a loss). DOJI and NO DATA are never losses. Returns a list of
+    {asset, hhmm, direction} (direction is the expected direction
+    for directionless Blackout/Whiteout lines)."""
+    losses = []
+    for r in results:
+        if r["result"] != "LOSS":
+            continue
+        if r.get("mtg1") in ("WIN", "DOJI"):
+            continue
+        losses.append({
+            "asset": r["asset"],
+            "hhmm": r["hhmm"],
+            "direction": r.get("direction") or r.get("_expected") or "—",
+        })
+    return losses
+
+
 def _generated_line():
     """When this result was built (Dhaka time). A Telegram message is
     frozen once sent — a 12:52 AI Signal is still 12:52 at 12:57 —
@@ -424,6 +465,20 @@ def _store_result_spec(context, query_or_mid, spec):
     store[mid] = spec
     while len(store) > 10:
         store.pop(next(iter(store)))
+
+
+class _MessageQuery:
+    """Adapter so a sent Message can be used where a CallbackQuery is
+    expected (edit_message_text + .message.message_id) — the text
+    flows (AI Signal asset input) run their tool on a working
+    message instead of a tapped button."""
+
+    def __init__(self, message):
+        self.message = message
+
+    async def edit_message_text(self, text, reply_markup=None, parse_mode=None):
+        await self.message.edit_text(text, reply_markup=reply_markup,
+                                     parse_mode=parse_mode)
 
 
 def _fs_asset_label(asset):
@@ -589,6 +644,39 @@ async def _show_analysis_picker(query, context, tool):
     await query.edit_message_text(
         _analysis_picker_text(tool, page, total_pages),
         reply_markup=kb, parse_mode="HTML")
+
+
+async def _show_auto_picker(query, context, page):
+    """Single-select market picker for Live Auto Signal (the owner,
+    2026-11-28): tap one market and it becomes the watched market.
+    Paginated, OTC first."""
+    assets = _analysis_assets()
+    if not assets:
+        await query.edit_message_text(
+            f"{pe('cross')} No candles in the database yet.\n"
+            "The backfill collects the last 5 days first.",
+            reply_markup=back_keyboard(), parse_mode="HTML")
+        return
+    total_pages = max(1, (len(assets) + ASSETS_PER_PAGE - 1) // ASSETS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    chunk = assets[page * ASSETS_PER_PAGE:(page + 1) * ASSETS_PER_PAGE]
+    kb = []
+    for i in range(0, len(chunk), 2):
+        kb.append([_btn(display_asset(a), f"autolive_asset_{a}", icon="asset")
+                   for a in chunk[i:i + 2]])
+    nav = []
+    if page > 0:
+        nav.append(_btn("Prev Page", f"autolive_page_{page - 1}", icon="back"))
+    if page < total_pages - 1:
+        nav.append(_btn("Next Page", f"autolive_page_{page + 1}", icon="next"))
+    if nav:
+        kb.append(nav)
+    kb.append([_btn("Back", "menu_autolive", icon="back")])
+    await query.edit_message_text(
+        f"{pe('bell')} Auto Live Signal — pick your market {pe('chart')}\n"
+        f"{DIVIDER}\nPage {page + 1}/{total_pages}\n"
+        "Tap one market — the bot will watch it when you turn it ON.",
+        reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
 
 
 def parse_custom_time(text):
@@ -1241,7 +1329,14 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _run_bot_status(query, context)
         return
     if data == "menu_ai":
-        await _show_analysis_picker(query, context, "ai")
+        # AI Signal takes the asset typed by hand (the owner,
+        # 2026-11-28) — no picker for this tool any more.
+        context.user_data["flow"] = "ai_asset"
+        await query.edit_message_text(
+            f"{pe('diamond')} AI Signal — type the asset {pe('chart')}\n"
+            f"{DIVIDER}\n\n"
+            "Send the asset name, like BTCUSD-OTC or EURUSD-OTC.",
+            reply_markup=back_keyboard(), parse_mode="HTML")
         return
     if data == "menu_checker":
         # First: which checker? OTC / Real / Blackout / Whiteout
@@ -1295,6 +1390,51 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _checker_list_prompt(today,
                                  context.user_data.get("checker_mode", "OTC")),
             reply_markup=back_keyboard(), parse_mode="HTML")
+        return
+    if data == "checker_loss_candles":
+        # Loss Candle report (the owner, 2026-11-28): the SHOW LOSS
+        # CANDLE button sends this list's LOSS candles one by one
+        # as chart images built locally from the DB candles — no
+        # extra cost, no paid API. Only on tap, never automatically.
+        losses = context.user_data.get("checker_losses", [])
+        loss_date = context.user_data.get("checker_loss_date")
+        if not losses or not loss_date:
+            await query.answer("No loss candles to show for this list.")
+            return
+        await query.answer()
+        chat_id = update.effective_chat.id
+        total = len(losses)
+        for i, loss in enumerate(losses, start=1):
+            asset = loss["asset"]
+            hhmm = loss["hhmm"]
+            direction = loss.get("direction") or "—"
+            try:
+                day = [normalize_candle(c)
+                       for c in _db().get_candles(asset, loss_date)]
+            except Exception:
+                day = []
+            idx = next((j for j, c in enumerate(day)
+                        if c["hhmm"] == hhmm), None)
+            caption = (f"{display_asset(asset)} — {hhmm} M1 {direction} — "
+                       f"LOSS CANDLE {i}/{total}")
+            if idx is None or not day:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"{caption}\nNo candles in the database for "
+                         f"that minute.")
+                continue
+            window = day[max(0, idx - 29):idx + 1]
+            try:
+                png = draw_candles_png(
+                    window, highlight_idx=len(window) - 1, mark="loss",
+                    title=f"{display_asset(asset)} {hhmm} M1 {direction}")
+            except Exception as exc:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"{caption}\nCould not draw the chart: {exc}")
+                continue
+            await context.bot.send_photo(
+                chat_id=chat_id, photo=png, caption=caption)
         return
     if data == "menu_market":
         await _show_analysis_picker(query, context, "market")
@@ -1370,7 +1510,44 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _run_market(query, assets, context)
         return
     if data == "menu_backtest":
-        await _run_backtest(query)
+        # Backtest Lab takes its inputs by hand (the owner,
+        # 2026-11-28): asset, date, time window, then days.
+        context.user_data["flow"] = "backtest_asset"
+        await query.edit_message_text(
+            f"{pe('chart')}{pe('diamond')} Backtest Lab {pe('chart')}\n"
+            f"{DIVIDER}\n\n"
+            "Send the asset name, like BTCUSD-OTC or EURUSD-OTC.",
+            reply_markup=back_keyboard(), parse_mode="HTML")
+        return
+    if data == "backtest_date_yesterday":
+        # Backtest Lab step 2 shortcut: test yesterday.
+        context.user_data["backtest_date"] = _yesterday_date_str()
+        context.user_data["flow"] = "backtest_time"
+        await query.edit_message_text(
+            f"{pe('diamond')} Backtest Lab — {_yesterday_date_str()} {pe('chart')}\n"
+            f"{DIVIDER}\n\n"
+            "Which time window? Send start and end like this:\n"
+            "09:00 10:59",
+            reply_markup=back_keyboard(), parse_mode="HTML")
+        return
+    if data.startswith("backtest_days_"):
+        # Backtest Lab step 4: the training days, then run it.
+        try:
+            days = int(data[len("backtest_days_"):])
+        except ValueError:
+            return
+        asset = context.user_data.get("backtest_asset")
+        date_str = context.user_data.get("backtest_date")
+        start = context.user_data.get("backtest_start", "09:00")
+        end = context.user_data.get("backtest_end", "10:59")
+        if not asset or not date_str:
+            await query.edit_message_text(
+                f"{pe('warning')} The backtest inputs are missing — "
+                "open Backtest Lab again from the menu.",
+                reply_markup=back_keyboard(), parse_mode="HTML")
+            return
+        await _run_backtest(query, asset=asset, date_str=date_str,
+                            start=start, end=end, days=days)
         return
     if data == "menu_news":
         await _run_news(query)
@@ -1403,12 +1580,33 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=back_keyboard(), parse_mode="HTML")
         return
     if data == "menu_filter":
-        context.user_data["flow"] = "filter_aston"
+        # Signal Filter, rebuilt (the owner, 2026-11-28): the old
+        # Aston/Newexe filter is gone. The list's assets are analysed
+        # from the DB (win % + trend + Blackout/Whiteout), days and %
+        # are asked, and only the signals that pass are kept.
+        context.user_data["flow"] = "filter_list"
         await query.edit_message_text(
-            f"{pe('chart')}{pe('diamond')} Blue Fish Prime Filter (separate system — not part of signal generation)\n\n"
-            "Send the Aston list first. Then I will ask for the Newexe list.\n"
-            "Rules: remove 14:00-19:00, remove both signals of any 1-4 minute pair "
-            "in each list, after merging remove only the Aston one.",
+            f"{pe('chart')}{pe('diamond')} Signal Filter {pe('search')}\n\n"
+            "Send the signal list to filter. Each line looks like:\n"
+            "BTCUSD-OTC,09:02 M1 CALL\n\n"
+            "I will check every line against the database — win % over "
+            "the past days, the trend, and Blackout/Whiteout — and keep "
+            "only the strong ones.",
+            reply_markup=back_keyboard(), parse_mode="HTML")
+        return
+    if data.startswith("filter_days_"):
+        # Days chosen: now ask for the win-% threshold.
+        try:
+            days = int(data.rsplit("_", 1)[1])
+        except ValueError:
+            days = 3
+        context.user_data["filter_days"] = days
+        context.user_data["flow"] = "filter_pct"
+        await query.edit_message_text(
+            f"{pe('chart')}{pe('diamond')} Signal Filter — {days} day(s) {pe('search')}\n\n"
+            "Now send the minimum win rate % to keep (70-100).\n"
+            "Example: 70 means only signals that won 70% or more "
+            "of the past days are kept.",
             reply_markup=back_keyboard(), parse_mode="HTML")
         return
     if data == "menu_status":
@@ -1464,20 +1662,72 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=back_keyboard(), parse_mode="HTML")
         return
     if data == "menu_autolive":
+        # Live Auto Signal (the owner, 2026-11-28): pick ONE market,
+        # then turn it ON — the bot watches that market live and
+        # sends a signal only when the analysis is strong, never
+        # every minute. ON stays on until the user turns it OFF.
+        on = database.is_auto_subscriber(user.id)
+        asset = database.get_auto_asset(user.id)
+        kb = []
+        if asset:
+            kb.append([_btn(f"Market: {display_asset(asset)}",
+                            "autolive_pick", icon="asset")])
+        else:
+            kb.append([_btn("Pick market", "autolive_pick", icon="asset")])
+        toggle = _btn("Turn OFF" if on else "Turn ON",
+                      "autolive_toggle",
+                      icon="toggle_off" if on else "toggle_on")
+        kb.append([toggle])
+        kb.append([_btn("Back", "menu_main", icon="back")])
+        market_line = (f"Market: {display_asset(asset)}\n" if asset
+                       else "Market: not picked yet — pick one first.\n")
+        await query.edit_message_text(
+            f"{pe('bell')} Auto Live Signal\n{DIVIDER}\n"
+            f"Status: {'ON' if on else 'OFF'}\n"
+            f"{market_line}\n"
+            "When ON, the bot watches your market live and sends a "
+            "signal only when the analysis is strong (multi-day + "
+            "win-%), with a chart screenshot — then a result "
+            "screenshot with a tick (profit) or a cross (loss).",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="HTML")
+        return
+    if data == "autolive_pick":
+        await _show_auto_picker(query, context, 0)
+        return
+    if data.startswith("autolive_page_"):
+        try:
+            page = int(data[len("autolive_page_"):])
+        except ValueError:
+            return
+        await _show_auto_picker(query, context, page)
+        return
+    if data.startswith("autolive_asset_"):
+        asset = data[len("autolive_asset_"):]
+        database.set_auto_asset(user.id, asset)
         on = database.is_auto_subscriber(user.id)
         toggle = _btn("Turn OFF" if on else "Turn ON",
                       "autolive_toggle",
                       icon="toggle_off" if on else "toggle_on")
         await query.edit_message_text(
             f"{pe('bell')} Auto Live Signal\n{DIVIDER}\n"
-            f"Status: {'ON' if on else 'OFF'}\n\n"
-            "When ON, the bot sends you the next 2-hour window's top "
-            "signals right after every collection run.",
-            reply_markup=InlineKeyboardMarkup([[toggle],
-                                               [_btn("Back", "menu_main", icon="back")]]),
+            f"Status: {'ON' if on else 'OFF'}\n"
+            f"Market: {display_asset(asset)}\n\n"
+            "Tap Turn ON and the bot starts watching this market.",
+            reply_markup=InlineKeyboardMarkup(
+                [[toggle], [_btn("Back", "menu_main", icon="back")]]),
             parse_mode="HTML")
         return
     if data == "autolive_toggle":
+        asset = database.get_auto_asset(user.id)
+        if not asset:
+            await query.edit_message_text(
+                f"{pe('warning')} Pick a market first — tap Pick market.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[_btn("Pick market", "autolive_pick", icon="asset")],
+                     [_btn("Back", "menu_main", icon="back")]]),
+                parse_mode="HTML")
+            return
         on = not database.is_auto_subscriber(user.id)
         database.set_auto_signals(user.id, on)
         toggle = _btn("Turn OFF" if on else "Turn ON",
@@ -1485,11 +1735,14 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                       icon="toggle_off" if on else "toggle_on")
         await query.edit_message_text(
             f"{pe('bell')} Auto Live Signal\n{DIVIDER}\n"
-            f"Status: {'ON' if on else 'OFF'}\n\n"
-            "When ON, the bot sends you the next 2-hour window's top "
-            "signals right after every collection run.",
-            reply_markup=InlineKeyboardMarkup([[toggle],
-                                               [_btn("Back", "menu_main", icon="back")]]),
+            f"Status: {'ON' if on else 'OFF'}\n"
+            f"Market: {display_asset(asset)}\n\n"
+            "When ON, the bot watches your market live and sends a "
+            "signal only when the analysis is strong (multi-day + "
+            "win-%), with a chart screenshot — then a result "
+            "screenshot with a tick (profit) or a cross (loss).",
+            reply_markup=InlineKeyboardMarkup(
+                [[toggle], [_btn("Back", "menu_main", icon="back")]]),
             parse_mode="HTML")
         return
     if data == "menu_premium":
@@ -1830,12 +2083,13 @@ async def _run_futures(query, context, start, end, animate=True):
 
 
 async def _run_market(query, assets=None, context=None):
-    """Market Live detail for each picked market: last candle (Dhaka
-    time, close, direction, and how old it is), today's high/low and
-    candle count, EMA trend + RSI. DB only — the live stream keeps
-    the last candle at most ~1 minute old, the batch collector
-    fills any gap. `assets` comes from the picker (str, list or None);
-    None keeps the old default-asset behaviour."""
+    """Market Live detail for each picked market (the owner,
+    2026-11-28): live price + change, the last 5 candles,
+    support/resistance from the last 60 candles, the 1M payout %,
+    and a signal hint from the AI analysis. DB only — the live
+    stream keeps the last candle at most ~1 minute old, the batch
+    collector fills any gap. `assets` comes from the picker (str,
+    list or None); None keeps the old default-asset behaviour."""
     assets = _resolve_analysis_assets(assets)
     if not assets:
         await query.edit_message_text(
@@ -1844,6 +2098,10 @@ async def _run_market(query, assets=None, context=None):
             reply_markup=back_keyboard(), parse_mode="HTML")
         return
     today = _today_date_str()
+    try:
+        payouts = {a: p for a, p, _o, _u in _db().get_payouts()}
+    except Exception:
+        payouts = {}
     sections = []
     for asset in assets:
         try:
@@ -1857,21 +2115,52 @@ async def _run_market(query, assets=None, context=None):
         norm = [normalize_candle(c) for c in candles]
         last = norm[-1]
         direction = "CALL" if last["close"] > last["open"] else "PUT"
-        hi = max(c["high"] for c in norm)
-        lo = min(c["low"] for c in norm)
+        # Live price + change vs the previous candle.
+        if len(norm) >= 2 and norm[-2]["close"]:
+            chg = (last["close"] - norm[-2]["close"]) / norm[-2]["close"] * 100
+            chg_text = f" {'▲' if chg >= 0 else '▼'} {abs(chg):.2f}%"
+        else:
+            chg_text = ""
+        # Last 5 candles, compact.
+        last5 = norm[-5:]
+        c5 = " | ".join(
+            f"{c['hhmm']} {'C' if c['close'] > c['open'] else ('P' if c['close'] < c['open'] else 'D')}"
+            for c in last5)
+        # Support / resistance from the last 60 candles.
+        window = norm[-60:]
+        res = max(c["high"] for c in window)
+        sup = min(c["low"] for c in window)
+        near = ""
+        if last["close"] and res and (res - last["close"]) / res <= 0.001:
+            near = " (near resistance)"
+        elif last["close"] and sup and (last["close"] - sup) / sup <= 0.001:
+            near = " (near support)"
+        payout = payouts.get(asset)
+        payout_line = (f"{pe('money')} Payout (1M): {payout:.0f}%"
+                       if payout is not None else "")
+        # Signal hint from the AI analysis (same four checks).
+        try:
+            hint_dir, _checks, _n = ai_next_signal(_db(), asset)
+        except Exception:
+            hint_dir = None
+        hint = (f"Signal hint: {hint_dir} for the next minute"
+                if hint_dir else "Signal hint: no strong signal right now")
+        lines = [
+            f"{display_asset(asset)}",
+            f"Live price: {last['close']}{chg_text} | {direction} ({_candle_age_text(last)})",
+            f"Last 5: {c5}",
+            f"Resistance: {res} | Support: {sup}{near}",
+        ]
+        if payout_line:
+            lines.append(payout_line)
+        lines.append(hint)
         closes = [c["close"] for c in norm]
         if len(closes) >= 21:
             trend = trend_direction(closes)
             trend_emoji = pe("up") if trend == "UP" else pe("down")
-            trend_line = (f"{trend_emoji} Trend (EMA9/21): {trend} | "
-                          f"{pe('chart')} RSI(14): {rsi(closes):.1f}")
-        else:
-            trend_line = "Not enough candles for trend/RSI yet."
-        sections.append(
-            f"{display_asset(asset)}\n"
-            f"Last: {last['datetime'][11:16]} | {last['close']} | {direction} ({_candle_age_text(last)})\n"
-            f"Today: {len(norm)} candles | High: {hi} | Low: {lo}\n"
-            f"{trend_line}")
+            lines.append(f"{trend_emoji} Trend (EMA9/21): {trend} | "
+                         f"{pe('chart')} RSI(14): {rsi(closes):.1f}")
+        sections.append("\n".join(lines))
     title = (f" — {display_asset(assets[0])}" if len(assets) == 1
              else f" — {len(assets)} markets")
     text = (f"{pe('diamond')} Market Live{title} {pe('chart')}\n"
@@ -1971,6 +2260,19 @@ async def _run_bot_status(query, context=None):
         stream_line = f"{stream_status} — last candle {stream_last or '—'} (Dhaka)"
     else:
         stream_line = "not running (stream off or not started yet)"
+    # Disconnect detector (the owner, 2026-11-28): which asset's
+    # candles just stopped flowing and which just resumed — the
+    # stream stores these transitions in the DB state.
+    try:
+        stopped, resumed = live_stream._load_flow_state(_db())
+    except Exception:
+        stopped, resumed = {}, []
+    stopped_line = (", ".join(f"{display_asset(a)} ({t})"
+                              for a, t in sorted(stopped.items()))
+                    or "none")
+    resumed_line = (", ".join(f"{display_asset(a)} ({t})"
+                              for a, t in resumed)
+                    or "none")
     text = (f"{pe('green')}{pe('diamond')} BLUE FISH PRIME • BOT STATUS {pe('sparkle')}\n{DIVIDER}\n"
             f"Mode: {mode_text}\n"
             f"Database: {db_text}\n"
@@ -1980,6 +2282,8 @@ async def _run_bot_status(query, context=None):
             f"Next collection: {s['next_collection'] or '—'}\n"
             f"Quotex session: {html.escape(str(s['quotex_session']))}\n"
             f"Live stream: {stream_line}\n"
+            f"Stopped: {stopped_line}\n"
+            f"Resumed: {resumed_line}\n"
             f"Last Quotex login: {s['quotex_last_login'] or '—'}\n"
             f"Today ({s['today_date']}) 00:00-now: {s['today_count']} candles\n"
             f"Time now (Dhaka): {s['now_dhaka']}")
@@ -2044,13 +2348,19 @@ def _resolve_analysis_assets(assets):
     return assets
 
 
+def _ai_next_signal(asset):
+    """Thin wrapper: the AI analysis lives in the engine
+    (ai_next_signal) so the Live Auto Signal loop can use it too."""
+    return ai_next_signal(_db(), asset)
+
+
 async def _run_ai_signal(query, context, assets=None, animate=True):
-    """AI Signal from the DB: each picked market's last candle (today),
-    EMA9/21 trend and RSI(14) over its last 60 candles. No Quotex
-    login, no sample file. `assets` comes from the picker (str, list
-    or None); None keeps the old default-asset behaviour. The result
-    carries its build time and a Refresh button, so a 12:52 result is
-    never mistaken for live data at 12:57."""
+    """AI Signal from the DB — the NEXT minute's direction for ONE
+    asset, only when EMA trend, RSI zone, the last 3 candles and the
+    5-day same-time history all agree (see _ai_next_signal). No
+    Quotex login, no Open/Close data, no disclaimer, no Generated
+    line. `assets` is a one-element list (typed asset) or None (the
+    old default-asset behaviour)."""
     if animate:
         try:
             await query.edit_message_text(
@@ -2070,32 +2380,39 @@ async def _run_ai_signal(query, context, assets=None, animate=True):
             "Please try again in a bit.",
             reply_markup=back_keyboard(), parse_mode="HTML")
         return
-    sections = []
-    for asset in assets:
-        recent = _db_recent_candles(asset, 60)
-        if len(recent) < 21:
-            sections.append(f"{display_asset(asset)}: Not enough candles yet "
-                            f"({len(recent)} today). Try again after the next collection.")
-            continue
-        closes = [c["close"] for c in recent]
-        last = recent[-1]
-        direction = "CALL" if last["close"] > last["open"] else "PUT"
-        trend = trend_direction(closes)
-        value = rsi(closes)
-        trend_emoji = pe("up") if trend == "UP" else pe("down")
-        sections.append(
-            f"{display_asset(asset)}\n"
-            f"Last: {last['datetime']} M1 {direction} ({_candle_age_text(last)})\n"
-            f"{trend_emoji} Trend (EMA9/21): {trend} | {pe('chart')} RSI(14): {value:.1f}\n"
-            f"{pe('money')} Close: {last['close']} | Open: {last['open']}")
-    title = (f" — {display_asset(assets[0])}" if len(assets) == 1
-             else f" — {len(assets)} markets")
+    asset = assets[0]
+    direction, checks, n_candles = _ai_next_signal(asset)
+    now = collector.dhaka_now()
+    next_min = (now.replace(second=0, microsecond=0)
+                + timedelta(minutes=1))
+    hhmm = next_min.strftime("%H:%M")
+    if n_candles < 21:
+        await query.edit_message_text(
+            f"{pe('cross')} {display_asset(asset)}: Not enough candles yet "
+            f"({n_candles} today). Try again after the next collection.",
+            reply_markup=back_keyboard(), parse_mode="HTML")
+        return
+    check_mark = pe("check")
+    cross_mark = pe("cross")
+
+    def _line(label, voted):
+        mark = check_mark if voted else cross_mark
+        return f"{mark} {label}: {voted or '—'}"
+
+    lines = [
+        f"{pe('star')}{pe('diamond')} BLUE FISH PRIME • AI SIGNAL — "
+        f"{display_asset(asset)} {pe('sparkle')}\n{DIVIDER}",
+        f"Next: {hhmm} M1 " + (f"{direction}" if direction
+                               else "No signal — conditions do not agree"),
+        _line("Trend (EMA9/21)", checks["trend"]),
+        _line("RSI(14) zone", checks["rsi"]),
+        _line("Last 3 candles", checks["last3"]),
+        _line("5-day same-time", checks["history"]),
+    ]
     await query.edit_message_text(
-        f"{pe('star')}{pe('diamond')} BLUE FISH PRIME • AI SIGNAL{title} {pe('sparkle')}\n{DIVIDER}\n"
-        + "\n\n".join(sections)
-        + f"\n\n{DISCLAIMER}\n{_generated_line()}",
+        "\n".join(lines),
         reply_markup=_refresh_keyboard(), parse_mode="HTML")
-    _store_result_spec(context, query, ("an", "ai", assets))
+    _store_result_spec(context, query, ("an", "ai", [asset]))
 
 
 async def _run_counter(query, assets=None, context=None):
@@ -2167,17 +2484,21 @@ async def _run_trend(query, assets=None, context=None):
         _store_result_spec(context, query, ("an", "trend", assets))
 
 
-async def _run_backtest(query):
-    """Backtest Lab from the DB — a real backtest this time: signals
-    for yesterday 09:00-10:59 built from the 2 days BEFORE yesterday
-    (majority vote), then checked against yesterday's actual candles."""
+async def _run_backtest(query, asset=None, date_str=None,
+                      start="09:00", end="10:59", days=2):
+    """Backtest Lab from the DB: signals for one test date + time
+    window, built from the `days` days BEFORE the test date
+    (majority vote), then checked against the test date's actual
+    candles. Defaults (no arguments) keep the old behaviour:
+    yesterday 09:00-10:59, 2 training days, the default asset."""
     try:
         await query.edit_message_text(
             f"{pe('hourglass')} Running backtest... {pe('chart')}", parse_mode="HTML")
         await asyncio.sleep(0.6)
     except Exception:
         pass
-    asset = _default_analysis_asset()
+    if asset is None:
+        asset = _default_analysis_asset()
     if asset is None:
         await query.edit_message_text(
             f"{pe('cross')} No candles in the database yet.\n"
@@ -2186,37 +2507,37 @@ async def _run_backtest(query):
         return
     db = _db()
     today = _today_date_str()
-    yesterday = (datetime.strptime(today, "%Y-%m-%d")
-                 - timedelta(days=1)).strftime("%Y-%m-%d")
+    test_date = date_str or (datetime.strptime(today, "%Y-%m-%d")
+                             - timedelta(days=1)).strftime("%Y-%m-%d")
     all_dates = [d for d in db.get_dates() if d < today]
-    if yesterday not in all_dates:
+    if test_date not in all_dates:
         await query.edit_message_text(
-            f"{pe('cross')} No candles for {yesterday} yet — the backtest "
-            "needs yesterday's full day. Try again tomorrow.",
+            f"{pe('cross')} No candles for {test_date} yet — the backtest "
+            "needs that day's full data. Try another date.",
             reply_markup=back_keyboard(), parse_mode="HTML")
         return
-    train = [d for d in all_dates if d < yesterday][-2:]
+    train = [d for d in all_dates if d < test_date][-days:]
     if not train:
         await query.edit_message_text(
             f"{pe('cross')} Not enough history yet — the backtest needs "
-            "at least 2 days before yesterday.",
+            f"at least 1 day before {test_date}.",
             reply_markup=back_keyboard(), parse_mode="HTML")
         return
-    signals = generate_futures_signals_from_db(db, asset, train, "09:00", "10:59")
+    signals = generate_futures_signals_from_db(db, asset, train, start, end)
     lines = format_signals_list(signals)
     if not lines:
         await query.edit_message_text(
-            f"{pe('chart')}{pe('diamond')} BACKTEST LAB — {display_asset(asset)} {yesterday} 09:00-10:59\n"
+            f"{pe('chart')}{pe('diamond')} BACKTEST LAB — {display_asset(asset)} {test_date} {start}-{end}\n"
             f"{DIVIDER}\n"
             f"{pe('chart')} Filtered signals: 0\n"
             "The filter removed every signal for this window. Try another asset later.",
             reply_markup=back_keyboard(), parse_mode="HTML")
         return
-    lookup = build_lookup(db.get_candles(asset, yesterday), asset)
-    results, summary = check_signals(lines, lookup, yesterday, with_mtg1=False)
+    lookup = build_lookup(db.get_candles(asset, test_date), asset)
+    results, summary = check_signals(lines, lookup, test_date, with_mtg1=False)
     text = format_check_results(results, summary, header=False)
-    full = (f"{pe('chart')}{pe('diamond')} BACKTEST LAB — {display_asset(asset)} {yesterday} 09:00-10:59\n"
-            f"Signals built from {', '.join(train)} (majority vote), checked against {yesterday}.\n"
+    full = (f"{pe('chart')}{pe('diamond')} BACKTEST LAB — {display_asset(asset)} {test_date} {start}-{end}\n"
+            f"Signals built from {', '.join(train)} (majority vote), checked against {test_date}.\n"
             f"{DIVIDER}\n{text}")
     # The full list is always shown (the owner, 2026-11-27) — split
     # instead of cut. In practice the backtest caps at ~12 signals,
@@ -2305,6 +2626,102 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Every text message counts as activity for the Admin Dashboard's
     # 'Online' count (last_seen is touched inside get_or_create_user).
     database.get_or_create_user(user.id, user.username or "")
+
+    if flow == "backtest_asset":
+        # Backtest Lab step 1: the asset, typed by hand. Next: the
+        # test date.
+        asset = candles_db.normalize_asset_name(text)
+        known = []
+        try:
+            known = _db().get_assets()
+        except Exception:
+            known = []
+        if not asset or (known and asset not in known):
+            await update.message.reply_text(
+                f"{pe('warning')} I do not have that asset. "
+                "Send a name like BTCUSD-OTC or EURUSD-OTC.",
+                reply_markup=back_keyboard(), parse_mode="HTML")
+            return  # keep the flow so the user can retry
+        context.user_data["backtest_asset"] = asset
+        context.user_data["flow"] = "backtest_date"
+        kb = [[_btn("Yesterday", "backtest_date_yesterday", icon="days")],
+              [_btn("Back", "menu_main", icon="back")]]
+        await update.message.reply_text(
+            f"{pe('diamond')} Backtest Lab — {display_asset(asset)} {pe('chart')}\n"
+            f"{DIVIDER}\n\n"
+            "Which date should I test? Send a date like 2026-11-25, "
+            "or tap Yesterday.",
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+        return
+
+    if flow == "backtest_date":
+        # Backtest Lab step 2: the test date (the day whose candles
+        # are checked). It must be a past date with candles.
+        parsed = parse_checker_date(text)
+        today = _today_date_str()
+        if parsed is None or parsed >= today:
+            await update.message.reply_text(
+                f"{pe('warning')} That date is not valid. Send a past "
+                "date like 2026-11-25, or tap Yesterday.",
+                reply_markup=back_keyboard(), parse_mode="HTML")
+            return  # keep the flow so the user can retry
+        context.user_data["backtest_date"] = parsed
+        context.user_data["flow"] = "backtest_time"
+        await update.message.reply_text(
+            f"{pe('diamond')} Backtest Lab — {parsed} {pe('chart')}\n"
+            f"{DIVIDER}\n\n"
+            "Which time window? Send start and end like this:\n"
+            "09:00 10:59",
+            reply_markup=back_keyboard(), parse_mode="HTML")
+        return
+
+    if flow == "backtest_time":
+        # Backtest Lab step 3: the time window. Next: the days
+        # (buttons 1/2/3/5).
+        parsed = parse_custom_time(text)
+        if parsed is None:
+            await update.message.reply_text(
+                f"{pe('warning')} That time is not valid. Please send start and end time like this:\n"
+                "09:00 10:59\n\nEnd time must be after start time.",
+                reply_markup=back_keyboard(), parse_mode="HTML")
+            return  # keep the flow so the user can retry
+        start, end = parsed
+        context.user_data["backtest_start"] = start
+        context.user_data["backtest_end"] = end
+        context.user_data["flow"] = None
+        kb = [[_btn("1 Day", "backtest_days_1", icon="days"),
+               _btn("2 Days", "backtest_days_2", icon="days"),
+               _btn("3 Days", "backtest_days_3", icon="days"),
+               _btn("5 Days", "backtest_days_5", icon="days")],
+              [_btn("Back", "menu_main", icon="back")]]
+        await update.message.reply_text(
+            f"{pe('diamond')} Backtest Lab — how many days of history should build the signals? {pe('chart')}\n"
+            "Signals are built from the days BEFORE the test date, at the same HH:MM.",
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+        return
+
+    if flow == "ai_asset":
+        # AI Signal takes the asset typed by hand (the owner,
+        # 2026-11-28). Normalise the name, then run the signal on a
+        # working message; a bad name asks again, keeping the flow.
+        asset = candles_db.normalize_asset_name(text)
+        known = []
+        try:
+            known = _db().get_assets()
+        except Exception:
+            known = []
+        if not asset or (known and asset not in known):
+            await update.message.reply_text(
+                f"{pe('warning')} I do not have that asset. "
+                "Send a name like BTCUSD-OTC or EURUSD-OTC.",
+                reply_markup=back_keyboard(), parse_mode="HTML")
+            return  # keep the flow so the user can retry
+        context.user_data["flow"] = None
+        working = await update.message.reply_text(
+            f"{pe('hourglass')} Analysing {display_asset(asset)}... {pe('chart')}",
+            parse_mode="HTML")
+        await _run_ai_signal(_MessageQuery(working), context, [asset])
+        return
 
     if flow == "futures_pct":
         # The user typed the win-rate % (70-100) for the FUTURES
@@ -2406,6 +2823,14 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lookup = await _build_checker_lookup(lines, check_date)
         results, summary = check_signals(lines, lookup, check_date,
                                          with_mtg1=with_mtg1, mode=mode)
+        # Loss Candle report (the owner, 2026-11-28): remember the
+        # final LOSS entries so the SHOW LOSS CANDLE button below
+        # the result can chart them one by one. Only on tap — the
+        # charts are never sent automatically.
+        losses = _checker_losses(results)
+        context.user_data["checker_losses"] = losses
+        context.user_data["checker_loss_date"] = check_date
+        result_kb = _checker_result_keyboard(bool(losses))
         # The full list is always shown (the owner, 2026-11-27) — a
         # list longer than one Telegram message is sent as several
         # messages, never cut. The Back button sits on the last part.
@@ -2414,32 +2839,93 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                  mode=mode))
         await working.edit_text(
             parts[0],
-            reply_markup=back_keyboard() if len(parts) == 1 else None,
+            reply_markup=result_kb if len(parts) == 1 else None,
             parse_mode="HTML")
         for i, part in enumerate(parts[1:], start=1):
             await update.message.reply_text(
                 part,
-                reply_markup=(back_keyboard()
+                reply_markup=(result_kb
                               if i == len(parts) - 1 else None),
                 parse_mode="HTML")
         context.user_data["flow"] = None
         return
 
-    if flow == "filter_aston":
-        context.user_data["aston_lines"] = text.splitlines()
-        context.user_data["flow"] = "filter_newexe"
+    if flow == "filter_list":
+        # The pasted signal list: parse each line, then ask how many
+        # days of history to analyse.
+        lines = [p for p in (parse_line(x) for x in text.splitlines()) if p]
+        if not lines:
+            await update.message.reply_text(
+                f"{pe('warning')} I could not read any signal lines. "
+                "Send the list again — each line like "
+                "BTCUSD-OTC,09:02 M1 CALL.", parse_mode="HTML")
+            return
+        context.user_data["filter_lines"] = lines
+        context.user_data["flow"] = "filter_days"
+        kb = [[_btn("1 Day", "filter_days_1", icon="days"),
+               _btn("2 Days", "filter_days_2", icon="days"),
+               _btn("3 Days", "filter_days_3", icon="days"),
+               _btn("5 Days", "filter_days_5", icon="days")],
+              [_btn("Back", "menu_main", icon="back")]]
         await update.message.reply_text(
-            f"{pe('sparkle')} Now send the Newexe list.", parse_mode="HTML")
+            f"{pe('chart')}{pe('diamond')} Signal Filter — {len(lines)} line(s) {pe('search')}\n\n"
+            "How many days of history should I analyse for each line?",
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
         return
 
-    if flow == "filter_newexe":
-        aston = context.user_data.get("aston_lines", [])
-        final, counts = filter_personal(aston, text.splitlines())
-        await update.message.reply_text(
-            f"{pe('chart')}{pe('diamond')} Filter Results:\n{DIVIDER}\n\n"
-            + format_filter_result(final, counts),
-            reply_markup=back_keyboard(), parse_mode="HTML")
+    if flow == "filter_pct":
+        # The minimum win-% threshold, then run the filter with a
+        # download-style progress bar.
+        pct = _parse_fs_pct(text)
+        if pct is None:
+            await update.message.reply_text(
+                f"{pe('warning')} That % is not valid. Send a whole "
+                "number from 70 to 100.", parse_mode="HTML")
+            return
+        lines = context.user_data.get("filter_lines", [])
+        days = context.user_data.get("filter_days", 3)
         context.user_data["flow"] = None
+        if not lines:
+            await update.message.reply_text(
+                f"{pe('warning')} The list is gone — open Signal Filter "
+                "again and send the list.", parse_mode="HTML")
+            return
+        working = await update.message.reply_text(
+            f"{pe('search')} Filtering... {progress_bar(0)}",
+            parse_mode="HTML")
+        from .filters import _today_str
+        today = _today_str()
+        kept = []
+        details = []
+        no_data = 0
+        last_shown = -1
+        for i, line in enumerate(lines):
+            ok, detail = filter_one_line(_db(), line, days, pct, today)
+            if ok:
+                kept.append(line)
+            elif detail[4] == "no data":
+                no_data += 1
+            details.append(detail)
+            shown = int((i + 1) / len(lines) * 100)
+            if shown - last_shown >= 10 or i == len(lines) - 1:
+                last_shown = shown
+                try:
+                    await working.edit_text(
+                        f"{pe('search')} Filtering... {progress_bar(shown)}",
+                        parse_mode="HTML")
+                except Exception:
+                    pass
+        stats = {"total": len(lines), "kept": len(kept),
+                 "dropped": len(lines) - len(kept), "no_data": no_data,
+                 "details": details}
+        body = format_filter_result(kept, stats, days, pct)
+        parts = split_message(
+            f"{pe('chart')}{pe('diamond')} Filter Results:\n{DIVIDER}\n\n"
+            f"<code>{body}</code>")
+        await working.edit_text(parts[0], reply_markup=back_keyboard(),
+                                parse_mode="HTML")
+        for part in parts[1:]:
+            await update.message.reply_text(part, parse_mode="HTML")
         return
 
     if flow == "formatter":

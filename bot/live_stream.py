@@ -16,9 +16,14 @@ Safety, in order:
 - One Quotex login at a time across the process (the collector's
   _CONNECT_LOCK): stream reconnects and collector runs never log in
   simultaneously.
-- Reconnects back off (30s -> 300s cap); a 429 rests 10 minutes.
+- Reconnects back off (10s -> 300s cap); a 429 rests 10 minutes.
 - On (re)connect the stream tail-fills each asset from its last
-  stored candle, so a disconnect gap is closed immediately.
+  stored candle, so a disconnect gap is closed immediately; a
+  tail-fill that stores nothing for stale assets retries once
+  after 10s instead of waiting for the next collector run.
+- The stream tracks per-asset candle-flow transitions (the owner,
+  2026-11-28): which asset's candles just stopped and which just
+  resumed — stored in the DB state so Bot Status can show them.
 - The loop never raises out of live_stream_loop — a dead stream is
   logged loudly and retried, like the collector loop.
 
@@ -28,6 +33,7 @@ works exactly as before, from the batch collector alone.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from datetime import datetime, timedelta, timezone
@@ -36,6 +42,7 @@ from . import candles_db, config, quotex_client
 from .candles_db import DHAKA, utc_iso
 from .collector import (
     SharedQuotexSession,
+    _capture_payouts,
     _fetch_assets_3_at_a_time,
     _safe_set_state,
     _tail_seconds_back,
@@ -64,6 +71,58 @@ _NEVER_TICKED_COOLDOWN_SECONDS = 7200
 # already has. Skipping current assets is what keeps the tail-fill
 # cheap in the normal case.
 _TAIL_FILL_SKIP_SECONDS = 120
+# Payout refresh interval (the owner, 2026-11-28): the live stream
+# refreshes the payout snapshot this often, reusing its own session.
+_PAYOUT_REFRESH_SECONDS = 120
+# Disconnect detector (the owner, 2026-11-28): per-asset candle-flow
+# transitions are stored under this DB state key as JSON
+# {"stopped": [[asset, "HH:MM"], ...], "resumed": [[asset, "HH:MM"],
+# ...]} — Bot Status reads it. "Stopped" = the asset's candles went
+# quiet while others kept ticking; "Resumed" = its candles flowed
+# again after being stopped.
+_FLOW_STATE_KEY = "live_stream_flow"
+# How many resumed assets Bot Status keeps (most recent first).
+_FLOW_RESUMED_KEEP = 10
+# Reconnect backoff (the owner, 2026-11-28): the first reconnect
+# waits 10s (was 30s) so a disconnect gap heals faster; a flapping
+# connection still doubles up to the 300s cap.
+_RECONNECT_BACKOFF_SECONDS = 10
+# Tail-fill retry (the owner, 2026-11-28): when a reconnect's
+# tail-fill stores nothing for stale assets (the AUDCAD_otc
+# 00:18-00:20 gap on 2026-11-28 waited for the next 30-min collector
+# run), retry once after this long instead of waiting.
+_TAIL_FILL_RETRY_SECONDS = 10
+
+
+def _load_flow_state(db):
+    """(stopped, resumed) from the DB state: stopped is {asset:
+    "HH:MM"} for assets currently stopped; resumed is [(asset,
+    "HH:MM")] most recent first. Empty on any error or no state."""
+    try:
+        raw = db.get_state(_FLOW_STATE_KEY, None)
+    except Exception:
+        return {}, []
+    if not raw:
+        return {}, []
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return {}, []
+    stopped = {a: t for a, t in data.get("stopped", [])}
+    resumed = [(a, t) for a, t in data.get("resumed", [])]
+    return stopped, resumed
+
+
+def _save_flow_state(db, stopped, resumed):
+    """Persist the (stopped, resumed) flow state; never raises."""
+    data = {"stopped": sorted(stopped.items()),
+            "resumed": list(resumed)[:_FLOW_RESUMED_KEEP]}
+    _safe_set_state(db, _FLOW_STATE_KEY, json.dumps(data))
+
+
+def _dhaka_hhmm():
+    """The current Dhaka time as HH:MM."""
+    return dhaka_now().strftime("%H:%M")
 
 
 def _tail_is_stale(db, asset, now):
@@ -162,40 +221,138 @@ def _pick_stream_assets(assets, test_asset):
     return list(assets)
 
 
-async def _tail_fill(db, session, assets, now=None):
+# Tick filter (the owner, 2026-11-28): a bad tick (a wrong price from
+# the feed) poisons the whole 1-min candle it lands in — and every
+# tool reads that candle (AI Signal, Candle Scan, Trend Scan, Market
+# Live, CHECKER). Drop a tick whose price jumps too far from the
+# asset's last accepted price in a single step. A genuine level
+# shift is NOT dropped: a jump is held as a suspect, and only
+# accepted when the next tick confirms the new level (within 1%);
+# a lone spike is dropped when the next tick comes back near the
+# reference. The filter runs in one place only — the poll loop,
+# before the ticks reach the candle builder.
+_TICK_FILTER_MAX_JUMP = 0.05  # 5% in one tick
+_TICK_FILTER_CONFIRM = 0.01  # 1% — the next tick must agree
+
+
+def _filter_ticks(ticks, last_price, suspects):
+    """Drop abnormal-price ticks.
+
+    `last_price` maps asset -> last accepted price (seeded from the
+    DB's last candle close); `suspects` maps asset -> a held tick
+    that jumped too far, awaiting confirmation. Both dicts are
+    updated in place. Returns (filtered_ticks, n_dropped)."""
+    dropped = 0
+    out = {}
+    for asset, tick_list in (ticks or {}).items():
+        kept = []
+        ref = last_price.get(asset)
+        suspect = suspects.get(asset)
+        for t in tick_list or []:
+            try:
+                price = float(t["price"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if price <= 0:
+                dropped += 1
+                continue
+            if ref is None or ref <= 0:
+                kept.append(t)
+                last_price[asset] = price
+                ref = price
+                suspect = None
+                continue
+            if abs(price - ref) / ref > _TICK_FILTER_MAX_JUMP:
+                if suspect is not None and abs(
+                        price - suspect[1]) / suspect[1] <= _TICK_FILTER_CONFIRM:
+                    # Confirmed: the level really moved — accept the
+                    # suspect tick too, then this one.
+                    kept.append(suspect[0])
+                    kept.append(t)
+                    last_price[asset] = price
+                    ref = price
+                    suspect = None
+                else:
+                    # A new suspect replaces an old one — the old one
+                    # was a spike, not a shift.
+                    if suspect is not None:
+                        dropped += 1
+                    suspect = (t, price)
+                continue
+            # A normal tick: a pending suspect was a lone spike.
+            if suspect is not None:
+                dropped += 1
+                suspect = None
+            kept.append(t)
+            last_price[asset] = price
+            ref = price
+        if suspect is not None:
+            suspects[asset] = suspect
+        elif asset in suspects:
+            del suspects[asset]
+        if kept:
+            out[asset] = kept
+    return out, dropped
+
+
+async def _tail_fill(db, session, assets, now=None, sleep=None):
     """Fetch only each asset's missing tail (last stored candle ->
     now) and store it — closes the gap a disconnect left behind.
-    Reuses the collector's tail machinery; never raises.
+    Reuses the collector's tail machinery; never raises. Returns
+    the number of candles stored.
 
     Assets already current (last candle within _TAIL_FILL_SKIP_SECONDS)
     are skipped: fetching them would only re-store minutes the DB
     already has (the fetch floor is 10 min), and skipping them is
     what keeps the tail-fill cheap in the normal case — a restart a
     minute after the old instance stopped has almost nothing to fetch.
+
+    Retry (the owner, 2026-11-28): when the first attempt has stale
+    assets to heal but stores nothing (the AUDCAD_otc 00:18-00:20
+    gap on 2026-11-28 waited for the next 30-min collector run),
+    wait _TAIL_FILL_RETRY_SECONDS and try once more instead of
+    waiting for the next cycle.
     """
+    sleep = sleep or asyncio.sleep
     now = now or dhaka_now()
     try:
         dates = backfill_dates(config.BACKFILL_DAYS, now)
         oldest_start, _ = day_window_utc(dates[-1])
         todo = [a for a in assets if _tail_is_stale(db, a, now)]
         if not todo:
-            return
+            return 0
         spans = {a: _tail_seconds_back(db, a, oldest_start, now)
                  for a in todo}
-        results = await _fetch_assets_3_at_a_time(session, todo, spans)
-        total = 0
-        for asset, raw in results.items():
-            if not raw:
-                continue
-            # Batch truth: overwrite tick-built rows for the same minutes.
-            total += db.insert_candles(asset, rows_from_raw(raw),
-                                       on_conflict="update")
+        total = await _tail_fill_attempt(db, session, todo, spans)
+        if total == 0:
+            logger.warning(
+                "live stream: tail-fill stored nothing for %d stale "
+                "asset(s) — retrying once in %ds",
+                len(todo), _TAIL_FILL_RETRY_SECONDS)
+            await sleep(_TAIL_FILL_RETRY_SECONDS)
+            total = await _tail_fill_attempt(db, session, todo, spans)
         if total:
             logger.info("live stream: tail-fill stored %d candles", total)
+        return total
     except quotex_client.QuotexRateLimited:
         raise
     except Exception as exc:
         logger.warning("live stream: tail-fill failed: %s", exc)
+        return 0
+
+
+async def _tail_fill_attempt(db, session, todo, spans):
+    """One tail-fill fetch+store pass over `todo`. Returns the number
+    of candles stored (0 when the fetch returned nothing)."""
+    results = await _fetch_assets_3_at_a_time(session, todo, spans)
+    total = 0
+    for asset, raw in results.items():
+        if not raw:
+            continue
+        # Batch truth: overwrite tick-built rows for the same minutes.
+        total += db.insert_candles(asset, rows_from_raw(raw),
+                                   on_conflict="update")
+    return total
 
 
 def _store_tick_candles(db, ticks, period, buckets, built_until, now_s):
@@ -329,6 +486,36 @@ async def _poll_loop(db, session, sleep, assets=(), never_cool=None):
                 continue
             if age < _NEVER_TICKED_RECENT_SECONDS:
                 expected[asset] = prev["ts"]
+    # Tick-filter reference prices (the owner, 2026-11-28): the last
+    # accepted price per asset, seeded from the DB's last candle
+    # close so the first tick of a run is judged against real data.
+    last_price = {}
+    suspects = {}
+    if assets:
+        for asset in assets:
+            try:
+                prev = db.last_candle(asset)
+            except Exception:
+                prev = None
+            if prev and prev.get("close"):
+                try:
+                    last_price[asset] = float(prev["close"])
+                except (TypeError, ValueError):
+                    pass
+    filter_log_at = 0.0  # monotonic time of the last filter-drop log
+    # Disconnect detector (the owner, 2026-11-28): per-asset
+    # candle-flow transitions. `stopped` is {asset: "HH:MM"} for
+    # assets whose candles went quiet in this run (or a previous
+    # one — loaded from the DB so a resume after a reconnect is
+    # still recognised); `resumed` is [(asset, "HH:MM")] most recent
+    # first. Both are persisted on every change so Bot Status can
+    # show them even after the loop returns.
+    stopped, resumed = _load_flow_state(db)
+    # Payout refresh (the owner, 2026-11-28): the Live Payouts board
+    # used to update only when the 30-min collector ran. The stream
+    # reuses its own already-connected session (no extra Quotex
+    # login) to refresh the payout snapshot every 2 minutes.
+    last_payout_at = 0.0  # 0 -> refresh on the first poll
     while True:
         await sleep(poll)
         if not await session.is_connected():
@@ -387,6 +574,20 @@ async def _poll_loop(db, session, sleep, assets=(), never_cool=None):
             ticks = session.generated_ticks() or {}
         except Exception:
             ticks = {}
+        # Tick filter (the owner, 2026-11-28): drop abnormal-price
+        # ticks here, in the one place they enter the stream, before
+        # the liveness check and the candle builder see them.
+        try:
+            ticks, n_dropped = _filter_ticks(ticks, last_price, suspects)
+        except Exception as exc:
+            logger.warning("live stream: tick filter failed: %s", exc)
+            n_dropped = 0
+        if n_dropped:
+            now_mono = time.monotonic()
+            if now_mono - filter_log_at >= 60:
+                filter_log_at = now_mono
+                logger.info("live stream: tick filter dropped %d bad "
+                            "tick(s)", n_dropped)
         # Per-asset liveness (the owner, 2026-11-27): remember the
         # newest tick seen for each asset in THIS run — the
         # per-asset silence check at the end of the poll uses it.
@@ -400,6 +601,23 @@ async def _poll_loop(db, session, sleep, assets=(), never_cool=None):
                     ts /= 1000.0
                 if asset not in last_tick or ts > last_tick[asset]:
                     last_tick[asset] = ts
+        # Disconnect detector: an asset that was stopped and now
+        # ticks again has RESUMED — move it from the stopped set to
+        # the resumed list (with the Dhaka time) and persist it.
+        if stopped:
+            now_hhmm = _dhaka_hhmm()
+            just_resumed = [a for a in stopped
+                            if a in last_tick
+                            and now_s - last_tick[a] <= stale_after]
+            if just_resumed:
+                for a in just_resumed:
+                    del stopped[a]
+                    resumed.insert(0, (a, now_hhmm))
+                resumed = resumed[:_FLOW_RESUMED_KEEP]
+                _save_flow_state(db, stopped, resumed)
+                logger.info("live stream: %d asset(s) resumed (%s)",
+                            len(just_resumed),
+                            ", ".join(sorted(just_resumed)))
         try:
             tick_inserted, tick_assets, newest_ts = _store_tick_candles(
                 db, ticks, period, tick_buckets, built_until, now_s)
@@ -458,6 +676,14 @@ async def _poll_loop(db, session, sleep, assets=(), never_cool=None):
                         "60s (%d assets subscribed — server silent or "
                         "subscription not delivering)", n_assets)
                 quiet_polls = 0
+        # Payout refresh (the owner, 2026-11-28): every 2 minutes the
+        # stream reuses its own live session to refresh the payout
+        # snapshot — no extra Quotex login, and the Payouts board
+        # stops going stale between collector runs. _capture_payouts
+        # never raises (a failed capture is just a warning).
+        if time.monotonic() - last_payout_at >= _PAYOUT_REFRESH_SECONDS:
+            last_payout_at = time.monotonic()
+            await _capture_payouts(db, session)
         if time.monotonic() - last_any > stale_after:
             logger.warning("live stream: stale — no new candle for %d "
                            "minutes, reconnecting",
@@ -485,6 +711,13 @@ async def _poll_loop(db, session, sleep, assets=(), never_cool=None):
                 "live stream: %d asset(s) silent for %d minutes while "
                 "others still tick (%s%s) — reconnecting",
                 len(silent), config.LIVE_STREAM_STALE_MINUTES, shown, extra)
+            # Disconnect detector: record the stopped assets (with
+            # the Dhaka time) before reconnecting, so Bot Status
+            # shows them even after this loop returns.
+            now_hhmm = _dhaka_hhmm()
+            for a in silent:
+                stopped.setdefault(a, now_hhmm)
+            _save_flow_state(db, stopped, resumed)
             return
         # Never ticked at all in this run (the owner, 2026-11-27):
         # 20 major forex OTC pairs sat at 10:44 while exotics kept
@@ -513,6 +746,11 @@ async def _poll_loop(db, session, sleep, assets=(), never_cool=None):
                     "live stream: %d subscribed asset(s) never ticked "
                     "in this run while others tick (%s%s) — reconnecting",
                     len(never), shown, extra)
+                # Disconnect detector: record the stopped assets.
+                now_hhmm = _dhaka_hhmm()
+                for a in never:
+                    stopped.setdefault(a, now_hhmm)
+                _save_flow_state(db, stopped, resumed)
                 return
 
 
@@ -525,7 +763,7 @@ async def live_stream_loop(db=None, session_factory=None, sleep=None):
     db = db or candles_db.get_candle_db()
     session_factory = session_factory or SharedQuotexSession
     sleep = sleep or asyncio.sleep
-    backoff = 30
+    backoff = _RECONNECT_BACKOFF_SECONDS
     # Per-asset cooldown for the never-ticked reconnect trigger —
     # shared across reconnects so one broken subscription cannot
     # flap the stream every few minutes (the stale window is 3 min
@@ -563,12 +801,12 @@ async def live_stream_loop(db=None, session_factory=None, sleep=None):
             # A long clean run resets the backoff; a flapping
             # connection keeps doubling it (up to 5 minutes).
             if time.monotonic() - run_started > 300:
-                backoff = 30
+                backoff = _RECONNECT_BACKOFF_SECONDS
             logger.warning("live stream: disconnected, reconnecting")
         except quotex_client.QuotexRateLimited:
             logger.warning("live stream: 429 — resting 10 minutes")
             await sleep(600)
-            backoff = 30
+            backoff = _RECONNECT_BACKOFF_SECONDS
             continue
         except Exception as exc:
             logger.warning("live stream: %s", exc)

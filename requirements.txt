@@ -11,3 +11,6 @@ certifi
 # Postgres driver for the candle database on Render (DATABASE_URL).
 # Local testing uses SQLite, so this is only used when DATABASE_URL is set.
 psycopg2-binary
+# Pillow — candlestick chart screenshots for Live Auto Signal and the
+# Loss Candle report (drawn locally from DB candles, no paid API).
+Pillow

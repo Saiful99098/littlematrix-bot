@@ -246,7 +246,12 @@ def test_analysis_pickers_use_picked_asset():
         q = FakeQuery()
         asyncio.run(handlers._run_market(q, "ETHUSD_otc"))
         assert "Market Live — ETHUSD-OTC" in q.texts[-1][0], q.texts[-1][0]
-        assert "Today: 60 candles" in q.texts[-1][0], q.texts[-1][0]
+        # The improved Market Live (the owner, 2026-11-28) shows the
+        # live price, the last 5 candles and S/R instead of the old
+        # "Today: N candles" line.
+        assert "Live price:" in q.texts[-1][0], q.texts[-1][0]
+        assert "Last 5:" in q.texts[-1][0], q.texts[-1][0]
+        assert "Resistance:" in q.texts[-1][0], q.texts[-1][0]
     finally:
         candles_db_mod.get_candle_db = real_get_db
         config.DATA_MODE = real_mode
@@ -896,13 +901,126 @@ def test_tail_fill_skips_current_assets():
     class _RecSession(FakeSession):
         async def fetch_asset_span(self, asset, seconds_back):
             fetched.append(asset)
-            return []
+            # A real candle, so the tail-fill stores something and
+            # the retry (the owner, 2026-11-28) does not fire.
+            return [{"time": int(now.timestamp()) - 300, "open": 100.0,
+                     "high": 101.0, "low": 99.0, "close": 100.5}]
 
     session = _RecSession(tail_candles=[])
     asyncio.run(live_stream._tail_fill(
         db, session, ["BTCUSD_otc", "ETHUSD_otc"], now=now))
     assert fetched == ["ETHUSD_otc"], fetched
     print("PASS v) tail-fill skips current assets, fetches only stale ones")
+
+
+def test_disconnect_detector_records_stopped():
+    """w) The owner, 2026-11-28: when an asset's candles go quiet
+    while others keep ticking, the stream records it as STOPPED
+    (with the Dhaka time) in the DB state, so Bot Status can show
+    it. ETH stops ticking after 180s; the silence check fires and
+    the loop reconnects — ETH must be in the stopped set."""
+    db, tmp = _tmp_db()
+    clock = _FakeClock(1_700_000_000)
+    session = _TickScriptSession(clock, eth_stop=1_700_000_000 + 180)
+    real_time = live_stream.time
+    live_stream.time = clock
+    try:
+        asyncio.run(live_stream.live_stream_loop(
+            db=db, session_factory=lambda: session,
+            sleep=_ClockSleep(clock, max_calls=300)))
+    except _StopLoop:
+        pass
+    finally:
+        live_stream.time = real_time
+    assert session.connects >= 2, session.connects
+    stopped, resumed = live_stream._load_flow_state(db)
+    assert "ETHUSD_otc" in stopped, (stopped, resumed)
+    assert "BTCUSD_otc" not in stopped, (stopped, resumed)
+    print("PASS w) disconnect detector: silent asset recorded as STOPPED")
+
+
+def test_disconnect_detector_records_resumed():
+    """x) The owner, 2026-11-28: an asset that was stopped and then
+    ticks again is recorded as RESUMED (and leaves the stopped set).
+    The DB state is pre-seeded with ETH stopped; the poll loop runs
+    with ETH ticking again, then disconnects — ETH must be in the
+    resumed list and out of the stopped set."""
+    db, tmp = _tmp_db()
+    live_stream._save_flow_state(db, {"ETHUSD_otc": "10:44"}, [])
+    clock = _FakeClock(1_700_000_000)
+    # ETH always ticks in this run; the session disconnects after
+    # 3 polls so the loop returns.
+    session = _TickScriptSession(clock, eth_stop=1_700_000_000 + 10_000)
+    session.connected_polls = 3
+    real_time = live_stream.time
+    live_stream.time = clock
+    try:
+        asyncio.run(live_stream._poll_loop(
+            db, session, _ClockSleep(clock, max_calls=50),
+            assets=["BTCUSD_otc", "ETHUSD_otc"]))
+    except _StopLoop:
+        pass
+    finally:
+        live_stream.time = real_time
+    stopped, resumed = live_stream._load_flow_state(db)
+    assert "ETHUSD_otc" not in stopped, (stopped, resumed)
+    assert [a for a, _t in resumed] == ["ETHUSD_otc"], (stopped, resumed)
+    print("PASS x) disconnect detector: ticking asset recorded as RESUMED")
+
+
+def test_bot_status_shows_stopped_and_resumed():
+    """y) The owner, 2026-11-28: Bot Status shows the Stopped and
+    Resumed lists from the disconnect detector."""
+    import bot.handlers as handlers
+    from tests.test_multiselect import FakeQuery, _setup, _tmp_db
+    db, tmp = _tmp_db()
+    live_stream._save_flow_state(
+        db, {"EURUSD_otc": "10:44"}, [("GBPUSD_otc", "11:02")])
+    restore = _setup(db)
+    try:
+        q = FakeQuery("menu_status")
+        asyncio.run(handlers._run_bot_status(q, None))
+        result = q.texts[-1]
+        assert "Stopped:" in result, result
+        assert "EURUSD-OTC (10:44)" in result, result
+        assert "Resumed:" in result, result
+        assert "GBPUSD-OTC (11:02)" in result, result
+    finally:
+        restore()
+    print("PASS y) Bot Status shows Stopped and Resumed lists")
+
+
+async def _noop_sleep(seconds):
+    return None
+
+
+def test_tail_fill_retries_when_nothing_stored():
+    """v2) The owner, 2026-11-28: a reconnect's tail-fill that stores
+    nothing for stale assets (the AUDCAD_otc 00:18-00:20 gap waited
+    for the next 30-min collector run) retries once after 10s. The
+    first fetch returns nothing, the retry returns a candle — the
+    candle must reach the DB and the fetch must have run twice."""
+    db, tmp = _tmp_db()
+    now = datetime(2026, 11, 28, 0, 25, tzinfo=DHAKA)
+    db.insert_candles("AUDCAD_otc", [{
+        "ts": now.astimezone(timezone.utc) - timedelta(minutes=10),
+        "open": 1.0, "high": 1.1, "low": 0.9, "close": 1.05}])
+    fetched = []
+
+    class _RetrySession(FakeSession):
+        async def fetch_asset_span(self, asset, seconds_back):
+            fetched.append(asset)
+            if len(fetched) == 1:
+                return []
+            return [{"time": int(now.timestamp()) - 180, "open": 1.0,
+                     "high": 1.1, "low": 0.9, "close": 1.05}]
+
+    session = _RetrySession(tail_candles=[])
+    stored = asyncio.run(live_stream._tail_fill(
+        db, session, ["AUDCAD_otc"], now=now, sleep=_noop_sleep))
+    assert fetched == ["AUDCAD_otc", "AUDCAD_otc"], fetched
+    assert stored == 1, stored
+    print("PASS v2) tail-fill retries once when it stores nothing")
 
 
 class _YieldingClockSleep(_ClockSleep):
@@ -960,6 +1078,110 @@ def test_poll_loop_runs_while_tail_fill_is_slow():
     print("PASS w) poll loop stores live ticks while the tail-fill is slow")
 
 
+def test_tick_filter_drops_spike_and_keeps_shift():
+    """x) The owner, 2026-11-28: a bad tick (wrong price) poisons the
+    whole 1-min candle. A lone spike must be dropped; a genuine
+    level shift (two ticks agreeing at the new level) must be kept."""
+    last_price = {"BTCUSD_otc": 100.0}
+    suspects = {}
+    ticks = {"BTCUSD_otc": [
+        {"time": 100, "price": 100.1},
+        {"time": 101, "price": 200.0},  # lone spike — dropped
+        {"time": 102, "price": 100.2},
+        {"time": 103, "price": 105.5},  # jump — held as suspect
+        {"time": 104, "price": 105.6},  # confirms the shift — kept
+    ]}
+    out, dropped = live_stream._filter_ticks(ticks, last_price, suspects)
+    kept = [t["price"] for t in out["BTCUSD_otc"]]
+    assert kept == [100.1, 100.2, 105.5, 105.6], kept
+    assert dropped == 1, dropped
+    assert last_price["BTCUSD_otc"] == 105.6
+    print("PASS x) tick filter drops a lone spike and keeps a real shift")
+
+
+class _ScriptedTickSession(FakeSession):
+    """Ticks from a script: {minute_offset: [prices]} for the minute
+    containing the fake clock's now."""
+
+    def __init__(self, clock, script):
+        super().__init__(event_from_poll=999, tail_candles=[])
+        self.clock = clock
+        self.script = script
+        self.start_min = None
+
+    def generated_ticks(self):
+        now = int(self.clock.time())
+        cur_min = now - (now % 60)
+        if self.start_min is None:
+            self.start_min = cur_min
+        offset = (cur_min - self.start_min) // 60
+        prices = self.script.get(offset, [100.0])
+        return {"BTCUSD_otc": [
+            {"time": cur_min + 5 + i, "price": p}
+            for i, p in enumerate(prices)]}
+
+
+def test_tick_filter_drops_bad_tick_in_loop():
+    """y) Integration: a bad tick (price 200 when the market is 100)
+    must not poison the built candle — the stored candle's high
+    stays near 100, not 200."""
+    db, tmp = _tmp_db()
+    start = int(datetime(2026, 11, 28, 12, 0, tzinfo=timezone.utc).timestamp())
+    clock = _FakeClock(start)
+    db.insert_candles("BTCUSD_otc", [{
+        "ts": datetime.fromtimestamp(start - 60, tz=timezone.utc),
+        "open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0}])
+    script = {0: [100.0], 1: [100.0, 200.0, 100.1], 2: [100.1]}
+    session = _ScriptedTickSession(clock, script)
+    real_time = live_stream.time
+    live_stream.time = clock
+    try:
+        asyncio.run(live_stream.live_stream_loop(
+            db=db, session_factory=lambda: session,
+            sleep=_ClockSleep(clock, max_calls=40)))
+    except _StopLoop:
+        pass
+    finally:
+        live_stream.time = real_time
+    rows = db.get_candles("BTCUSD_otc", "2026-11-28")
+    by_time = {r["time"]: r for r in rows}
+    bad_min = start + 60  # minute offset 1 — the one with the bad tick
+    assert bad_min in by_time, by_time
+    assert by_time[bad_min]["H"] < 101.0, by_time[bad_min]
+    print("PASS y) tick filter drops a bad tick in the loop")
+
+
+def test_payouts_refresh_every_two_minutes():
+    """z) The owner, 2026-11-28: the Payouts board only updated when
+    the 30-min collector ran. The stream must refresh the payout
+    snapshot every 2 minutes from its own live session."""
+    db, tmp = _tmp_db()
+    start = int(datetime(2026, 11, 28, 12, 0, tzinfo=timezone.utc).timestamp())
+    clock = _FakeClock(start)
+    calls = []
+
+    class _PayoutSession(_TickScriptSession):
+        async def get_payouts(self):
+            calls.append(int(self.clock.time()))
+            return {"BTCUSD_otc": (95, True), "ETHUSD_otc": (90, True)}
+
+    session = _PayoutSession(clock, eth_stop=start + 10000)
+    real_time = live_stream.time
+    live_stream.time = clock
+    try:
+        asyncio.run(live_stream.live_stream_loop(
+            db=db, session_factory=lambda: session,
+            sleep=_ClockSleep(clock, max_calls=60)))
+    except _StopLoop:
+        pass
+    finally:
+        live_stream.time = real_time
+    # 60 polls x 5s = 300s of fake time -> refreshes at ~0s, ~120s, ~240s.
+    assert len(calls) >= 2, calls
+    assert db.get_payouts(), "no payouts stored"
+    print("PASS z) stream refreshes payouts every 2 minutes")
+
+
 if __name__ == "__main__":
     test_stream_stores_generated_candles()
     test_stream_reconnects_and_tail_fills()
@@ -983,5 +1205,12 @@ if __name__ == "__main__":
     test_never_ticked_cooldown_bounds_reconnects()
     test_stream_assets_includes_missing_recent_otc()
     test_tail_fill_skips_current_assets()
+    test_tail_fill_retries_when_nothing_stored()
+    test_disconnect_detector_records_stopped()
+    test_disconnect_detector_records_resumed()
+    test_bot_status_shows_stopped_and_resumed()
     test_poll_loop_runs_while_tail_fill_is_slow()
+    test_tick_filter_drops_spike_and_keeps_shift()
+    test_tick_filter_drops_bad_tick_in_loop()
+    test_payouts_refresh_every_two_minutes()
     print("ALL LIVE-STREAM TESTS PASSED")

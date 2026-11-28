@@ -138,11 +138,15 @@ def test_users_db_sqlite():
         until = database.grant_premium(123, days=30)
         assert database.is_premium(123) is True
         assert database.get_or_create_user(123)["premium_until"] == until
-        # Auto signals subscribe / list.
+        # Auto signals subscribe / list (the owner, 2026-11-28: the
+        # subscriber list is (telegram_id, market) pairs, and only
+        # users who picked a market are listed).
         assert database.get_auto_subscribers() == []
         database.set_auto_signals(123, True)
         assert database.is_auto_subscriber(123) is True
-        assert database.get_auto_subscribers() == [123]
+        assert database.get_auto_subscribers() == []
+        database.set_auto_asset(123, "BTCUSD_otc")
+        assert database.get_auto_subscribers() == [(123, "BTCUSD_otc")]
         database.set_auto_signals(123, False)
         assert database.get_auto_subscribers() == []
         # Premium request round-trip + approve.

@@ -624,49 +624,6 @@ class _FakeBot:
         self.sent.append((chat_id, text))
 
 
-def test_auto_signals_sent_once_per_window():
-    """j) The owner, 2026-11-27: the collector now runs every 30 min,
-    so two runs in one hour would send the same next-hour window
-    twice. One window is sent only once — the second call for the
-    same window sends nothing. Three synthetic days feed the
-    generator; strong CALLs are forced at the next hour's :00/:07/:14
-    on every day so the window always has signals."""
-    from bot.collector import _send_auto_signals, dhaka_now
-    import bot.database as users_db
-    from synthetic_data import force_candle, make_day, to_raw
-
-    db = _tmp_db()
-    now = dhaka_now()
-    start_dt = (now + timedelta(hours=1)).replace(
-        minute=0, second=0, microsecond=0)
-    hh = start_dt.strftime("%H")
-    today = now.date()
-    dates = [(today - timedelta(days=i)).strftime("%Y-%m-%d")
-             for i in (3, 2, 1)]
-    for k, d in enumerate(dates):
-        day = make_day("USDMXN_otc", d, seed=7 + k)
-        for mm in ("00", "07", "14"):
-            force_candle(day, f"{hh}:{mm}", "CALL")
-        rows = rows_from_raw(to_raw(day))
-        db.insert_candles("USDMXN_otc", rows)
-    bot = _FakeBot()
-    old = users_db.get_auto_subscribers
-    users_db.get_auto_subscribers = lambda: [123]
-    try:
-        asyncio.run(_send_auto_signals(bot, db))
-        assert len(bot.sent) == 1, bot.sent
-        assert "AUTO SIGNALS" in bot.sent[0][1], bot.sent[0][1][:80]
-        end_hh = (start_dt + timedelta(hours=1)).strftime("%H")
-        key = db.get_state("auto_signal_window")
-        assert key == (start_dt.strftime("%Y-%m-%d")
-                       + f" {hh}:00-{end_hh}:59"), key
-        asyncio.run(_send_auto_signals(bot, db))
-        assert len(bot.sent) == 1, "second call re-sent the same window"
-    finally:
-        users_db.get_auto_subscribers = old
-    print("PASS j) auto signals sent once per window (30-min runs)")
-
-
 def test_loop_retries_failed_run_once():
     """k) The owner, 2026-11-27: the collector's 17:45 run died at
     login ("Error on access page: 403") and the next run was 30
@@ -874,12 +831,11 @@ def main():
     test_post_init_starts_collector_only_when_active()
     test_handlers_db_end_to_end()
     test_incremental_retries_failed_assets()
-    test_auto_signals_sent_once_per_window()
     test_loop_retries_failed_run_once()
     test_incremental_includes_missing_recent_otc_assets()
     test_find_gaps_detects_missing_ranges()
     test_fill_gaps_fills_missing_ranges()
-    print("ALL TESTS PASSED (19/19)")
+    print("ALL TESTS PASSED (18/18)")
 
 
 if __name__ == "__main__":
