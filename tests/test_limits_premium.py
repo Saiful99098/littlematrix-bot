@@ -16,6 +16,8 @@ d) Fix 9: save_premium_request stores the plan days and
 e) My Status limits block: a free user sees every limited
    feature's uses today plus Auto Live minutes; a premium user
    gets an empty string (unlimited).
+f) Admin exemption (the owner, 2026-11-28): the owner has NO
+   limits — always allowed, never counted, no limits block.
 """
 from __future__ import annotations
 
@@ -235,10 +237,43 @@ def test_today_limits_text():
     print("PASS e) My Status limits block: free sees uses, premium sees none")
 
 
+def test_admin_has_no_limits():
+    """f) Admin exemption: the owner (ADMIN_USER_IDS) is always
+    allowed, uses are never counted, and My Status shows no
+    limits block — even though the owner is NOT premium."""
+    import bot.handlers as handlers
+    from bot import config as config_mod
+    restore = _setup_users()
+    old_admins = config_mod.ADMIN_USER_IDS
+    try:
+        config_mod.ADMIN_USER_IDS = {999}
+        today = handlers._today_date_str()
+        # The owner is not premium in the DB…
+        assert database.is_premium(999) is False
+        # …yet is always allowed, even after 5 uses of a feature.
+        for _ in range(5):
+            handlers._free_feature_use(999, "ai_signal")
+        assert database.get_usage(999, "ai_signal", today) == 0
+        assert handlers._free_feature_allowed(999, "ai_signal") is True
+        assert handlers._free_feature_allowed(999, "news") is True
+        # And My Status shows no limits block for the owner.
+        assert handlers._today_limits_text(999) == ""
+        # A non-admin free user is still limited (sanity check).
+        for _ in range(3):
+            handlers._free_feature_use(123, "ai_signal")
+        assert handlers._free_feature_allowed(123, "ai_signal") is False
+        assert handlers._today_limits_text(123) != ""
+    finally:
+        config_mod.ADMIN_USER_IDS = old_admins
+        restore()
+    print("PASS f) admin has no limits: always allowed, never counted")
+
+
 if __name__ == "__main__":
     test_usage_round_trip()
     test_free_feature_allowed()
     test_bot_on_off_per_tier()
     test_premium_plan_days()
     test_today_limits_text()
+    test_admin_has_no_limits()
     print("ALL LIMITS/PREMIUM TESTS PASSED")

@@ -415,14 +415,16 @@ async def _auto_live_tick(bot, db, now_fn=None):
     # Free Auto Live is 30 minutes a day (the owner, 2026-11-28):
     # one tick = one minute of being ON. A free user who hits the
     # limit is turned OFF (pending results cancelled) and told to
-    # get Premium. Premium users are unlimited. A DB error never
-    # turns anyone off — on error the user is treated as premium.
+    # get Premium. Premium users and the owner (admin) are
+    # unlimited. A DB error never turns anyone off — on error the
+    # user is treated as premium.
     try:
         if users_db is not None:
             today_str = now.strftime("%Y-%m-%d")
             for _uid in sorted({uid for uid, _a in (subs or [])}):
                 try:
-                    _is_prem = users_db.is_premium(_uid)
+                    _is_prem = (_uid in config.ADMIN_USER_IDS
+                                or users_db.is_premium(_uid))
                 except Exception:
                     _is_prem = True
                 if _is_prem:

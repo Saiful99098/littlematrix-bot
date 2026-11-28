@@ -253,10 +253,12 @@ _LIMIT_LABELS = [("ai_signal", "AI Signal"),
 def _today_limits_text(user_id):
     """The 'Today's limits' block for My Status (the owner,
     2026-11-28): free users see each limited feature's uses
-    today (used/3) plus Auto Live minutes (used/30). Premium
-    users get an empty string — they are unlimited. Never
-    raises; a DB error hides the block rather than breaking
+    today (used/3) plus Auto Live minutes (used/30). The owner
+    and premium users get an empty string — they are unlimited.
+    Never raises; a DB error hides the block rather than breaking
     My Status."""
+    if _is_admin(user_id):
+        return ""
     try:
         if database.is_premium(user_id):
             return ""
@@ -277,9 +279,11 @@ def _today_limits_text(user_id):
 
 
 def _free_feature_allowed(user_id, feature):
-    """True when the user may run `feature` now: premium users
-    always, free users while under today's limit. A DB error never
-    blocks a user — it fails open."""
+    """True when the user may run `feature` now: the owner (admin)
+    and premium users always, free users while under today's limit.
+    A DB error never blocks a user — it fails open."""
+    if _is_admin(user_id):
+        return True
     try:
         if database.is_premium(user_id):
             return True
@@ -293,8 +297,10 @@ def _free_feature_allowed(user_id, feature):
 
 
 def _free_feature_use(user_id, feature):
-    """Count one use of `feature` for a free user (premium users
-    are never counted). Never raises."""
+    """Count one use of `feature` for a free user (the owner and
+    premium users are never counted). Never raises."""
+    if _is_admin(user_id):
+        return
     try:
         if database.is_premium(user_id):
             return
@@ -2127,9 +2133,10 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if on:
             # Free Auto Live is 30 minutes a day (the owner,
             # 2026-11-28): a free user who already used them cannot
-            # turn it back ON today — a DB error never blocks.
+            # turn it back ON today — the owner (admin) is never
+            # limited. A DB error never blocks.
             try:
-                _prem = database.is_premium(user.id)
+                _prem = _is_admin(user.id) or database.is_premium(user.id)
             except Exception:
                 _prem = True
             if not _prem:

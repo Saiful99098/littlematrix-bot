@@ -726,9 +726,11 @@ def test_auto_live_channel_copy_is_photo_plus_text():
 def test_auto_live_free_minutes_limit():
     """Fix 10 (2026-11-28): a free user with 29 used Auto Live
     minutes is turned OFF after one tick and gets a limit message;
-    a premium user with the same usage is not turned off."""
+    a premium user with the same usage is not turned off. The
+    owner (admin) is never limited either."""
     db = _tmp_candle_db()
     restore = _setup_users()
+    old_admins = config.ADMIN_USER_IDS
     try:
         start = datetime(2026, 11, 28, 12, 0, tzinfo=DHAKA)
         clock = _FakeClock(start.timestamp())
@@ -745,8 +747,13 @@ def test_auto_live_free_minutes_limit():
         database.set_auto_asset(124, "BTCUSD_otc")
         database.set_auto_signals(124, True)
         database.grant_premium(124, days=30)
+        # Admin 999: not premium, but the owner — never limited.
+        config.ADMIN_USER_IDS = {999}
+        database.set_auto_asset(999, "BTCUSD_otc")
+        database.set_auto_signals(999, True)
         database.increment_usage(123, "auto_live", "2026-11-28", 29)
         database.increment_usage(124, "auto_live", "2026-11-28", 29)
+        database.increment_usage(999, "auto_live", "2026-11-28", 29)
         bot = FakeBot()
         asyncio.run(auto_live._auto_live_tick(bot, db, now_fn=_now_fn(clock)))
         # Free user 123: 29 + 1 = 30 -> OFF + limit message.
@@ -760,7 +767,13 @@ def test_auto_live_free_minutes_limit():
         assert database.is_auto_subscriber(124) is True
         assert database.get_usage(124, "auto_live", "2026-11-28") == 29
         assert [m for m in bot.messages if m[0] == 124] == []
+        # Admin 999: untouched, still ON, no message, minutes never
+        # counted — the owner has no limits.
+        assert database.is_auto_subscriber(999) is True
+        assert database.get_usage(999, "auto_live", "2026-11-28") == 29
+        assert [m for m in bot.messages if m[0] == 999] == []
     finally:
+        config.ADMIN_USER_IDS = old_admins
         restore()
     print("PASS Fix 10) auto live: free user turned OFF at 30 minutes, premium untouched")
 
