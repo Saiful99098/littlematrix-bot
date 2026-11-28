@@ -135,6 +135,16 @@ async def post_init(app):
     starts. Starts the background candle collector (db mode only).
     The collector is a background asyncio task — it never blocks
     the bot from answering Telegram."""
+    # Menu button beside the message field (the owner, 2026-11-28,
+    # BELL BOT style): registering /start makes Telegram show the
+    # Menu button, and tapping it runs /start and opens the main
+    # menu. First in post_init so it always runs, even when the
+    # collector is off.
+    try:
+        from telegram import BotCommand
+        await app.bot.set_my_commands([BotCommand("start", "Main menu")])
+    except Exception:
+        logger.warning("could not set bot commands", exc_info=True)
     if config.collector_active():
         logger.info("collector enabled (DATA_MODE=db) — starting background task")
         _restart_task(app, "collector_task",

@@ -227,13 +227,38 @@ async def _send_photo_or_text(bot, chat_id, png, caption, what):
         return False
 
 
+async def _send_channel_copy(bot, chat_id, png, caption, what):
+    """Send a chart photo + caption to the channel as TWO messages:
+    the photo WITHOUT a caption, then the caption as a separate text
+    message. Telegram renders <tg-emoji> tags in a channel photo
+    caption as the plain fallback emoji (the owner, 2026-11-28:
+    the DM shows the premium sticker, the channel shows the plain
+    emoji) — a text message gives the custom premium emoji a chance
+    to render. The tradeoff: the channel gets two messages per
+    signal/result (photo + caption text) instead of one. If the
+    channel text still shows the fallback, that is Telegram's
+    platform behaviour, not the code — there is no other mechanism."""
+    if png is not None:
+        try:
+            await bot.send_photo(chat_id=chat_id, photo=png, caption=None)
+        except Exception as exc:
+            logger.warning("auto live: %s channel photo to %s failed: %s",
+                           what, chat_id, exc)
+    try:
+        await bot.send_message(chat_id=chat_id, text=caption,
+                               parse_mode="HTML")
+    except Exception as exc:
+        logger.warning("auto live: %s channel caption to %s failed: %s",
+                       what, chat_id, exc)
+
+
 async def _send_signal(bot, db, uid, asset, minute_key, direction, now,
                        mtg1=False, extra_chats=()):
     candles = _recent_chart_candles(db, asset, now)
     hhmm = minute_key[11:16]
     mode = " (MTG1)" if mtg1 else ""
     caption = (f"{pe('bell')} {display_asset(asset)} — {hhmm} M1 {direction}\n"
-               f"{pe('diamond')} Auto Live Signal{mode} — all four checks agree.")
+               f"{pe('diamond')} Auto Live Signal{mode}")
     try:
         png = draw_candles_png(
             candles, title=f"{display_asset(asset)} {hhmm} M1 {direction}")
@@ -241,7 +266,7 @@ async def _send_signal(bot, db, uid, asset, minute_key, direction, now,
         png = None
     await _send_photo_or_text(bot, uid, png, caption, "signal")
     for chat_id in extra_chats:
-        await _send_photo_or_text(bot, chat_id, png, caption, "signal")
+        await _send_channel_copy(bot, chat_id, png, caption, "signal")
     logger.info("auto live: signal %s %s %s to %s",
                 asset, minute_key, direction, uid)
 
@@ -284,7 +309,7 @@ async def _send_result(bot, db, sig, outcome, candle, now, extra_chats=()):
         png = None
     await _send_photo_or_text(bot, uid, png, caption, "result")
     for chat_id in extra_chats:
-        await _send_photo_or_text(bot, chat_id, png, caption, "result")
+        await _send_channel_copy(bot, chat_id, png, caption, "result")
     logger.info("auto live: result %s %s %s to %s",
                 asset, sig["minute"], outcome, uid)
 
@@ -319,8 +344,8 @@ def _summary_text(entries):
     acc = f"{wins}/{total} = {wins * 100 // total}%" if total else "—"
     return (
         f"DATE: {pe('sparkle')}{d}.{m}.{y}{pe('star')}\n"
-        f"{pe('bell')}{pe('diamond')} Auto Live Signal — "
-        f"{len(entries)} Signals Summary\n"
+        f"\n"
+        f"{pe('bell')} Auto Live Signal {pe('diamond')}\n"
         f"\n"
         + "\n".join(lines)
         + f"\n\n{pe('crown')} Accuracy: {acc}")
@@ -410,6 +435,48 @@ async def _auto_live_tick(bot, db, now_fn=None):
         subs = users_db.get_auto_subscribers() if users_db else []
     except Exception:
         subs = []
+    # Free Auto Live is 30 minutes a day (the owner, 2026-11-28):
+    # one tick = one minute of being ON. A free user who hits the
+    # limit is turned OFF (pending results cancelled) and told to
+    # get Premium. Premium users are unlimited. A DB error never
+    # turns anyone off — on error the user is treated as premium.
+    try:
+        if users_db is not None:
+            today_str = now.strftime("%Y-%m-%d")
+            for _uid in sorted({uid for uid, _a in (subs or [])}):
+                try:
+                    _is_prem = users_db.is_premium(_uid)
+                except Exception:
+                    _is_prem = True
+                if _is_prem:
+                    continue
+                try:
+                    _count = users_db.increment_usage(
+                        _uid, "auto_live", today_str)
+                except Exception:
+                    continue
+                if _count >= config.AUTO_LIVE_FREE_MINUTES:
+                    try:
+                        users_db.set_auto_signals(_uid, False)
+                    except Exception:
+                        pass
+                    cancel_pending_for_user(db, _uid)
+                    try:
+                        from .handlers import _limit_text as _handlers_limit_text
+                        _limit_msg = _handlers_limit_text()
+                    except Exception:
+                        _limit_msg = ("Your limit is reached for today. "
+                                      "Get Premium for unlimited use.")
+                    try:
+                        await bot.send_message(chat_id=_uid, text=_limit_msg,
+                                               parse_mode="HTML")
+                    except Exception:
+                        pass
+                    logger.info("auto live: free user %s hit the %d-minute "
+                                "daily limit", _uid,
+                                config.AUTO_LIVE_FREE_MINUTES)
+    except Exception as exc:
+        logger.warning("auto live: daily-minutes check failed: %s", exc)
     for uid, asset in subs or []:
         if not asset:
             continue

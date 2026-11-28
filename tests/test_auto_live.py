@@ -148,6 +148,8 @@ def test_auto_live_signal_and_result():
             pass
         assert len(bot.photos) == 1, bot.photos
         assert "12:01" in bot.photos[0][2] and "CALL" in bot.photos[0][2], bot.photos[0][2]
+        # Fix 5 (2026-11-28): no "all four checks agree" in the caption.
+        assert "all four checks agree" not in bot.photos[0][2], bot.photos[0][2]
         assert bot.photos[0][1][:8] == PNG_MAGIC, "signal photo is not a PNG"
         # The 12:01 candle closes as a WIN for the CALL.
         db.insert_candles("BTCUSD_otc", [{
@@ -253,6 +255,8 @@ def test_auto_live_result_within_5s_of_close():
         asyncio.run(auto_live._auto_live_tick(bot, db, now_fn=_now_fn(clock)))
         assert len(bot.photos) == 1, bot.photos
         assert "tg-emoji" in bot.photos[0][2], "signal caption has no premium sticker"
+        # Fix 5 (2026-11-28): no "all four checks agree" in the caption.
+        assert "all four checks agree" not in bot.photos[0][2], bot.photos[0][2]
         # Stop new signals WITHOUT turning OFF: turning OFF would
         # cancel the pending result (Fix 2, 2026-11-28). Clearing
         # the picked markets stops new signals but keeps the
@@ -348,7 +352,10 @@ def test_auto_live_five_signal_summary():
         assert len(bot.photos) == 5, bot.photos
         assert len(bot.messages) == 1, bot.messages
         summary = bot.messages[0][1]
-        assert "5 Signals Summary" in summary, summary
+        # Fix 6 (2026-11-28): no "Signals Summary" — the header is
+        # "Auto Live Signal" with a premium emoji on BOTH sides,
+        # and there is a blank line directly below the DATE line.
+        assert "Signals Summary" not in summary, summary
         assert "Accuracy: 5/5" in summary, summary
         assert "tg-emoji" in summary, "summary has no premium sticker"
         # Fix 3 (2026-11-28): CHECKER format — date at the top,
@@ -358,7 +365,11 @@ def test_auto_live_five_signal_summary():
         assert "<code>" in summary, "summary signals are not monospace"
         lines = summary.split("\n")
         assert lines[0].startswith("DATE:"), lines
-        assert lines[2] == "", lines  # gap below the header
+        assert lines[1] == "", lines  # blank line below the DATE line
+        assert "Auto Live Signal" in lines[2], lines
+        assert (lines[2].startswith("<tg-emoji")
+                and lines[2].rstrip().endswith("</tg-emoji>")), lines
+        assert lines[3] == "", lines  # gap below the header
         assert lines[-2] == "", lines  # gap above Accuracy
         assert "Accuracy:" in lines[-1], lines
         sig_lines = [ln for ln in lines if ln.startswith("<code>")]
@@ -628,8 +639,17 @@ def test_auto_live_summary_stickers_aligned():
     ]
     text = auto_live._summary_text(entries)
     assert "DATE:" in text and "28.11.2026" in text, text
-    assert "5 Signals Summary" in text, text
+    # Fix 6 (2026-11-28): no "Signals Summary" — the header is
+    # "Auto Live Signal" with a premium emoji on BOTH sides, and
+    # there is a blank line directly below the DATE line.
+    assert "Signals Summary" not in text, text
     lines = text.split("\n")
+    assert lines[0].startswith("DATE:"), lines
+    assert lines[1] == "", lines  # blank line below the DATE line
+    header = [ln for ln in lines if "Auto Live Signal" in ln]
+    assert len(header) == 1, lines
+    assert (header[0].startswith("<tg-emoji")
+            and header[0].rstrip().endswith("</tg-emoji>")), header
     sig_lines = [ln for ln in lines if ln.startswith("<code>")]
     assert len(sig_lines) == 5, sig_lines
     # Every monospace block has the same length (padded) — the
@@ -640,6 +660,101 @@ def test_auto_live_summary_stickers_aligned():
     assert "</tg-emoji>." in text, text
     assert "Accuracy: 3/4" in text, text
     print("PASS Fix 3) auto live summary: stickers aligned in one column")
+
+
+def test_auto_live_channel_copy_is_photo_plus_text():
+    """Fix 1 (2026-11-28): the channel gets a signal/result as a
+    photo WITHOUT a caption plus the caption as a separate text
+    message (Telegram renders <tg-emoji> in a channel photo caption
+    as the plain fallback emoji); the DM still gets photo + caption."""
+    db = _tmp_candle_db()
+    restore = _setup_users()
+    old_admins = config.ADMIN_USER_IDS
+    old_channel = config.REQUIRED_CHANNEL
+    try:
+        start = datetime(2026, 11, 28, 12, 0, tzinfo=DHAKA)
+        clock = _FakeClock(start.timestamp())
+        _seed_bullish(db, "BTCUSD_otc", start)
+        config.ADMIN_USER_IDS = {123}
+        config.REQUIRED_CHANNEL = "-100123"
+        database.set_auto_asset(123, "BTCUSD_otc")
+        database.set_auto_signals(123, True)
+        auto_live.set_channel_send(db, True)
+        bot = FakeBot()
+        # Tick 1: signal for 12:01.
+        asyncio.run(auto_live._auto_live_tick(bot, db, now_fn=_now_fn(clock)))
+        assert len(bot.photos) == 2, bot.photos
+        dm_photo = [p for p in bot.photos if p[0] == 123]
+        ch_photo = [p for p in bot.photos if p[0] == "-100123"]
+        assert len(dm_photo) == 1 and len(ch_photo) == 1, bot.photos
+        assert dm_photo[0][2] is not None and "tg-emoji" in dm_photo[0][2]
+        assert ch_photo[0][2] is None, ch_photo  # channel photo: no caption
+        ch_text = [m for m in bot.messages if m[0] == "-100123"]
+        assert len(ch_text) == 1, bot.messages
+        assert "12:01" in ch_text[0][1] and "CALL" in ch_text[0][1], ch_text
+        assert "tg-emoji" in ch_text[0][1], ch_text
+        # Stop new signals WITHOUT turning OFF (Fix 2), then the
+        # 12:01 candle wins — the result follows the same split.
+        database.set_auto_assets(123, [])
+        db.insert_candles("BTCUSD_otc", [{
+            "ts": datetime(2026, 11, 28, 12, 1, tzinfo=DHAKA),
+            "open": 100.0, "high": 100.3, "low": 99.9, "close": 100.2}])
+        clock.now += 125
+        asyncio.run(auto_live._auto_live_tick(bot, db, now_fn=_now_fn(clock)))
+        assert len(bot.photos) == 4, bot.photos
+        ch_result_photo = [p for p in bot.photos[2:] if p[0] == "-100123"]
+        assert len(ch_result_photo) == 1 and ch_result_photo[0][2] is None
+        ch_result_text = [m for m in bot.messages if m[0] == "-100123"]
+        assert len(ch_result_text) == 2, bot.messages
+        assert "WIN" not in ch_result_text[1][1], ch_result_text
+        assert "tg-emoji" in ch_result_text[1][1], ch_result_text
+    finally:
+        config.ADMIN_USER_IDS = old_admins
+        config.REQUIRED_CHANNEL = old_channel
+        restore()
+    print("PASS Fix 1) auto live channel copy: photo without caption + caption text")
+
+
+def test_auto_live_free_minutes_limit():
+    """Fix 10 (2026-11-28): a free user with 29 used Auto Live
+    minutes is turned OFF after one tick and gets a limit message;
+    a premium user with the same usage is not turned off."""
+    db = _tmp_candle_db()
+    restore = _setup_users()
+    try:
+        start = datetime(2026, 11, 28, 12, 0, tzinfo=DHAKA)
+        clock = _FakeClock(start.timestamp())
+        # Flat candles: no signal this tick — the minutes block is
+        # what is being tested, not the analysis.
+        today = start.strftime("%Y-%m-%d")
+        d = datetime.strptime(today, "%Y-%m-%d").replace(tzinfo=DHAKA)
+        rows = [{"ts": d + timedelta(hours=9, minutes=i),
+                 "open": 100.0, "high": 100.05, "low": 99.95,
+                 "close": 100.0} for i in range(60)]
+        db.insert_candles("BTCUSD_otc", rows)
+        database.set_auto_asset(123, "BTCUSD_otc")
+        database.set_auto_signals(123, True)
+        database.set_auto_asset(124, "BTCUSD_otc")
+        database.set_auto_signals(124, True)
+        database.grant_premium(124, days=30)
+        database.increment_usage(123, "auto_live", "2026-11-28", 29)
+        database.increment_usage(124, "auto_live", "2026-11-28", 29)
+        bot = FakeBot()
+        asyncio.run(auto_live._auto_live_tick(bot, db, now_fn=_now_fn(clock)))
+        # Free user 123: 29 + 1 = 30 -> OFF + limit message.
+        assert database.is_auto_subscriber(123) is False
+        assert database.get_usage(123, "auto_live", "2026-11-28") == 30
+        limit_msgs = [m for m in bot.messages if m[0] == 123]
+        assert len(limit_msgs) == 1, bot.messages
+        assert "Your limit is reached" in limit_msgs[0][1], limit_msgs
+        # Premium user 124: untouched, still ON, no message, and
+        # their minutes were never counted.
+        assert database.is_auto_subscriber(124) is True
+        assert database.get_usage(124, "auto_live", "2026-11-28") == 29
+        assert [m for m in bot.messages if m[0] == 124] == []
+    finally:
+        restore()
+    print("PASS Fix 10) auto live: free user turned OFF at 30 minutes, premium untouched")
 
 
 if __name__ == "__main__":
@@ -657,4 +772,6 @@ if __name__ == "__main__":
     test_auto_live_toggle_off_cancels_pending()
     test_auto_live_off_user_gets_no_result()
     test_auto_live_summary_stickers_aligned()
+    test_auto_live_channel_copy_is_photo_plus_text()
+    test_auto_live_free_minutes_limit()
     print("ALL AUTO-LIVE TESTS PASSED")

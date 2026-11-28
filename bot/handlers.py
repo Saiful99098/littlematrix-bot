@@ -109,6 +109,11 @@ def _url_btn(text, url, icon=None):
     return InlineKeyboardButton(text, url=url, **kwargs)
 
 
+# Premium plans (the owner, 2026-11-28): (price in USD, days).
+# $2 = 1 day, $3 = 5 days, $5 = 15 days, $8 = 1 month (30 days).
+PREMIUM_PLANS = [(2, 1), (3, 5), (5, 15), (8, 30)]
+
+
 # Main menu: all 21 buttons carry a premium icon; their text is
 # plain (premium-only, per the owner). If an icon does not render
 # (old client / old library), the button still shows its text.
@@ -132,7 +137,7 @@ MAIN_MENU = [
     [_btn("About", "menu_about", icon="about"),
      _btn("Auto Signals", "menu_autolive", icon="autolive")],
     [_btn("Referral — Earn Coins", "menu_referral", icon="premium")],
-    [_btn("Premium — 5 USDT", "menu_premium", icon="premium", style="primary")],
+    [_btn("Get Premium", "menu_premium", icon="premium", style="primary")],
     [_url_btn("Contact Owner", "https://t.me/LittleMatrix", icon="contact")],
 ]
 
@@ -172,6 +177,111 @@ def _is_admin(user_id):
 
 
 # ---------------------------------------------------------------------------
+# Bot ON/OFF per tier (the owner, 2026-11-28)
+# ---------------------------------------------------------------------------
+# Two switches in the candle DB state (default "1" = ON): the owner
+# flips them from the Admin Dashboard. When a tier is OFF, that
+# tier's users get the off text instead of any tool.
+_BOT_ON_FREE_KEY = "bot_on_free"
+_BOT_ON_PREMIUM_KEY = "bot_on_premium"
+
+
+def _bot_on_for(user_id):
+    """True when the bot is ON for this user. The owner is always
+    on; everyone else follows their tier's switch. A DB error never
+    turns the bot off — it fails open."""
+    if _is_admin(user_id):
+        return True
+    try:
+        premium = database.is_premium(user_id)
+    except Exception:
+        premium = False
+    key = _BOT_ON_PREMIUM_KEY if premium else _BOT_ON_FREE_KEY
+    try:
+        return _db().get_state(key, "1") != "0"
+    except Exception:
+        return True
+
+
+def _bot_off_text(user_id):
+    """The off message for this user's tier (exact wording)."""
+    try:
+        premium = database.is_premium(user_id)
+    except Exception:
+        premium = False
+    if premium:
+        return "The Blue Fish Prime was currently off for premium user."
+    return "The Blue Fish Prime was currently off for free user."
+
+
+def _bot_off_keyboard():
+    """Keyboard under the off message: a switched-off user can still
+    buy Premium (the purchase flow is gate-exempt), which makes them
+    a premium user — so the off text always offers a way back in,
+    even when they have no live menu left."""
+    return InlineKeyboardMarkup([
+        [_btn("Get Premium", "menu_premium", icon="premium",
+              style="primary")]])
+
+
+# ---------------------------------------------------------------------------
+# Free-user daily limits (the owner, 2026-11-28)
+# ---------------------------------------------------------------------------
+# Premium users are unlimited everywhere. Free users get
+# FREE_DAILY_LIMIT uses a day of each limited feature; Futures
+# Signal OTC and CHECKER are unlimited for everyone (no gate).
+# Auto Live has its own 30-minutes-a-day budget, enforced in the
+# auto-live loop (bot/auto_live.py), not here.
+_LIMITED_FEATURES = {"ai_signal", "market_live", "payouts",
+                     "candle_scan", "trend_scan", "backtest", "news",
+                     "swap", "formatter", "filter"}
+
+
+def _free_feature_allowed(user_id, feature):
+    """True when the user may run `feature` now: premium users
+    always, free users while under today's limit. A DB error never
+    blocks a user — it fails open."""
+    try:
+        if database.is_premium(user_id):
+            return True
+    except Exception:
+        return True
+    try:
+        return (database.get_usage(user_id, feature, _today_date_str())
+                < config.FREE_DAILY_LIMIT)
+    except Exception:
+        return True
+
+
+def _free_feature_use(user_id, feature):
+    """Count one use of `feature` for a free user (premium users
+    are never counted). Never raises."""
+    try:
+        if database.is_premium(user_id):
+            return
+    except Exception:
+        return
+    try:
+        database.increment_usage(user_id, feature, _today_date_str())
+    except Exception:
+        pass
+
+
+def _limit_text():
+    """The limit message (the phrase 'Your limit is reached' is
+    exact — the owner, 2026-11-28)."""
+    return (f"{pe('warning')} Your limit is reached for today.\n\n"
+            "Get Premium for unlimited use.")
+
+
+def _limit_keyboard():
+    """Get Premium + Back, under a limit message."""
+    return InlineKeyboardMarkup([
+        [_btn("Get Premium", "menu_premium", icon="premium", style="primary")],
+        [_btn("Back to Menu", "menu_main", icon="back")]])
+
+
+# ---------------------------------------------------------------------------
 # Admin Dashboard (the owner, 2026-11-27)
 # ---------------------------------------------------------------------------
 # user_id -> {"task": asyncio.Task} for the live dashboard refresh.
@@ -197,13 +307,29 @@ def _admin_dashboard_text(stats):
 
 def _admin_dashboard_keyboard(stats):
     """The counts themselves are display-only buttons (like the
-    payouts grid): tapping one does nothing (admin_stat_noop)."""
+    payouts grid): tapping one does nothing (admin_stat_noop).
+    The Bot ON/OFF rows (the owner, 2026-11-28) flip the per-tier
+    switches in the candle DB state; a tier that is OFF shows OFF
+    and its users get the off text instead of any tool."""
+    try:
+        free_on = _db().get_state(_BOT_ON_FREE_KEY, "1") != "0"
+    except Exception:
+        free_on = True
+    try:
+        premium_on = _db().get_state(_BOT_ON_PREMIUM_KEY, "1") != "0"
+    except Exception:
+        premium_on = True
     return InlineKeyboardMarkup([
         [_btn(f"Total Users: {stats['total']}", "admin_stat_noop", icon="info"),
          _btn(f"Online Now: {stats['online']}", "admin_stat_noop", icon="green")],
         [_btn(f"Premium: {stats['premium']}", "admin_stat_noop", icon="premium"),
          _btn(f"Free: {stats['free']}", "admin_stat_noop", icon="status")],
         [_btn("Fill Gaps", "admin_fill_gaps", icon="refresh")],
+        [_btn(f"Bot ON for Free Users: {'ON' if free_on else 'OFF'}",
+              "admin_bot_free", icon="toggle_on" if free_on else "toggle_off")],
+        [_btn(f"Bot ON for Premium Users: {'ON' if premium_on else 'OFF'}",
+              "admin_bot_premium",
+              icon="toggle_on" if premium_on else "toggle_off")],
         [_btn("Back to Menu", "menu_main", icon="back")]])
 
 
@@ -965,6 +1091,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
     _cancel_admin_dash(user.id)
     database.get_or_create_user(user.id, user.username or "")
+    # Bot ON/OFF per tier (the owner, 2026-11-28): when the owner
+    # switched the bot off for this user's tier, /start answers
+    # with the off text instead of the menu.
+    if not _bot_on_for(user.id):
+        off = _bot_off_text(user.id)
+        if update.message:
+            await update.message.reply_text(
+                off, reply_markup=_bot_off_keyboard(), parse_mode="HTML")
+        elif update.callback_query:
+            await update.callback_query.edit_message_text(
+                off, reply_markup=_bot_off_keyboard(), parse_mode="HTML")
+        return
     if not await _is_channel_member(context.bot, user.id):
         text = _join_gate_text()
         if update.message:
@@ -1096,7 +1234,8 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # stays open), and menu_admin re-opens it (which restarts the
     # loop itself). This runs before the channel gate, so even a
     # gate-blocked tap stops the loop.
-    if data not in ("menu_admin", "admin_stat_noop", "admin_fill_gaps"):
+    if data not in ("menu_admin", "admin_stat_noop", "admin_fill_gaps",
+                    "admin_bot_free", "admin_bot_premium"):
         _cancel_admin_dash(user.id)
     database.get_or_create_user(user.id, user.username or "")
 
@@ -1110,6 +1249,22 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 _join_gate_text(), reply_markup=_join_keyboard(),
                 parse_mode="HTML")
             return
+
+    # Bot ON/OFF per tier (the owner, 2026-11-28): when the owner
+    # switched the bot off for this user's tier, every tap answers
+    # with the off text — except the channel re-check, premium
+    # decisions, and buying Premium itself (a switched-off user
+    # can still buy Premium).
+    if (data != "check_member"
+            and not data.startswith("premium_approve_")
+            and not data.startswith("premium_reject_")
+            and data != "menu_premium"
+            and not data.startswith("premium_plan_")
+            and not _bot_on_for(user.id)):
+        await query.edit_message_text(
+            _bot_off_text(user.id), reply_markup=_bot_off_keyboard(),
+            parse_mode="HTML")
+        return
 
     if data == "refresh":
         # Re-run exactly the result shown in THIS message (stored by
@@ -1186,13 +1341,17 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                           reply_markup=back_keyboard(), parse_mode="HTML")
             return
         if approve:
-            until = database.grant_premium(req["telegram_id"], days=30)
+            # The plan length the user picked (the owner,
+            # 2026-11-28: $2/1 day, $3/5, $5/15, $8/30) — never a
+            # hardcoded 30 days.
+            days = req.get("days", 30) or 30
+            until = database.grant_premium(req["telegram_id"], days=days)
             database.set_premium_request_status(req_id, "approved")
-            verdict = f"Approved — premium until {until}."
+            verdict = f"Approved — {days} day(s) premium until {until}."
             try:
                 await context.bot.send_message(
                     chat_id=req["telegram_id"],
-                    text=f"{pe('crown')}{pe('diamond')} Your BLUE FISH PRIME Premium is active! "
+                    text=f"{pe('crown')}{pe('diamond')} Your BLUE FISH PRIME Premium is active for {days} day(s)! "
                          f"Valid until {until}. {pe('fire')}",
                     parse_mode="HTML")
             except Exception:
@@ -1265,6 +1424,25 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _FILL_GAPS_TASK[user.id] = {"task": task}
         task.add_done_callback(
             lambda _t: _FILL_GAPS_TASK.pop(user.id, None))
+        return
+
+    if data in ("admin_bot_free", "admin_bot_premium"):
+        # Bot ON/OFF per tier (the owner, 2026-11-28): flip the
+        # switch in the candle DB state, then re-render the
+        # dashboard so the toggle shows the new state.
+        if not _is_admin(user.id):
+            await query.edit_message_text(
+                "Only the owner can change this.",
+                reply_markup=back_keyboard(), parse_mode="HTML")
+            return
+        key = (_BOT_ON_FREE_KEY if data == "admin_bot_free"
+               else _BOT_ON_PREMIUM_KEY)
+        try:
+            current = _db().get_state(key, "1")
+            _db().set_state(key, "0" if current != "0" else "1")
+        except Exception:
+            pass
+        await _run_admin_dashboard(query, context, user.id)
         return
 
     if data == "menu_futures":
@@ -1550,10 +1728,22 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _run_otc_board(query, context)
         return
     if data == "menu_payouts":
+        if not _free_feature_allowed(user.id, "payouts"):
+            await query.edit_message_text(
+                _limit_text(), reply_markup=_limit_keyboard(),
+                parse_mode="HTML")
+            return
+        _free_feature_use(user.id, "payouts")
         await _run_payouts(query, context)
         return
     if data.startswith("payout_"):
         # A payout button opens that market's Market Live detail.
+        if not _free_feature_allowed(user.id, "market_live"):
+            await query.edit_message_text(
+                _limit_text(), reply_markup=_limit_keyboard(),
+                parse_mode="HTML")
+            return
+        _free_feature_use(user.id, "market_live")
         await _run_market(query, data[len("payout_"):], context)
         return
     if data == "menu_counter":
@@ -1600,13 +1790,24 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _rerender_an_picker(query, context, tool)
         return
     if data.startswith("an_next_"):
-        # Run the tool for the selected markets (1..N).
+        # Run the tool for the selected markets (1..N). A use is
+        # counted only here — when the tool actually runs, not when
+        # the picker opens (the owner, 2026-11-28).
         tool = data[len("an_next_"):]
         selected = set(context.user_data.get("an_selected") or set())
         if not selected:
             await _rerender_an_picker(query, context, tool, warn=True)
             return
         assets = [a for a in _analysis_assets() if a in selected]
+        feature = {"ai": "ai_signal", "counter": "candle_scan",
+                   "trend": "trend_scan", "market": "market_live"}.get(tool)
+        if feature and not _free_feature_allowed(user.id, feature):
+            await query.edit_message_text(
+                _limit_text(), reply_markup=_limit_keyboard(),
+                parse_mode="HTML")
+            return
+        if feature:
+            _free_feature_use(user.id, feature)
         if tool == "ai":
             await _run_ai_signal(query, context, assets)
         elif tool == "counter":
@@ -1653,10 +1854,22 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "open Backtest Lab again from the menu.",
                 reply_markup=back_keyboard(), parse_mode="HTML")
             return
+        if not _free_feature_allowed(user.id, "backtest"):
+            await query.edit_message_text(
+                _limit_text(), reply_markup=_limit_keyboard(),
+                parse_mode="HTML")
+            return
+        _free_feature_use(user.id, "backtest")
         await _run_backtest(query, asset=asset, date_str=date_str,
                             start=start, end=end, days=days)
         return
     if data == "menu_news":
+        if not _free_feature_allowed(user.id, "news"):
+            await query.edit_message_text(
+                _limit_text(), reply_markup=_limit_keyboard(),
+                parse_mode="HTML")
+            return
+        _free_feature_use(user.id, "news")
         await _run_news(query)
         return
     if data == "menu_formatter":
@@ -1869,6 +2082,25 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML")
             return
         on = not database.is_auto_subscriber(user.id)
+        if on:
+            # Free Auto Live is 30 minutes a day (the owner,
+            # 2026-11-28): a free user who already used them cannot
+            # turn it back ON today — a DB error never blocks.
+            try:
+                _prem = database.is_premium(user.id)
+            except Exception:
+                _prem = True
+            if not _prem:
+                try:
+                    _used = database.get_usage(
+                        user.id, "auto_live", _today_date_str())
+                except Exception:
+                    _used = 0
+                if _used >= config.AUTO_LIVE_FREE_MINUTES:
+                    await query.edit_message_text(
+                        _limit_text(), reply_markup=_limit_keyboard(),
+                        parse_mode="HTML")
+                    return
         database.set_auto_signals(user.id, on)
         if not on:
             # Turning OFF cancels pending results too (the owner,
@@ -1880,20 +2112,48 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
         await _show_autolive_menu(query, context, user.id)
         return
-    if data == "menu_premium":
+    if data.startswith("premium_plan_"):
+        # A plan was picked (the owner, 2026-11-28): remember its
+        # price + days, then ask for the Binance Pay transaction ID.
+        try:
+            price = int(data[len("premium_plan_"):])
+        except ValueError:
+            return
+        days = dict(PREMIUM_PLANS).get(price)
+        if days is None:
+            return
+        context.user_data["premium_plan_price"] = price
+        context.user_data["premium_plan_days"] = days
         context.user_data["flow"] = "premium_txn"
         pay_id = config.BINANCE_PAY_ID
         if pay_id:
-            pay_text = (f"Pay {config.USDT_AMOUNT} USDT via Binance Pay ID:\n"
+            pay_text = (f"Pay ${price} via Binance Pay ID:\n"
                         f"{html.escape(pay_id)}\n\n")
         else:
             pay_text = "Ask the owner (@LittleMatrix) for the Binance Pay ID.\n\n"
+        days_label = "1 day" if days == 1 else f"{days} days"
         await query.edit_message_text(
-            f"{pe('diamond')}{pe('crown')} Blue Fish Prime Premium — 1 month, {config.USDT_AMOUNT} USDT {pe('fire')}\n\n"
+            f"{pe('diamond')}{pe('crown')} Blue Fish Prime Premium — ${price} for {days_label} {pe('fire')}\n\n"
             + pay_text +
-            "After paying, paste the transaction ID here. The owner will check and "
-            "approve it, then your 30-day Premium starts.",
+            f"After paying ${price}, paste the transaction ID here. The owner will check and "
+            f"approve it, then your {days_label} Premium starts.",
             reply_markup=back_keyboard(), parse_mode="HTML")
+        return
+    if data == "menu_premium":
+        # Get Premium (the owner, 2026-11-28): 4 plans — $2/1 day,
+        # $3/5 days, $5/15 days, $8/1 month. The plan is picked
+        # first; the payment + transaction ID step follows.
+        kb = [[_btn("$2 — 1 day Premium", "premium_plan_2", icon="money"),
+               _btn("$3 — 5 days Premium", "premium_plan_3", icon="money")],
+              [_btn("$5 — 15 days Premium", "premium_plan_5", icon="money"),
+               _btn("$8 — 1 month Premium", "premium_plan_8", icon="money")],
+              [_btn("Back", "menu_main", icon="back")]]
+        await query.edit_message_text(
+            f"{pe('diamond')}{pe('crown')} Get Premium {pe('fire')}\n\n"
+            "Choose a plan below. Pay the amount via Binance Pay ID, "
+            "then paste the transaction ID here — the owner will check "
+            "and approve it, and your Premium starts.",
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
         return
 
 
@@ -2746,6 +3006,15 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # and again in the Render log).
     if update.effective_user is None or update.message is None:
         return
+    # Bot ON/OFF per tier (the owner, 2026-11-28): a switched-off
+    # user gets the off text instead of any tool — except sending
+    # their premium transaction ID, which is how they buy Premium.
+    if ((context.user_data or {}).get("flow") != "premium_txn"
+            and not _bot_on_for(update.effective_user.id)):
+        await update.message.reply_text(
+            _bot_off_text(update.effective_user.id),
+            reply_markup=_bot_off_keyboard(), parse_mode="HTML")
+        return
     flow = (context.user_data or {}).get("flow")
     text = update.message.text or ""
     user = update.effective_user
@@ -2851,6 +3120,15 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Send a name like BTCUSD-OTC or EURUSD-OTC.",
                 reply_markup=back_keyboard(), parse_mode="HTML")
             return  # keep the flow so the user can retry
+        # Free users get 3 AI Signals a day (the owner,
+        # 2026-11-28) — counted only when the signal actually runs.
+        if not _free_feature_allowed(user.id, "ai_signal"):
+            context.user_data["flow"] = None
+            await update.message.reply_text(
+                _limit_text(), reply_markup=_limit_keyboard(),
+                parse_mode="HTML")
+            return
+        _free_feature_use(user.id, "ai_signal")
         context.user_data["flow"] = None
         working = await update.message.reply_text(
             f"{pe('hourglass')} Analysing {display_asset(asset)}... {pe('chart')}",
@@ -3025,6 +3303,14 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{pe('warning')} The list is gone — open Signal Filter "
                 "again and send the list.", parse_mode="HTML")
             return
+        # Free users get 3 Signal Filters a day (the owner,
+        # 2026-11-28) — counted only when the filter actually runs.
+        if not _free_feature_allowed(user.id, "filter"):
+            await update.message.reply_text(
+                _limit_text(), reply_markup=_limit_keyboard(),
+                parse_mode="HTML")
+            return
+        _free_feature_use(user.id, "filter")
         working = await update.message.reply_text(
             f"{pe('search')} Filtering... {progress_bar(0)}",
             parse_mode="HTML")
@@ -3064,6 +3350,13 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if flow == "formatter":
+        if not _free_feature_allowed(user.id, "formatter"):
+            context.user_data["flow"] = None
+            await update.message.reply_text(
+                _limit_text(), reply_markup=_limit_keyboard(),
+                parse_mode="HTML")
+            return
+        _free_feature_use(user.id, "formatter")
         formatted = format_signal_list(text)
         await update.message.reply_text(
             f"{pe('sparkle')}{pe('diamond')} Formatter — standard format:\n"
@@ -3073,6 +3366,13 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if flow == "swap":
+        if not _free_feature_allowed(user.id, "swap"):
+            context.user_data["flow"] = None
+            await update.message.reply_text(
+                _limit_text(), reply_markup=_limit_keyboard(),
+                parse_mode="HTML")
+            return
+        _free_feature_use(user.id, "swap")
         await update.message.reply_text(
             f"{pe('refresh')} Swap C/P:\n{html.escape(swap_call_put(text))}",
             reply_markup=back_keyboard(), parse_mode="HTML")
@@ -3096,10 +3396,17 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if flow == "premium_txn":
-        req_id = database.save_premium_request(user.id, text.strip())
+        # The plan the user picked (the owner, 2026-11-28) — the
+        # request stores its days, so the admin approves exactly
+        # that plan. An old flow without a plan defaults to 30.
+        plan_days = context.user_data.get("premium_plan_days", 30) or 30
+        plan_price = context.user_data.get("premium_plan_price")
+        req_id = database.save_premium_request(
+            user.id, text.strip(), days=plan_days)
+        days_label = "1 day" if plan_days == 1 else f"{plan_days} days"
         await update.message.reply_text(
             f"{pe('check')}{pe('diamond')} Transaction ID saved. The owner will check and approve it, "
-            f"then your 30-day Premium starts. {pe('crown')}",
+            f"then your {days_label} Premium starts. {pe('crown')}",
             reply_markup=back_keyboard(), parse_mode="HTML")
         for admin_id in config.ADMIN_USER_IDS:
             try:
@@ -3108,10 +3415,13 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                          icon="approve"),
                     _btn("Reject", f"premium_reject_{req_id}",
                          icon="reject")]])
+                plan_line = (f"Plan: ${plan_price} — {days_label} Premium\n"
+                             if plan_price is not None else "")
                 await context.bot.send_message(
                     chat_id=admin_id,
                     text=(f"Premium request #{req_id} from "
                           f"@{user.username or user.id} (id {user.id}):\n"
+                          f"{plan_line}"
                           f"{html.escape(text.strip())}"),
                     reply_markup=kb, parse_mode="HTML")
             except Exception:

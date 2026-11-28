@@ -157,6 +157,12 @@ LIVE_STREAM_TEST_ASSET = os.getenv("LIVE_STREAM_TEST_ASSET", "").strip()
 # How many days of history the day picker may offer (1-20 in code;
 # the Render-test backfill gives 5, so the picker shows 1-5 in db mode).
 MAX_SIGNAL_DAYS = int(os.getenv("MAX_SIGNAL_DAYS", "20"))
+# Free-user daily limits (the owner, 2026-11-28): premium users are
+# unlimited everywhere. Free users get 3 uses a day of each limited
+# feature (Futures Signal OTC and CHECKER are unlimited for everyone)
+# and 30 minutes a day of Live Auto Signal. Tunable via env.
+FREE_DAILY_LIMIT = int(os.getenv("FREE_DAILY_LIMIT", "3") or 3)
+AUTO_LIVE_FREE_MINUTES = int(os.getenv("AUTO_LIVE_FREE_MINUTES", "30") or 30)
 
 DB_PATH = BASE_DIR / "data" / "littlematrix.db"
 CANDLES_DB_PATH = BASE_DIR / "data" / "candles.db"

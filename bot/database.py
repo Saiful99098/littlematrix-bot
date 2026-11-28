@@ -37,7 +37,19 @@ CREATE TABLE IF NOT EXISTS premium_requests (
     telegram_id BIGINT,
     txn_hash TEXT,
     created_at TEXT,
-    status TEXT DEFAULT 'pending'
+    status TEXT DEFAULT 'pending',
+    days INTEGER NOT NULL DEFAULT 30
+);
+-- Free-user daily usage (the owner, 2026-11-28): one row per
+-- (user, feature, date); count is how many times the free user ran
+-- that feature that day. Premium users are unlimited and never
+-- counted.
+CREATE TABLE IF NOT EXISTS usage (
+    telegram_id BIGINT,
+    feature TEXT,
+    date TEXT,
+    count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (telegram_id, feature, date)
 );
 -- MATRIX referral (the owner, 2026-11-27, Option B pricing):
 -- one invite link per referrer; one invited user counts once, ever
@@ -71,7 +83,15 @@ CREATE TABLE IF NOT EXISTS premium_requests (
     telegram_id INTEGER,
     txn_hash TEXT,
     created_at TEXT,
-    status TEXT DEFAULT 'pending'
+    status TEXT DEFAULT 'pending',
+    days INTEGER NOT NULL DEFAULT 30
+);
+CREATE TABLE IF NOT EXISTS usage (
+    telegram_id INTEGER,
+    feature TEXT,
+    date TEXT,
+    count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (telegram_id, feature, date)
 );
 CREATE TABLE IF NOT EXISTS referral_links (
     referrer_id INTEGER PRIMARY KEY,
@@ -189,6 +209,23 @@ def _ensure_matrix_coins_column():
 
 
 
+def _ensure_premium_days_column():
+    """Add the premium plan length (days) to premium_requests,
+    created before per-plan requests existed. Same tolerant pattern
+    as auto_mtg1: a migration failure must never break the bot."""
+    try:
+        if _backend() == "postgres":
+            _execute("ALTER TABLE premium_requests ADD COLUMN IF NOT EXISTS days INTEGER NOT NULL DEFAULT 30")
+        else:
+            try:
+                _execute("ALTER TABLE premium_requests ADD COLUMN days INTEGER NOT NULL DEFAULT 30")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc):
+                    raise
+    except Exception:
+        pass  # a failed migration must never break the bot
+
+
 def _connect():
     global _CONN
     if _CONN is not None:
@@ -210,6 +247,7 @@ def _connect():
     _ensure_auto_asset_column()
     _ensure_auto_mtg1_column()
     _ensure_menu_started_at_column()
+    _ensure_premium_days_column()
     return _CONN
 
 
@@ -326,11 +364,14 @@ def grant_premium(telegram_id, days=30):
     return until
 
 
-def save_premium_request(telegram_id, txn_hash):
+def save_premium_request(telegram_id, txn_hash, days=30):
+    """Store a premium purchase request, with the plan length
+    (days) the user picked — the admin approves exactly that plan
+    (the owner, 2026-11-28: 4 plans, $2/1 day, $3/5, $5/15, $8/30)."""
     now = datetime.now().isoformat(timespec="seconds")
     _execute(
-        "INSERT INTO premium_requests (telegram_id, txn_hash, created_at) "
-        "VALUES (?, ?, ?)", (telegram_id, txn_hash, now))
+        "INSERT INTO premium_requests (telegram_id, txn_hash, created_at, days) "
+        "VALUES (?, ?, ?, ?)", (telegram_id, txn_hash, now, int(days)))
     row = _execute(
         "SELECT id FROM premium_requests WHERE telegram_id=? AND txn_hash=? "
         "ORDER BY id DESC LIMIT 1", (telegram_id, txn_hash)).fetchone()
@@ -339,25 +380,66 @@ def save_premium_request(telegram_id, txn_hash):
 
 def get_premium_request(request_id):
     row = _execute(
-        "SELECT id, telegram_id, txn_hash, created_at, status "
+        "SELECT id, telegram_id, txn_hash, created_at, status, days "
         "FROM premium_requests WHERE id=?", (request_id,)).fetchone()
     if not row:
         return None
     return {"id": row[0], "telegram_id": row[1], "txn_hash": row[2],
-            "created_at": row[3], "status": row[4]}
+            "created_at": row[3], "status": row[4],
+            "days": int(row[5]) if len(row) > 5 and row[5] is not None else 30}
 
 
 def get_pending_premium_requests():
     cur = _execute(
-        "SELECT id, telegram_id, txn_hash, created_at FROM premium_requests "
+        "SELECT id, telegram_id, txn_hash, created_at, days FROM premium_requests "
         "WHERE status='pending' ORDER BY id")
     return [{"id": r[0], "telegram_id": r[1], "txn_hash": r[2],
-             "created_at": r[3]} for r in cur.fetchall()]
+             "created_at": r[3],
+             "days": int(r[4]) if len(r) > 4 and r[4] is not None else 30}
+            for r in cur.fetchall()]
 
 
 def set_premium_request_status(request_id, status):
     _execute("UPDATE premium_requests SET status=? WHERE id=?",
              (status, request_id))
+
+
+def get_usage(telegram_id, feature, date_str):
+    """How many times a free user ran `feature` on `date_str`
+    (0 when never). Never raises — a DB error reads as 0, so a
+    broken usage table never blocks a user."""
+    try:
+        row = _execute(
+            "SELECT count FROM usage WHERE telegram_id=? AND feature=? "
+            "AND date=?", (telegram_id, feature, date_str)).fetchone()
+    except Exception:
+        return 0
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def increment_usage(telegram_id, feature, date_str, amount=1):
+    """Add `amount` to a free user's daily count for `feature` and
+    return the new count. An update that touches no row inserts one
+    instead; a race (two inserts at once) or any other failure never
+    raises — the current count is returned instead."""
+    try:
+        cur = _execute(
+            "UPDATE usage SET count = count + ? WHERE telegram_id=? "
+            "AND feature=? AND date=?",
+            (amount, telegram_id, feature, date_str))
+        if cur.rowcount == 0:
+            try:
+                _execute(
+                    "INSERT INTO usage (telegram_id, feature, date, count) "
+                    "VALUES (?, ?, ?, ?)",
+                    (telegram_id, feature, date_str, amount))
+            except Exception:
+                # Lost a race with a concurrent insert for the same
+                # (user, feature, date) — the row exists now.
+                pass
+    except Exception:
+        pass
+    return get_usage(telegram_id, feature, date_str)
 
 
 def set_auto_signals(telegram_id, on):
