@@ -227,31 +227,6 @@ async def _send_photo_or_text(bot, chat_id, png, caption, what):
         return False
 
 
-async def _send_channel_copy(bot, chat_id, png, caption, what):
-    """Send a chart photo + caption to the channel as TWO messages:
-    the photo WITHOUT a caption, then the caption as a separate text
-    message. Telegram renders <tg-emoji> tags in a channel photo
-    caption as the plain fallback emoji (the owner, 2026-11-28:
-    the DM shows the premium sticker, the channel shows the plain
-    emoji) — a text message gives the custom premium emoji a chance
-    to render. The tradeoff: the channel gets two messages per
-    signal/result (photo + caption text) instead of one. If the
-    channel text still shows the fallback, that is Telegram's
-    platform behaviour, not the code — there is no other mechanism."""
-    if png is not None:
-        try:
-            await bot.send_photo(chat_id=chat_id, photo=png, caption=None)
-        except Exception as exc:
-            logger.warning("auto live: %s channel photo to %s failed: %s",
-                           what, chat_id, exc)
-    try:
-        await bot.send_message(chat_id=chat_id, text=caption,
-                               parse_mode="HTML")
-    except Exception as exc:
-        logger.warning("auto live: %s channel caption to %s failed: %s",
-                       what, chat_id, exc)
-
-
 async def _send_signal(bot, db, uid, asset, minute_key, direction, now,
                        mtg1=False, extra_chats=()):
     candles = _recent_chart_candles(db, asset, now)
@@ -266,7 +241,7 @@ async def _send_signal(bot, db, uid, asset, minute_key, direction, now,
         png = None
     await _send_photo_or_text(bot, uid, png, caption, "signal")
     for chat_id in extra_chats:
-        await _send_channel_copy(bot, chat_id, png, caption, "signal")
+        await _send_photo_or_text(bot, chat_id, png, caption, "signal")
     logger.info("auto live: signal %s %s %s to %s",
                 asset, minute_key, direction, uid)
 
@@ -290,7 +265,9 @@ async def _send_result(bot, db, sig, outcome, candle, now, extra_chats=()):
     # The result caption carries NO "WIN"/"LOSS" text — only the
     # premium sticker (the owner, 2026-11-28): a win shows the
     # check sticker, a loss the cross, a DOJI the minus; a MTG1
-    # win carries the dot, exactly like the CHECKER.
+    # win carries the dot, exactly like the CHECKER. The sticker
+    # sits BESIDE the direction (after CALL/PUT), NOT before the
+    # asset — the owner, 2026-11-28 16:10.
     if outcome == "WIN":
         mark, sticker = "win", pe("check")
     elif outcome == "WIN_MTG1":
@@ -299,8 +276,8 @@ async def _send_result(bot, db, sig, outcome, candle, now, extra_chats=()):
         mark, sticker = "loss", pe("cross")
     else:
         mark, sticker = None, pe("minus")
-    caption = (f"{sticker} {display_asset(asset)} — {hhmm} M1 "
-               f"{sig.get('direction')}")
+    caption = (f"{display_asset(asset)} — {hhmm} M1 "
+               f"{sig.get('direction')} {sticker}")
     try:
         png = draw_candles_png(
             candles, highlight_idx=idx, mark=mark,
@@ -309,7 +286,7 @@ async def _send_result(bot, db, sig, outcome, candle, now, extra_chats=()):
         png = None
     await _send_photo_or_text(bot, uid, png, caption, "result")
     for chat_id in extra_chats:
-        await _send_channel_copy(bot, chat_id, png, caption, "result")
+        await _send_photo_or_text(bot, chat_id, png, caption, "result")
     logger.info("auto live: result %s %s %s to %s",
                 asset, sig["minute"], outcome, uid)
 

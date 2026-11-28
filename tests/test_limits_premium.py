@@ -13,6 +13,9 @@ c) Fix 8: _bot_on_for — admin always True, a free user is False
 d) Fix 9: save_premium_request stores the plan days and
    get_premium_request returns them; grant_premium with those days
    sets the right expiry.
+e) My Status limits block: a free user sees every limited
+   feature's uses today plus Auto Live minutes; a premium user
+   gets an empty string (unlimited).
 """
 from __future__ import annotations
 
@@ -200,9 +203,42 @@ def test_premium_plan_days():
     print("PASS d) Fix 9: premium request stores days; grant uses them")
 
 
+def test_today_limits_text():
+    """e) My Status limits block: free user sees all 10 features
+    (used/3) + Auto Live minutes (used/30); premium gets ""."""
+    import bot.handlers as handlers
+    restore = _setup_users()
+    try:
+        today = handlers._today_date_str()
+        # Fresh free user: all zeros.
+        text = handlers._today_limits_text(123)
+        assert text.startswith("Today's limits:"), text
+        for label in ("AI Signal", "Market Live", "Payouts",
+                      "Candle Scan", "Trend Scan", "Backtest Lab",
+                      "News Desk", "Swap C/P", "Signal Formatter",
+                      "Signal Filter"):
+            assert f"{label}: 0/3 used" in text, (label, text)
+        assert "Auto Live: 0/30 min used" in text, text
+        # After some uses the numbers move.
+        handlers._free_feature_use(123, "ai_signal")
+        handlers._free_feature_use(123, "ai_signal")
+        database.increment_usage(123, "auto_live", today, 5)
+        text = handlers._today_limits_text(123)
+        assert "AI Signal: 2/3 used" in text, text
+        assert "Auto Live: 5/30 min used" in text, text
+        assert "News Desk: 0/3 used" in text, text
+        # Premium: no block at all (unlimited).
+        database.grant_premium(124, days=30)
+        assert handlers._today_limits_text(124) == ""
+    finally:
+        restore()
+    print("PASS e) My Status limits block: free sees uses, premium sees none")
+
+
 if __name__ == "__main__":
     test_usage_round_trip()
     test_free_feature_allowed()
     test_bot_on_off_per_tier()
     test_premium_plan_days()
+    test_today_limits_text()
     print("ALL LIMITS/PREMIUM TESTS PASSED")

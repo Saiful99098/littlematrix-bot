@@ -236,6 +236,45 @@ _LIMITED_FEATURES = {"ai_signal", "market_live", "payouts",
                      "candle_scan", "trend_scan", "backtest", "news",
                      "swap", "formatter", "filter"}
 
+# Display order + labels for the My Status "Today's limits" block
+# (the owner, 2026-11-28).
+_LIMIT_LABELS = [("ai_signal", "AI Signal"),
+                 ("market_live", "Market Live"),
+                 ("payouts", "Payouts"),
+                 ("candle_scan", "Candle Scan"),
+                 ("trend_scan", "Trend Scan"),
+                 ("backtest", "Backtest Lab"),
+                 ("news", "News Desk"),
+                 ("swap", "Swap C/P"),
+                 ("formatter", "Signal Formatter"),
+                 ("filter", "Signal Filter")]
+
+
+def _today_limits_text(user_id):
+    """The 'Today's limits' block for My Status (the owner,
+    2026-11-28): free users see each limited feature's uses
+    today (used/3) plus Auto Live minutes (used/30). Premium
+    users get an empty string — they are unlimited. Never
+    raises; a DB error hides the block rather than breaking
+    My Status."""
+    try:
+        if database.is_premium(user_id):
+            return ""
+    except Exception:
+        return ""
+    try:
+        today = _today_date_str()
+        lines = ["Today's limits:"]
+        for key, label in _LIMIT_LABELS:
+            used = database.get_usage(user_id, key, today)
+            lines.append(f"{label}: {used}/{config.FREE_DAILY_LIMIT} used")
+        auto_used = database.get_usage(user_id, "auto_live", today)
+        lines.append(
+            f"Auto Live: {auto_used}/{config.AUTO_LIVE_FREE_MINUTES} min used")
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
 
 def _free_feature_allowed(user_id, feature):
     """True when the user may run `feature` now: premium users
@@ -1935,10 +1974,13 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         premium = f"{pe('diamond')}{pe('crown')} Premium" if database.is_premium(user.id) else "Free"
         until = u.get("premium_until") or "—"
         coins = database.get_coin_balance(user.id)
+        text = (f"{pe('crown')}{pe('diamond')} My Status\n{DIVIDER}\nID: {user.id}\nStatus: {premium}\n"
+                f"Premium until: {until}\nMATRIX coins: {coins}")
+        limits = _today_limits_text(user.id)
+        if limits:
+            text += f"\n{DIVIDER}\n{limits}"
         await query.edit_message_text(
-            f"{pe('crown')}{pe('diamond')} My Status\n{DIVIDER}\nID: {user.id}\nStatus: {premium}\n"
-            f"Premium until: {until}\nMATRIX coins: {coins}",
-            reply_markup=back_keyboard(), parse_mode="HTML")
+            text, reply_markup=back_keyboard(), parse_mode="HTML")
         return
     if data == "menu_referral" or data.startswith("referral_spend_"):
         # MATRIX referral (Option B, the owner, 2026-11-27):

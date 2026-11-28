@@ -276,6 +276,11 @@ def test_auto_live_result_within_5s_of_close():
         # Fix 1: no "WIN" text — only the premium check sticker.
         assert "WIN" not in bot.photos[1][2], bot.photos[1][2]
         assert "tg-emoji" in bot.photos[1][2], "result caption has no premium sticker"
+        # The sticker sits beside the direction (after CALL/PUT),
+        # not before the asset (the owner, 2026-11-28 16:10).
+        cap = bot.photos[1][2]
+        assert cap.index("CALL") < cap.index("tg-emoji"), cap
+        assert not cap.startswith("<tg-emoji"), cap
     finally:
         restore()
     print("PASS f) auto live: result within 5s of the signal candle closing")
@@ -663,10 +668,12 @@ def test_auto_live_summary_stickers_aligned():
 
 
 def test_auto_live_channel_copy_is_photo_plus_text():
-    """Fix 1 (2026-11-28): the channel gets a signal/result as a
-    photo WITHOUT a caption plus the caption as a separate text
-    message (Telegram renders <tg-emoji> in a channel photo caption
-    as the plain fallback emoji); the DM still gets photo + caption."""
+    """Fix 1 (2026-11-28, REVERTED 2026-11-28 16:16): the channel
+    gets a signal/result as ONE message — photo WITH the caption
+    below it, exactly like the DM. The two-message split (photo
+    without caption + caption as a separate text) did NOT make the
+    premium emoji render in the channel (live test 16:05), so the
+    owner asked for the caption back under the photo."""
     db = _tmp_candle_db()
     restore = _setup_users()
     old_admins = config.ADMIN_USER_IDS
@@ -688,13 +695,14 @@ def test_auto_live_channel_copy_is_photo_plus_text():
         ch_photo = [p for p in bot.photos if p[0] == "-100123"]
         assert len(dm_photo) == 1 and len(ch_photo) == 1, bot.photos
         assert dm_photo[0][2] is not None and "tg-emoji" in dm_photo[0][2]
-        assert ch_photo[0][2] is None, ch_photo  # channel photo: no caption
-        ch_text = [m for m in bot.messages if m[0] == "-100123"]
-        assert len(ch_text) == 1, bot.messages
-        assert "12:01" in ch_text[0][1] and "CALL" in ch_text[0][1], ch_text
-        assert "tg-emoji" in ch_text[0][1], ch_text
+        # Channel: the caption rides WITH the photo (one message),
+        # no separate caption text.
+        assert ch_photo[0][2] is not None, ch_photo
+        assert "12:01" in ch_photo[0][2] and "CALL" in ch_photo[0][2]
+        assert "tg-emoji" in ch_photo[0][2], ch_photo
+        assert not [m for m in bot.messages if m[0] == "-100123"], bot.messages
         # Stop new signals WITHOUT turning OFF (Fix 2), then the
-        # 12:01 candle wins — the result follows the same split.
+        # 12:01 candle wins — the result follows the same form.
         database.set_auto_assets(123, [])
         db.insert_candles("BTCUSD_otc", [{
             "ts": datetime(2026, 11, 28, 12, 1, tzinfo=DHAKA),
@@ -703,16 +711,16 @@ def test_auto_live_channel_copy_is_photo_plus_text():
         asyncio.run(auto_live._auto_live_tick(bot, db, now_fn=_now_fn(clock)))
         assert len(bot.photos) == 4, bot.photos
         ch_result_photo = [p for p in bot.photos[2:] if p[0] == "-100123"]
-        assert len(ch_result_photo) == 1 and ch_result_photo[0][2] is None
-        ch_result_text = [m for m in bot.messages if m[0] == "-100123"]
-        assert len(ch_result_text) == 2, bot.messages
-        assert "WIN" not in ch_result_text[1][1], ch_result_text
-        assert "tg-emoji" in ch_result_text[1][1], ch_result_text
+        assert len(ch_result_photo) == 1, bot.photos
+        assert ch_result_photo[0][2] is not None, ch_result_photo
+        assert "WIN" not in ch_result_photo[0][2], ch_result_photo
+        assert "tg-emoji" in ch_result_photo[0][2], ch_result_photo
+        assert not [m for m in bot.messages if m[0] == "-100123"], bot.messages
     finally:
         config.ADMIN_USER_IDS = old_admins
         config.REQUIRED_CHANNEL = old_channel
         restore()
-    print("PASS Fix 1) auto live channel copy: photo without caption + caption text")
+    print("PASS Fix 1) auto live channel copy: photo with caption below it")
 
 
 def test_auto_live_free_minutes_limit():
